@@ -13,6 +13,9 @@ extern crate alloc;
 /// Centralised time-boundary policy for the contract.
 pub mod time_policy;
 
+/// Attestation expiry and ledger binding for cross-contract authorization (#1122).
+pub mod attestation;
+
 /// Bounded, overflow-safe oracle-price conversion (Issue #1088).
 pub mod conversion;
 
@@ -380,6 +383,16 @@ pub enum Error {
     /// Archival policy parameters are invalid (zero retention, zero batch size,
     /// or batch size above MAX_ARCHIVAL_COMPACTION_BATCH).
     InvalidArchivalPolicy = 111,
+    /// The cross-contract attestation offered as authorization is past its
+    /// expiry ledger, so it proves a state that is no longer current (#1122).
+    OnboardingAttestationExpired = 112,
+    /// The cross-contract attestation is future-dated: its issuance ledger is
+    /// ahead of the ledger being executed (#1122).
+    OnboardingAttestationNotYetValid = 113,
+    /// The attestation's declared validity window is unusable — zero ledgers
+    /// long, longer than `attestation::MAX_ATTESTATION_VALIDITY_LEDGERS`, or
+    /// overflowing `u32` — so no ledger can ever satisfy it (#1122).
+    InvalidAttestationWindow = 114,
 }
 
 /// Maps a [`conversion::ConversionError`] onto the contract's own [`Error`]
@@ -399,6 +412,31 @@ impl From<conversion::ConversionError> for Error {
             }
             conversion::ConversionError::ExcessiveMovement => Error::ConversionExcessiveMovement,
             conversion::ConversionError::OutputUnderflow => Error::ConversionOutputUnderflow,
+        }
+    }
+}
+
+/// Maps an [`attestation::AttestationError`] onto the contract's own [`Error`]
+/// enum, following the same ABI-stability rule as the `conversion` mapping
+/// above: freshness failures keep their own discriminants so callers can tell
+/// "stale evidence" apart from "wrong instance", while every other rejection
+/// collapses onto the single authorization failure code (#1122).
+impl From<attestation::AttestationError> for Error {
+    fn from(err: attestation::AttestationError) -> Self {
+        match err {
+            attestation::AttestationError::Expired => Error::OnboardingAttestationExpired,
+            attestation::AttestationError::NotYetIssued => {
+                Error::OnboardingAttestationNotYetValid
+            }
+            attestation::AttestationError::ZeroValidityWindow
+            | attestation::AttestationError::ValidityWindowTooLong
+            | attestation::AttestationError::LedgerWindowOverflow => {
+                Error::InvalidAttestationWindow
+            }
+            attestation::AttestationError::ForeignContractInstance
+            | attestation::AttestationError::OperationNonceMismatch => {
+                Error::OnboardingAuthorizationFailed
+            }
         }
     }
 }
@@ -3894,6 +3932,24 @@ impl CraftNexusContract {
             || attestation.status != ProfileStatus::Active
         {
             env.panic_with_error(crate::Error::OnboardingAuthorizationFailed);
+        }
+        // #1122: bind the evidence to this deployment and bound its age before
+        // it is forwarded. The onboarding contract re-checks freshness, but an
+        // authorization boundary that only holds while the peer behaves
+        // correctly is not a boundary: evidence minted for another instance, or
+        // issued more than the validity window ago, is refused here too.
+        let current_ledger = env.ledger().sequence();
+        let window = crate::attestation::Attestation::issue(
+            attestation.ledger_sequence,
+            crate::attestation::DEFAULT_ATTESTATION_VALIDITY_LEDGERS,
+            attestation.contract_instance.clone(),
+            attestation.state_revision,
+        )
+        .unwrap_or_else(|err| env.panic_with_error(crate::Error::from(err)));
+        if let Err(err) =
+            window.validate(current_ledger, &escrow_address, attestation.state_revision)
+        {
+            env.panic_with_error(crate::Error::from(err));
         }
         match env.try_invoke_contract::<bool, soroban_sdk::Error>(
             &onboarding_address,
@@ -18067,6 +18123,24 @@ impl CraftNexusContract {
             || attestation.status != ProfileStatus::Active
         {
             env.panic_with_error(crate::Error::OnboardingAuthorizationFailed);
+        }
+        // #1122: bind the evidence to this deployment and bound its age before
+        // it is forwarded. The onboarding contract re-checks freshness, but an
+        // authorization boundary that only holds while the peer behaves
+        // correctly is not a boundary: evidence minted for another instance, or
+        // issued more than the validity window ago, is refused here too.
+        let current_ledger = env.ledger().sequence();
+        let window = crate::attestation::Attestation::issue(
+            attestation.ledger_sequence,
+            crate::attestation::DEFAULT_ATTESTATION_VALIDITY_LEDGERS,
+            attestation.contract_instance.clone(),
+            attestation.state_revision,
+        )
+        .unwrap_or_else(|err| env.panic_with_error(crate::Error::from(err)));
+        if let Err(err) =
+            window.validate(current_ledger, &escrow_address, attestation.state_revision)
+        {
+            env.panic_with_error(crate::Error::from(err));
         }
         match env.try_invoke_contract::<bool, soroban_sdk::Error>(
             &onboarding_address,
