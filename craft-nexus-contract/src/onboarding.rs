@@ -2543,6 +2543,42 @@ impl OnboardingContract {
         revision as u64
     }
 
+    /// Canonical Onboarding State Digest (#1119).
+    ///
+    /// Conceptually:
+    /// digest = SHA256(
+    ///     domain_tag ||
+    ///     len(account) || account_bytes ||
+    ///     profile_version_be ||
+    ///     role_u8 ||
+    ///     verification_u8 ||
+    ///     activation_u8 ||
+    ///     revision_u64_be
+    /// )
+    pub fn compute_canonical_onboarding_digest(
+        env: &Env,
+        account: &Address,
+        profile_version: u32,
+        role: UserRole,
+        is_verified: bool,
+        status: ProfileStatus,
+        revision: u64,
+    ) -> BytesN<32> {
+        let mut payload = Bytes::from_slice(env, b"CRAFTNEXUS_ONBOARDING_DIGEST_V1");
+        let account_string = account.to_string();
+        let mut account_bytes = [0u8; 64];
+        let account_len = account_string.len() as usize;
+        payload.extend_from_slice(&(account_len as u32).to_be_bytes());
+        account_string.copy_into_slice(&mut account_bytes[..account_len]);
+        payload.extend_from_slice(&account_bytes[..account_len]);
+        payload.extend_from_slice(&profile_version.to_be_bytes());
+        payload.push_back(role as u8);
+        payload.push_back(if is_verified { 1 } else { 0 });
+        payload.push_back(status as u8);
+        payload.extend_from_slice(&revision.to_be_bytes());
+        env.crypto().sha256(&payload).into()
+    }
+
     fn attestation_digest(
         env: &Env,
         account: &Address,
@@ -3788,6 +3824,26 @@ impl OnboardingContract {
         } else {
             0
         }
+    }
+
+    /// Return the canonical onboarding state digest for a user's profile (#1119).
+    ///
+    /// Hashes account, profile version, role, verification, activation (status),
+    /// and monotonic revision in fixed canonical order.
+    ///
+    /// Panics with `Error::UserNotFound` if the user has no onboarding profile.
+    pub fn get_onboarding_digest(env: Env, user: Address) -> BytesN<32> {
+        let profile = Self::get_user_profile(&env, user.clone());
+        let revision = Self::state_revision(&env, &user);
+        Self::compute_canonical_onboarding_digest(
+            &env,
+            &profile.address,
+            profile.version,
+            profile.role,
+            profile.is_verified,
+            profile.status,
+            revision,
+        )
     }
 
     /// Return the monotonically increasing state version for a user's profile.
