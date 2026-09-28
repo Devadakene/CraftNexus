@@ -308,7 +308,7 @@ pub struct ObservabilityMetrics {
     pub last_reset_ledger: u32,
 }
 
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub enum DataKey {
     /// Maps a user address to their flat persisted profile record

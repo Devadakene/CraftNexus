@@ -1,9 +1,7 @@
-#![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::{Address as _, Ledger},
-    vec, Address, Env, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
+
+#[cfg(test)]
+use soroban_sdk::testutils::{Address as _, Ledger};
 
 // ============================================================================
 // 1. DATA STRUCTURES & KEYS
