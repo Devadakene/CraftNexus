@@ -11756,6 +11756,7 @@ impl CraftNexusContract {
         authorized_address: Address,
     ) -> Result<soroban_sdk::Vec<u64>, Error> {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
         authorized_address.require_auth();
 
         let mut results = soroban_sdk::Vec::new(&env);
@@ -11766,19 +11767,19 @@ impl CraftNexusContract {
                 let escrow_opt = env.storage().persistent().get(&(ESCROW, order_id));
 
                 if escrow_opt.is_none() {
-                    return Err(Error::EscrowNotFound);
+                    env.panic_with_error(Error::EscrowNotFound);
                 }
 
                 let escrow: Escrow = escrow_opt.unwrap();
 
                 // Check status
                 if escrow.status != EscrowStatus::Active {
-                    return Err(Error::InvalidEscrowState);
+                    env.panic_with_error(Error::InvalidEscrowState);
                 }
 
                 // Check authorization (buyer must match)
                 if escrow.buyer != authorized_address {
-                    return Err(Error::Unauthorized);
+                    env.panic_with_error(Error::Unauthorized);
                 }
                 let operation_id =
                     Self::onboarding_operation_id(&env, b"release_batch_funds:", order_id);
@@ -11811,7 +11812,8 @@ impl CraftNexusContract {
                     let config = Self::get_platform_config_internal(&env);
 
                     // Deterministic fee allocation via the central FeePolicy engine.
-                    let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone())?;
+                    let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone())
+                        .unwrap_or_else(|e| env.panic_with_error(e));
                     let allocation = Self::compute_fee_allocation(
                         &env,
                         escrow.amount,
@@ -11829,7 +11831,10 @@ impl CraftNexusContract {
 
                     Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
                     Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
-                    Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+                    
+                    let neg_amount = 0i128.checked_sub(escrow.amount)
+                        .unwrap_or_else(|| env.panic_with_error(Error::CounterUnderflow));
+                    Self::update_total_locked(&env, &escrow.token, neg_amount);
 
                     // Transfer platform fee to platform wallet
                     if allocation.platform_fee > 0 {
@@ -12594,82 +12599,6 @@ impl CraftNexusContract {
         })
     }
 
-    /// Release multiple escrows in a batch operation
-    ///
-    /// Validates all escrows first before processing any.
-    ///
-    /// # Arguments
-    /// * `order_ids` - Vector of order IDs to release
-    /// * `batch_id` - Unique identifier for this batch operation
-    /// * `authorized_address` - Address releasing the funds (buyer)
-    pub fn release_batch_funds(
-        env: Env,
-        _batch_id: u64,
-        order_ids: soroban_sdk::Vec<u32>,
-        authorized_address: Address,
-    ) -> Result<soroban_sdk::Vec<u64>, Error> {
-        let _guard = ReentryGuardScope::new(&env);
-        authorized_address.require_auth();
-
-        let mut results = soroban_sdk::Vec::new(&env);
-
-        // Validate all escrows first
-        for i in 0..order_ids.len() {
-            if let Some(order_id) = order_ids.get(i) {
-                let escrow_opt = env.storage().persistent().get(&(ESCROW, order_id));
-
-                if escrow_opt.is_none() {
-                    return Err(Error::EscrowNotFound);
-                }
-
-                let escrow: Escrow = escrow_opt.unwrap();
-
-                // Check status
-                if escrow.status != EscrowStatus::Active {
-                    return Err(Error::InvalidEscrowState);
-                }
-
-                // Check authorization (buyer must match)
-                if escrow.buyer != authorized_address {
->>>>>>> 867344c7525c03c89db6e2269239d86e67ad05f3
-                    return Err(Error::Unauthorized);
-                }
-            }
-            DisputeTransition::AcceptRefund(proposer) => {
-                // Must be the counterparty to the proposer
-                if proposer == escrow.buyer && *caller != escrow.seller {
-                    return Err(Error::Unauthorized);
-                }
-                if proposer == escrow.seller && *caller != escrow.buyer {
-                    return Err(Error::Unauthorized);
-                }
-                if *caller != escrow.buyer && *caller != escrow.seller {
-                    return Err(Error::Unauthorized);
-                }
-            }
-            DisputeTransition::CancelRefund(proposer) => {
-                // Must be the proposer
-                if *caller != proposer {
-                    return Err(Error::Unauthorized);
-                }
-            }
-            DisputeTransition::ResolveArbitrated => {
-                let is_privileged = *caller == config.admin
-                    || *caller == config.arbitrator
-                    || Some(caller.clone()) == config.moderator;
-                if !is_privileged {
-                    return Err(Error::Unauthorized);
-                }
-                if *caller != config.admin && Self::arbitrator_on_blacklist(env, caller) {
-                    return Err(Error::ArbitratorBlacklisted);
-                }
-            }
-        }
-        Ok(())
-    }
-<<<<<<< HEAD
-}
-=======
 
     // â”€â”€ Staking Requirement for Artisans (#99) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

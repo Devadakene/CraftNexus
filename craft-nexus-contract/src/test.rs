@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 #![allow(clippy::too_many_arguments)]
 #[cfg(target_arch = "wasm32")]
 #[global_allocator]
@@ -2382,7 +2382,6 @@ fn test_release_batch_funds_fails_invalid_state() {
 }
 
 #[test]
-#[should_panic]
 fn test_release_batch_funds_fails_unauthorized() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2396,7 +2395,28 @@ fn test_release_batch_funds_fails_unauthorized() {
     // Try to release with different address
     let unauthorized = Address::generate(&env);
     let order_ids = vec![&env, 100u32];
-    client.release_batch_funds(&1u64, &order_ids, &unauthorized);
+    let result = client.try_release_batch_funds(&1u64, &order_ids, &unauthorized);
+    
+    assert_eq!(result.unwrap_err().unwrap(), crate::Error::Unauthorized);
+}
+
+#[test]
+fn test_release_batch_funds_fails_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &1_000_000_000);
+
+    // Create escrow
+    client.create_escrow(&buyer, &seller, &token_id, &100, &100, &None);
+
+    // Pause contract
+    client.set_paused(&true);
+
+    let order_ids = vec![&env, 100u32];
+    let result = client.try_release_batch_funds(&1u64, &order_ids, &buyer);
+    assert_eq!(result.unwrap_err().unwrap(), crate::Error::ContractPaused);
 }
 
 #[test]
