@@ -25,6 +25,8 @@ pub mod storage_lifecycle;
 #[cfg(test)]
 mod admin_idempotency_test;
 #[cfg(test)]
+mod set_min_escrow_amount_test;
+#[cfg(test)]
 mod arbitration_escalation_test;
 #[cfg(test)]
 mod dispute_escalation_timeout_test;
@@ -11025,6 +11027,11 @@ impl CraftNexusContract {
     pub fn set_min_escrow_amount(env: Env, token: Address, min_amount: i128) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        Self::check_not_paused(&env);
+        
+        if min_amount < 0 {
+            env.panic_with_error(crate::Error::AmountBelowMinimum);
+        }
 
         let key = DataKey::MinEscrowAmount(token.clone());
         let old_amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -21875,6 +21882,11 @@ impl CraftNexusContract {
     pub fn set_min_escrow_amount(env: Env, token: Address, min_amount: i128) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        Self::check_not_paused(&env);
+        
+        if min_amount < 0 {
+            env.panic_with_error(crate::Error::AmountBelowMinimum);
+        }
 
         let key = DataKey::MinEscrowAmount(token.clone());
         let old_amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -27983,6 +27995,11 @@ impl CraftNexusContract {
     pub fn set_min_escrow_amount(env: Env, token: Address, min_amount: i128) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        Self::check_not_paused(&env);
+        
+        if min_amount < 0 {
+            env.panic_with_error(crate::Error::AmountBelowMinimum);
+        }
 
         let key = DataKey::MinEscrowAmount(token.clone());
         let old_amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
