@@ -10302,10 +10302,19 @@ impl CraftNexusContract {
         Self::timeout_outcome(config.expired_dispute_fee_policy)
     }
 
-    /// Read the configured escalation checkpoint schedule (#1080).
-    pub fn get_escalation_checkpoints(env: Env) -> EscalationCheckpoints {
-        let config = Self::get_platform_config_internal(&env);
-        Self::escalation_checkpoints(&env, &config)
+    /// Read the explicitly configured escalation checkpoint schedule (#1080).
+    ///
+    /// Returns `None` when no schedule is stored. Dispute processing continues
+    /// to use the platform defaults in that case.
+    pub fn get_escalation_checkpoints(env: Env) -> Option<EscalationCheckpoints> {
+        let key = DataKey::EscalationCheckpoints;
+        match env.storage().persistent().get(&key) {
+            Some(checkpoints) => {
+                Self::extend_persistent_read(&env, &key);
+                Some(checkpoints)
+            }
+            None => None,
+        }
     }
 
     /// Configure the escalation checkpoint schedule (admin only) (#1080).
