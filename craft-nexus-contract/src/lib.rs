@@ -10993,6 +10993,9 @@ impl CraftNexusContract {
     /// * `arbitrator` - Address to remove from the blacklist
     pub fn remove_arbitrator_from_blacklist(env: Env, arbitrator: Address) {
         let config = Self::get_platform_config_internal(&env);
+        if config.paused {
+            panic_with_error!(&env, Error::ContractPaused);
+        }
         config.admin.require_auth();
 
         let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
@@ -21846,6 +21849,9 @@ impl CraftNexusContract {
     /// * `arbitrator` - Address to remove from the blacklist
     pub fn remove_arbitrator_from_blacklist(env: Env, arbitrator: Address) {
         let config = Self::get_platform_config_internal(&env);
+        if config.paused {
+            panic_with_error!(&env, Error::ContractPaused);
+        }
         config.admin.require_auth();
 
         let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
@@ -27966,6 +27972,9 @@ impl CraftNexusContract {
 
     pub fn remove_arbitrator_from_blacklist(env: Env, arbitrator: Address) {
         let config = Self::get_platform_config_internal(&env);
+        if config.paused {
+            panic_with_error!(&env, Error::ContractPaused);
+        }
         config.admin.require_auth();
 
         let key = DataKey::ArbitratorBlacklist(arbitrator.clone());

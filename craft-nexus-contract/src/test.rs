@@ -8156,3 +8156,22 @@ fn test_is_arbitrator_blacklisted_missing_key() {
     let result_removed = client.is_arbitrator_blacklisted(&arbitrator);
     assert_eq!(result_removed, None);
 }
+
+#[test]
+fn test_remove_arbitrator_from_blacklist_rejected_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, crate::CraftNexusContract);
+    let client = crate::CraftNexusContractClient::new(&env, &contract_id);
+    
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+    
+    client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None::<Address>);
+
+    client.pause_platform(&true);
+
+    let res = client.try_remove_arbitrator_from_blacklist(&arbitrator);
+    assert_eq!(res.unwrap_err().unwrap(), crate::Error::ContractPaused);
+}
