@@ -8175,3 +8175,34 @@ fn test_remove_arbitrator_from_blacklist_rejected_when_paused() {
     let res = client.try_remove_arbitrator_from_blacklist(&arbitrator);
     assert_eq!(res.unwrap_err().unwrap(), crate::Error::ContractPaused);
 }
+#[test]
+fn test_get_effective_fee_bps_missing_key_and_terminal() {
+    let env = soroban_sdk::Env::default();
+    env.mock_all_auths();
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let arbitrator = soroban_sdk::Address::generate(&env);
+    let platform_wallet = soroban_sdk::Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    
+    let contract_id = env.register_contract(None, crate::CraftNexusContract);
+    let client = crate::CraftNexusContractClient::new(&env, &contract_id);
+    
+    let seller = soroban_sdk::Address::generate(&env);
+
+    // Call before config initialized
+    let res = client.try_get_effective_fee_bps(&seller);
+    assert!(res.is_err());
+
+    client.initialize(
+        &admin,
+        &arbitrator,
+        &platform_wallet,
+        &token,
+        &500u32,
+    );
+
+    // Call before record exists
+    let fee = client.get_effective_fee_bps(&seller);
+    assert_eq!(fee, 500);
+}
