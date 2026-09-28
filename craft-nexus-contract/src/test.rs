@@ -8127,3 +8127,32 @@ fn test_differential_upgrade_compatibility_representative_fixture() {
         total_supply
     );
 }
+
+
+#[test]
+fn test_is_arbitrator_blacklisted_missing_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, crate::CraftNexusContract);
+    let client = crate::CraftNexusContractClient::new(&env, &contract_id);
+    
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+    
+    client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None::<Address>);
+
+    // Call before record exists
+    let result = client.is_arbitrator_blacklisted(&arbitrator);
+    assert_eq!(result, None);
+
+    // Call after adding to blacklist
+    client.blacklist_arbitrator(&arbitrator);
+    let result_blacklisted = client.is_arbitrator_blacklisted(&arbitrator);
+    assert_eq!(result_blacklisted, Some(true));
+
+    // Call after removing from blacklist (terminal state)
+    client.remove_arbitrator_from_blacklist(&arbitrator);
+    let result_removed = client.is_arbitrator_blacklisted(&arbitrator);
+    assert_eq!(result_removed, None);
+}

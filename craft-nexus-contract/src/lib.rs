@@ -11010,11 +11010,14 @@ impl CraftNexusContract {
     ///
     /// # Arguments
     /// * `arbitrator` - Address to query
-    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ArbitratorBlacklist(arbitrator))
-            .unwrap_or(false)
+    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> Option<bool> {
+        let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
+        if let Some(is_blacklisted) = env.storage().persistent().get(&key) {
+            Self::extend_persistent_read(&env, &key);
+            Some(is_blacklisted)
+        } else {
+            None
+        }
     }
 
     /// Set the minimum escrow amount for a specific token (admin only)
@@ -21860,11 +21863,14 @@ impl CraftNexusContract {
     ///
     /// # Arguments
     /// * `arbitrator` - Address to query
-    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ArbitratorBlacklist(arbitrator))
-            .unwrap_or(false)
+    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> Option<bool> {
+        let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
+        if let Some(is_blacklisted) = env.storage().persistent().get(&key) {
+            Self::extend_persistent_read(&env, &key);
+            Some(is_blacklisted)
+        } else {
+            None
+        }
     }
 
     /// Set the minimum escrow amount for a specific token (admin only)
@@ -27973,11 +27979,14 @@ impl CraftNexusContract {
         );
     }
 
-    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ArbitratorBlacklist(arbitrator))
-            .unwrap_or(false)
+    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> Option<bool> {
+        let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
+        if let Some(is_blacklisted) = env.storage().persistent().get(&key) {
+            Self::extend_persistent_read(&env, &key);
+            Some(is_blacklisted)
+        } else {
+            None
+        }
     }
 
     pub fn set_min_escrow_amount(env: Env, token: Address, min_amount: i128) -> Result<(), Error> {
@@ -28326,3 +28335,4 @@ impl CraftNexusContract {
         loop {
             if i >= buyer_next_counts.len() {
                 break;Sorry, something went wrong. Please try your request again.
+
