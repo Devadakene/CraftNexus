@@ -12558,23 +12558,33 @@ impl CraftNexusContract {
     /// deficit             = max(0, required − current_stake)
     /// ```
     pub fn evaluate_stake_health(env: Env, artisan: Address) -> StakeHealthSnapshot {
+        artisan.require_auth();
+        Self::check_not_paused(&env);
+
         Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
 
         let config = Self::get_platform_config_internal(&env);
         let current_stake = Self::get_stake(env.clone(), artisan.clone());
         let active_obligations = Self::get_active_obligation_count(env.clone(), artisan.clone());
 
-        let required_collateral = (active_obligations as i128) * config.min_stake_required;
+        let required_collateral = (active_obligations as i128)
+            .checked_mul(config.min_stake_required)
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::CounterOverflow));
 
         let denominator = if required_collateral > 0 {
             required_collateral
         } else {
             1
         };
-        let health_ratio_bps = ((current_stake as u128 * 10_000) / (denominator as u128)) as u32;
+        let health_ratio_bps = ((current_stake as u128)
+            .checked_mul(10_000)
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::CounterOverflow))
+            / (denominator as u128)) as u32;
 
         let deficit = if current_stake < required_collateral {
-            required_collateral - current_stake
+            required_collateral
+                .checked_sub(current_stake)
+                .unwrap_or_else(|| env.panic_with_error(crate::Error::CounterUnderflow))
         } else {
             0
         };
