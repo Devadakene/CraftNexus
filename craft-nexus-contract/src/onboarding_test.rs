@@ -1,3961 +1,6322 @@
-use super::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
-use super::*;
+//! Onboarding Contract
+//!
+//! Handles user registration (onboarding), role assignments, username configuration,
+//! profile management, and verification processes for buyers and artisans on the CraftNexus platform.
+//!
+//! # Integration guide
+//!
+//! This section documents the integration surface that off-chain indexers and
+//! client interfaces depend on (Issue #453 / component #52). Three integration
+//! channels exist: the **read API** (view functions), the **event stream**, and
+//! the **cross-contract interface** shared with the escrow contract.
+//!
+//! ## Read API for indexers and clients
+//!
+//! All read functions are side-effect free with respect to *state shape* but
+//! refresh the persistent TTL of the entries they touch (via the internal
+//! `extend_persistent` helper). Repeatedly reading a profile is
+//! therefore safe and additionally keeps the entry from being archived.
+//!
+//! | Function | Returns | Notes |
+//! |----------|---------|-------|
+//! | [`OnboardingContract::get_user`] | [`UserProfile`] | Panics with [`Error::UserNotFound`] when absent. |
+//! | [`OnboardingContract::get_user_by_username`] | [`UserProfile`] | Looks up by the *normalized* username (lowercased, see `onboard_user`). |
+//! | [`OnboardingContract::is_onboarded`] | `bool` | Non-panicking existence check. |
+//! | [`OnboardingContract::is_username_taken`] | `bool` | Accepts any casing; normalizes internally. |
+//! | [`OnboardingContract::get_user_role`] | [`UserRole`] | Returns [`UserRole::None`] for unknown users. |
+//! | [`OnboardingContract::is_verified`] | `bool` | Reflects manual or auto verification. |
+//! | [`OnboardingContract::get_user_metrics`] | [`UserMetrics`] | Escrow count / volume used for auto-verification. |
+//! | [`OnboardingContract::get_user_reputation`] | `(u32, u32)` | Lifetime `(successful_trades, disputed_trades)` counters. |
+//! | [`OnboardingContract::get_trust_score`] | `u32` | Decaying trust score (#939); lazy-applies decay on read. |
+//! | [`OnboardingContract::get_reputation_history`] | `Vec<ReputationHistoryEntry>` | Recent score-change log for abuse detection (#939). |
+//! | [`OnboardingContract::get_reputation_policy`] | [`ReputationPolicy`] | Decay / cooldown / anti-farming policy (#939). |
+//! | [`OnboardingContract::get_min_reputation_settlement`] | `i128` | Minimum 7-decimal normalized settlement eligible for trust. |
+//! | [`OnboardingContract::get_verification_history`] | `Vec<VerificationEntry>` | Compact entries decoded to human-readable actions. |
+//! | [`OnboardingContract::get_verification_queue`] | `Vec<Address>` | Pending manual-verification requests in FIFO order. |
+//! | [`OnboardingContract::get_config`] | [`OnboardingConfig`] | Global contract configuration. |
+//!
+//! ## Event stream
+//!
+//! Events are the canonical integration signal for indexers; subscribe to these
+//! topics rather than polling. Consumers should treat an event as authoritative
+//! only after it appears in a closed ledger. Each row lists the topic tuple, the
+//! data payload, and the function that emits it.
+//!
+//! | Topic tuple | Data payload | Emitted by |
+//! |-------------|--------------|------------|
+//! | `("UserOnboarded",)` | [`UserOnboardedEvent`] `{ user, username, role }` | [`OnboardingContract::onboard_user`] |
+//! | `("RoleUpdated",)` | `(user: Address, old_role: UserRole, new_role: UserRole)` | [`OnboardingContract::update_user_role`] |
+//! | `("UserVerified",)` | `user: Address` | `verify_user`, `auto_verify_user`, `process_verification_request` |
+//! | `("ProfileDeactivated", user: Address)` | `(user: Address, role: UserRole)` | [`OnboardingContract::deactivate_profile`] |
+//! | `("ProfileReactivated", user: Address)` | `(user: Address, role: UserRole)` | [`OnboardingContract::reactivate_profile`] |
+//! | `("UsernameChanged",)` | `user: Address` | [`OnboardingContract::change_username`] |
+//! | `("PortfolioUpdated",)` | `user: Address` | [`OnboardingContract::update_portfolio`] |
+//!
+//! Notes for consumers:
+//! - `ProfileDeactivated` / `ProfileReactivated` carry the user **in the topic
+//!   tuple** so indexers can filter the stream per user without decoding the
+//!   payload; the payload additionally carries the role captured at the time of
+//!   the transition so no follow-up profile read is required.
+//! - `UserVerified`, `UsernameChanged`, and `PortfolioUpdated` carry only the
+//!   address; fetch the current value via [`OnboardingContract::get_user`] when
+//!   the new field value is needed.
+//! - `UserOnboarded` is emitted exactly once per address. An identical
+//!   `onboard_user` retry returns the canonical profile and repairs missing
+//!   secondary state without emitting another event. A retry with a different
+//!   username or role panics with [`Error::AlreadyOnboarded`] (#929).
+//!
+//! ## Cross-contract interface
+//!
+//! Onboarding both calls and is called by the escrow contract:
+//! - **Outbound:** during [`OnboardingContract::deactivate_profile`] the contract
+//!   invokes [`EscrowInterface::has_active_escrows`] (via the generated
+//!   `EscrowClient`) to block deactivation while escrows are open.
+//! - **Inbound:** the escrow contract — the address stored in
+//!   [`OnboardingConfig::escrow_contract`] — is the only authorized caller of
+//!   [`OnboardingContract::update_reputation`],
+//!   [`OnboardingContract::update_reputation_for_settlement`],
+//!   [`OnboardingContract::update_user_metrics`], and
+//!   [`OnboardingContract::update_active_contracts`]. When `escrow_contract` is
+//!   `None`, the `platform_admin` is used as the authorized fallback.
+//!
+//! ## Profile versioning
+//!
+//! Stored profiles are versioned by [`CURRENT_USER_PROFILE_VERSION`]. Older
+//! entries (including the legacy version-less shape) are migrated transparently
+//! on first read (internal `try_get_user_profile`); integrators never observe an
+//! out-of-date shape through the read API.
+
 use crate::alloc::string::ToString;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, String, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
-fn register_decimal_test_token(env: &Env, decimals: u32) -> Address {
-    let admin = Address::generate(env);
-    let contract_id = env.register_contract(None, DecimalTestToken);
-    DecimalTestTokenClient::new(env, &contract_id).initialize(&admin, &decimals);
-    contract_id
+/// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
+const TTL_THRESHOLD: u32 = 10_000;
+const READ_TTL_THRESHOLD: u32 = 1_000;
+/// Standard TTL extension for persistent storage (approx 30 days)
+const TTL_EXTENSION: u32 = 518_400;
+const CURRENT_USER_PROFILE_VERSION: u32 = 5;
+const OBSERVABILITY_METRICS_KEY: Symbol = symbol_short!("OBS_MET");
+
+const BASE58_BTC_CHARSET: [bool; 256] = {
+    let mut chars = [false; 256];
+
+    let mut i = b'1' as usize;
+    while i <= b'9' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    i = b'A' as usize;
+    while i <= b'H' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    i = b'J' as usize;
+    while i <= b'N' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    i = b'P' as usize;
+    while i <= b'Z' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    i = b'a' as usize;
+    while i <= b'k' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    i = b'm' as usize;
+    while i <= b'z' as usize {
+        chars[i] = true;
+        i += 1;
+    }
+
+    chars
+};
+
+/// Cooldown period for username changes to prevent squatting and rapid identity rotation.
+/// 30 days in seconds.
+const USERNAME_CHANGE_COOLDOWN: u64 = 30 * 24 * 60 * 60;
+/// Maximum verification history entries retained per user (#519).
+const MAX_VERIFICATION_HISTORY: u32 = 10;
+
+// ---------------------------------------------------------------------------
+// Issue #939 – Reputation decay & anti-farming defaults
+// ---------------------------------------------------------------------------
+
+/// Basis-points denominator (100% = 10_000).
+const REPUTATION_BPS_DENOMINATOR: u32 = 10_000;
+/// Default decay interval: 30 days. Trust score loses `decay_bps` each interval.
+const DEFAULT_REPUTATION_DECAY_INTERVAL_SECS: u64 = 30 * 24 * 60 * 60;
+/// Default decay rate: 5% of trust score per decay interval.
+const DEFAULT_REPUTATION_DECAY_BPS: u32 = 500;
+/// Minimum gap between successful trust-score increases (1 hour).
+const DEFAULT_REPUTATION_UPDATE_COOLDOWN_SECS: u64 = 60 * 60;
+/// Rolling window used by the anti-farming cap (24 hours).
+const DEFAULT_REPUTATION_FARMING_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// Max successful-trade increments credited inside one farming window.
+const DEFAULT_MAX_SUCCESSFUL_PER_WINDOW: u32 = 5;
+/// Minimum completed-settlement value eligible for a trust-score increase.
+/// Values are normalized to the platform's 7-decimal base before comparison.
+const DEFAULT_MIN_REPUTATION_SETTLEMENT: i128 = 10_000_000;
+/// Bounded reputation history retained per user for abuse-pattern detection.
+const MAX_REPUTATION_HISTORY: u32 = 20;
+/// Version of the observability metrics schema.
+const OBSERVABILITY_METRICS_VERSION: u32 = 1;
+/// Cap decay intervals applied in one call to bound CPU (≈ 64 periods).
+const MAX_DECAY_INTERVALS_PER_CALL: u64 = 64;
+
+/// Default archival retention period: 30 days in ledgers (~5s ledger).
+const DEFAULT_ARCHIVAL_RETENTION_LEDGERS: u32 = 518_400;
+/// Default maximum archival records per user.
+const DEFAULT_MAX_ARCHIVAL_RECORDS: u32 = 10_000;
+/// Default compaction batch size for bounded, resumable pruning.
+const DEFAULT_ARCHIVAL_COMPACTION_BATCH: u32 = 100;
+
+/// Immutable snapshot of user/global state at settlement decision time.
+#[contracttype]
+#[derive(Clone)]
+pub struct SettlementSnapshot {
+    pub revision: u64,
+    pub user: Address,
+    pub role: UserRole,
+    pub metrics: UserMetrics,
+    pub trust_score: u32,
+    pub reputation_policy: ReputationPolicy,
+    pub min_reputation_settlement: i128,
+    pub config: OnboardingConfig,
+    pub timestamp: u64,
 }
 
-const AUTO_VERIFY_VOLUME_THRESHOLD: i128 = 10_000_000_000;
-const AUTO_VERIFY_ESCROW_THRESHOLD: u32 = 5;
+#[contractimpl]
+impl OnboardingContract {
+    /// Creates an immutable settlement snapshot for a user and returns its revision.
+    /// Can only be called by the configured escrow contract (or platform_admin fallback).
+    pub fn create_settlement_snapshot(env: Env, user: Address) -> u64 {
+        let config = Self::get_config(env.clone());
+        let caller = config
+            .escrow_contract
+            .clone()
+            .unwrap_or_else(|| config.platform_admin.clone());
+        caller.require_auth();
 
-fn string_to_bytes(env: &Env, s: &soroban_sdk::String) -> Bytes {
-    let mut buf = [0u8; 128];
-    let len = s.len() as usize;
-    s.copy_into_slice(&mut buf[..len]);
-    let mut b = Bytes::new(env);
-    b.extend_from_slice(&buf[..len]);
-    b
-}
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SettlementSnapCounter)
+            .unwrap_or(0);
+        counter += 1;
+        let revision = counter;
 
-fn setup_test(env: &Env) -> (OnboardingContractClient<'static>, Address) {
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(env, &contract_id);
+        let snapshot = SettlementSnapshot {
+            revision,
+            user: user.clone(),
+            role: Self::get_user_role(env.clone(), user.clone()),
+            metrics: Self::get_user_metrics(env.clone(), user.clone()),
+            trust_score: Self::get_trust_score(env.clone(), user.clone()),
+            reputation_policy: Self::get_reputation_policy(env.clone()),
+            min_reputation_settlement: Self::get_min_reputation_settlement(env.clone()),
+            config: Self::get_config(env.clone()),
+            timestamp: env.ledger().timestamp(),
+        };
 
-    let admin = Address::generate(env);
-    client.initialize(&admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SettlementSnapshot(revision), &snapshot);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SettlementSnapCounter, &revision);
+        revision
+    }
 
-    (client, admin)
-}
-
-/// Disable cooldown/farming caps so Issue #100 counter-math tests stay focused.
-fn set_permissive_reputation_policy(client: &OnboardingContractClient) {
-    client.set_reputation_policy(
-        &DEFAULT_REPUTATION_DECAY_INTERVAL_SECS,
-        &DEFAULT_REPUTATION_DECAY_BPS,
-        &0u64,     // no update cooldown
-        &0u64,     // disable farming window
-        &u32::MAX, // unlimited successes when window re-enabled
-    );
-}
-
-// ===== Initialization =====
-
-#[test]
-fn test_initialize() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let config = client.get_config();
-
-    assert_eq!(config.platform_admin, admin);
-    assert_eq!(config.min_username_length, 3);
-    assert_eq!(config.max_username_length, 50);
-    assert_eq!(
-        client.get_user(&admin).version,
-        CURRENT_USER_PROFILE_VERSION
-    );
-}
-
-#[test]
-fn test_initialize_reserves_admin_username() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    // "admin" should already be taken
-    assert!(client.is_username_taken(&String::from_str(&env, "admin")));
-    assert!(client.is_username_taken(&String::from_str(&env, "ADMIN")));
-    assert!(client.is_username_taken(&String::from_str(&env, "Admin")));
-}
-
-#[test]
-fn test_onboarding_attestation_rejects_forgery_and_replay() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let escrow_contract = Address::generate(&env);
-    client.set_escrow_contract(&escrow_contract);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "attested"), &UserRole::Buyer);
-    let operation_id = Bytes::from_slice(&env, b"operation-1");
-
-    let attestation = client.get_onboarding_attestation(&user, &operation_id, &escrow_contract);
-    assert!(client.validate_onboarding_attestation(&attestation));
-    assert!(client
-        .try_validate_onboarding_attestation(&attestation)
-        .is_err());
-
-    let mut forged = attestation.clone();
-    forged.role = UserRole::Artisan;
-    assert!(client.try_validate_onboarding_attestation(&forged).is_err());
-}
-
-#[test]
-fn test_onboarding_attestation_becomes_stale_after_role_change() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let escrow_contract = Address::generate(&env);
-    client.set_escrow_contract(&escrow_contract);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "revision"), &UserRole::Buyer);
-    let operation_id = Bytes::from_slice(&env, b"operation-2");
-    let attestation = client.get_onboarding_attestation(&user, &operation_id, &escrow_contract);
-
-    client.update_user_role(&user, &UserRole::Artisan);
-    assert!(client
-        .try_validate_onboarding_attestation(&attestation)
-        .is_err());
-}
-
-// ===== Onboarding =====
-
-fn onboard_user_success(
-    client: &OnboardingContractClient,
-    user: &Address,
-    username: &String,
-    role: &UserRole,
-) -> UserProfile {
-    match client.try_onboard_user(user, username, role) {
-        Ok(Ok(profile)) => profile,
-        Ok(Err(_)) => panic!("try_onboard_user returned Err but should have succeeded"),
-        Err(_) => panic!("try_onboard_user host call failed"),
+    /// Returns the immutable settlement snapshot for audit by revision.
+    pub fn get_settlement_snapshot(env: Env, revision: u64) -> SettlementSnapshot {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SettlementSnapshot(revision))
+            .expect("settlement snapshot not found")
     }
 }
 
-#[test]
-fn test_onboard_user_as_buyer() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "john_doe");
-
-    let profile = onboard_user_success(&client, &user, &username, &UserRole::Buyer);
-
-    assert_eq!(profile.version, CURRENT_USER_PROFILE_VERSION);
-    assert_eq!(profile.address, user);
-    assert_eq!(profile.username, Symbol::new(&env, "john_doe"));
-    assert_eq!(profile.role, UserRole::Buyer);
-    assert!(!profile.is_verified);
+/// Shared authorization adapter for privileged entry points.
+///
+/// Every privileged marketplace flow (escrow, dispute, stake, recovery,
+/// governance) MUST call [`AuthorizationAdapter::authorize`] at its own
+/// boundary to reject stale, deactivated, or inconsistent onboarding state.
+/// Implementations MUST read the latest persisted onboarding state and MUST
+/// NOT rely on cached or caller-supplied values.
+pub trait AuthorizationAdapter {
+    /// Rejects the call if `user` is not currently onboarded and active.
+    ///
+    /// Panics with [`Error::Unauthorized`] if the state is missing, deactivated,
+    /// or inconsistent.
+    fn authorize(&self, env: Env, user: Address);
 }
 
-#[test]
-fn test_onboard_user_as_artisan() {
-    let env = Env::default();
-    env.mock_all_auths();
+#[cfg(not(target_family = "wasm"))]
+#[path = "decimal_test_token.rs"]
+pub mod decimal_test_token;
 
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_jane");
-
-    let profile = onboard_user_success(&client, &user, &username, &UserRole::Artisan);
-
-    assert_eq!(profile.address, user);
-    assert_eq!(profile.username, Symbol::new(&env, "artisan_jane"));
-    assert_eq!(profile.role, UserRole::Artisan);
+// Circular mod removed
+/// Archival record policy for immutable summaries.
+///
+/// Separates active indexes from archival summaries. Archival records are
+/// immutable and retained for fund reconstruction; active records are never
+/// pruned by historical maintenance. Compaction is bounded and resumable via
+/// per-user offset state.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivalPolicy {
+    /// Number of ledgers an archival record is retained before compaction.
+    pub retention_ledgers: u32,
+    /// Maximum archival records kept per user (oldest compacted first).
+    pub max_records_per_user: u32,
+    /// Number of records processed per resumable compaction batch.
+    pub compaction_batch_size: u32,
 }
 
-#[test]
-fn test_onboard_stores_normalized_username() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "JohnDoe");
-
-    let profile = onboard_user_success(&client, &user, &username, &UserRole::Buyer);
-
-    // Username should be stored as lowercase
-    assert_eq!(profile.username, Symbol::new(&env, "johndoe"));
+/// Storage keys for the onboarding contract.
+///
+/// Each variant maps to a distinct persistent-storage slot. Keys that include
+/// an [`Address`] or [`u64`] are per-entity; all others are global singletons.
+///
+/// ## On-chain cost note
+/// Persistent storage entries incur rent. Every read/write in this contract
+/// calls [`extend_ttl`] to keep entries alive for ~30 days, preventing
+/// accidental expiry of user profiles.
+#[contracttype]
+#[derive(Clone)]
+pub struct ObservabilityMetrics {
+    pub version: u32,
+    pub escrow_volume: i128,
+    pub disputes: u64,
+    pub staking_events: u64,
+    pub failures: u64,
+    pub active_jobs: u64,
+    pub reset_count: u64,
+    pub last_reset_ledger: u32,
 }
 
-#[test]
-fn test_onboard_normalizes_multilingual_username() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, " Jöhn Őnе ");
-
-    let profile = onboard_user_success(&client, &user, &username, &UserRole::Buyer);
-
-    assert_eq!(profile.username, Symbol::new(&env, "john_one"));
-    assert!(client.is_username_taken(&String::from_str(&env, "JOHN ONE")));
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Maps a user address to their flat persisted profile record
+    UserProfile(Address),
+    /// Dedicated portfolio CID storage keyed by user to keep the main profile flat.
+    UserPortfolio(Address),
+    /// Maps a normalized username to the owning address (uniqueness index)
+    Username(String),
+    /// Contract configuration ([`OnboardingConfig`])
+    Config,
+    /// Activity metrics per user (escrow count and volume for auto-verification) (#63)
+    UserMetrics(Address),
+    /// Active contract counter per user (Issue #39)
+    /// Tracks the number of active escrows/agreements for an address.
+    ActiveContractCount(Address),
+    /// Total active user profiles.
+    ActiveUserCount,
+    /// Total successful onboarding operations.
+    GlobalOnboardCount,
+    /// Total username changes.
+    GlobalUserChangeCount,
+    // Rest commented out by python
+    SuspiciousActivityFlag(Address),
+    SybilReviewCase(Address),
+    ReviewQueueHead,
+    ReviewQueueTail,
+    ReviewQueueIndex(u64),
+    PohVerifier,
+    PohCredentialHash(Bytes),
+    UserPohCredential(Address),
+    SybilReviewer(Address),
+    OnboardRateLimitWindow,
+    MaxOnboardAttempts,
+    VerificationCooldown,
+    PohReqForAutoVerify,
+    UsernameChangeFee,
+    UsernameChangeFeeToken,
+    UserChangeFeeWallet,
+    AttemptRatePolicy,
+    MinRepSettlement,
+    ReputationPolicy,
+    LastUsernameChange(Address),
+    VerificationHistory(Address),
+    ReputationHistoryCount(Address),
+    RepHistoryIndexed(Address, u32),
+    IdentityCorrelation(Bytes),
+    UsedAttestation(Address, Bytes),
+    VerifyLastAttempt(Address),
+    VerifyHistoryCount(Address),
+    VerifyHistoryIndexed(Address, u32),
+    VerificationQueueHead,
+    VerificationQueueTail,
+    VerificationQueueIndex(u64),
+    UserStateRevision(Address),
+    VerifyRateLimitTracker(Address),
+    GlobalVerifyRateLimit,
+    RateLimitTracker(Address),
+    GlobalOnboardingRateLimit,
+    ReputationState(Address),
+    SettlementSnapCounter,
+    SettlementSnapshot(u64),
+    VerificationQueueCount,
+    VerificationRequest(Address),
 }
 
-#[test]
-fn test_onboard_duplicate_user() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username1 = String::from_str(&env, "test_user");
-    let username2 = String::from_str(&env, "other_name");
-
-    client.onboard_user(&user, &username1, &UserRole::Buyer);
-    let result = client.try_onboard_user(&user, &username2, &UserRole::Artisan);
-    assert!(result.is_err());
+/// User roles in the CraftNexus platform.
+///
+/// Roles are stored inside [`UserProfile`] and gate which operations a user
+/// may perform. Self-onboarding via [`OnboardingContract::onboard_user`] only
+/// allows `Buyer` or `Artisan`; `Admin` and `Moderator` are assigned by the
+/// platform admin via [`OnboardingContract::update_user_role`].
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum UserRole {
+    None = 0,    // User has not onboarded
+    Buyer = 1,   // Can purchase items
+    Artisan = 2, // Can sell items and create escrow
+    Admin = 3,   // Platform administrator
+    /// Dispute-resolution delegate (Issue #116). Moderators may resolve
+    /// escrows when their address is also registered on the escrow
+    /// contract's platform config, but they cannot change WASM, platform
+    /// fees, or other admin-only settings.
+    Moderator = 4,
 }
 
-#[test]
-fn test_repeated_identical_onboarding_is_idempotent() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "retry_user");
-
-    let before = client.get_active_user_count();
-    let first = client.onboard_user(&user, &username, &UserRole::Artisan);
-    let after_first = client.get_active_user_count();
-    let retried = client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    assert_eq!(retried, first);
-    assert_eq!(after_first, before + 1);
-    assert_eq!(client.get_active_user_count(), after_first);
-    assert_eq!(client.get_user_by_username(&username).address, user);
+/// Lifecycle status of a user profile.
+///
+/// A deactivated profile releases the username back to the pool so another
+/// user may claim it. Deactivation is blocked while the user has active
+/// escrows (checked via cross-contract call to the registered ESCROW_CONTRACT).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum ProfileStatus {
+    /// Profile is active and fully operational
+    Active = 0,
+    /// Profile has been deactivated by the user; username is released
+    Deactivated = 1,
+    /// Profile is under administrative or automated anti-Sybil review (#940)
+    UnderReview = 2,
+    /// Profile is flagged for suspicious activity and restricted (#940)
+    Flagged = 3,
 }
 
-#[test]
-fn test_idempotent_retry_repairs_missing_secondary_state() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "repair_user");
-    let original = client.onboard_user(&user, &username, &UserRole::Buyer);
-    let active_count = client.get_active_user_count();
-    let normalized = normalize_username(&env, &username);
+/// Public user profile returned by onboarding read/write methods.
+///
+/// The persistent storage layout is flatter than this API model: the core
+/// profile record lives under [`DataKey::UserProfile`], while
+/// `portfolio_cid` is stored separately under [`DataKey::UserPortfolio`].
+/// Callers still receive a single composed struct so the read API remains
+/// stable across storage migrations.
+///
+/// ## Storage cost note
+/// Keeping optional heap payloads like `portfolio_cid` out of the main
+/// persistent profile entry reduces Soroban rent for every onboarded user.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UserProfile {
+    /// Schema version — guards profile shape changes.
+    /// Must equal [`CURRENT_USER_PROFILE_VERSION`]; older values trigger
+    /// an in-place upgrade on read.
+    pub version: u32,
+    /// The user's Stellar account or contract address
+    pub address: Address,
+    /// Role assigned to this user (see [`UserRole`])
+    pub role: UserRole,
+    pub username: Symbol,
+    pub registered_at: u64,
+    /// Whether the user has passed verification (manual or auto-threshold)
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Optional IPFS content identifier for an artisan's portfolio
+    /// showcase (Issue #112).
+    ///
+    /// `None` when unset or after removal via `update_portfolio`. When
+    /// present, the CID must conform to the same validation rules as
+    /// escrow metadata CIDs (see `validate_ipfs_cid`). Indexers can read
+    /// this field from `get_user` / `get_user_by_username` responses or
+    /// subscribe to `PortfolioUpdated` events for live updates.
+    pub portfolio_cid: Option<Bytes>,
+    /// Status of the user profile - Issue #113
+    pub status: ProfileStatus,
+    /// Monotonically increasing state version — bumped on role changes,
+    /// verification transitions, deactivation, and reactivation so downstream
+    /// contracts can detect stale onboarding state.
+    pub state_version: u32,
+}
 
-    env.as_contract(&client.address, || {
+/// Coherent onboarding state proof for a single privileged marketplace operation.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct OnboardingAttestation {
+    pub account: Address,
+    pub profile_version: u32,
+    pub role: UserRole,
+    pub is_verified: bool,
+    pub status: ProfileStatus,
+    pub state_revision: u64,
+    pub ledger_sequence: u32,
+    pub operation_id: Bytes,
+    pub contract_instance: Address,
+    pub state_digest: BytesN<32>,
+}
+
+/// Flat persistent representation stored under [`DataKey::UserProfile`].
+///
+/// This shape intentionally omits optional heap payloads so profile rent stays
+/// bounded as the onboarding schema evolves.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+struct StoredUserProfile {
+    pub version: u32,
+    pub address: Address,
+    pub role: UserRole,
+    pub username: Symbol,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    pub successful_trades: u32,
+    pub disputed_trades: u32,
+    pub status: ProfileStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+struct LegacyUserProfile {
+    pub address: Address,
+    pub role: UserRole,
+    pub username: Symbol,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Portfolio CID for artisan showcase (IPFS) - Issue #112
+    pub portfolio_cid: Option<String>,
+}
+
+/// Activity metrics used to determine eligibility for auto-verification (#63).
+///
+/// Written exclusively by the registered escrow contract via
+/// [`OnboardingContract::update_user_metrics`] and read by
+/// [`OnboardingContract::get_user_metrics`], [`OnboardingContract::auto_verify_user`],
+/// and the internal `try_auto_verify` helper. Volume is normalized to 7 decimal
+/// places before accumulation so threshold comparisons remain token-agnostic.
+///
+/// # Integration notes — issue #427 / component #26
+///
+/// ## Storage layout
+/// Stored persistently under [`DataKey::UserMetrics`]`(Address)`. The struct
+/// is intentionally flat — two scalar fields only — to minimise on-chain
+/// entry size and reduce rent overhead. Avoid adding `Vec` or `Map` fields
+/// here; derived counters belong in separate indexed keys.
+///
+/// ## TTL management
+/// [`OnboardingContract::get_user_metrics`] extends the TTL of this entry
+/// on every read (via `extend_persistent`) so the record stays live as long
+/// as the user's escrow activity is ongoing. Writers (`update_user_metrics`)
+/// also extend TTL immediately after the write. The combined read + write
+/// refresh ensures the entry survives even during long periods with no new
+/// escrow settlements.
+///
+/// ## Preconditions for writers
+/// - Caller must be the [`OnboardingConfig::escrow_contract`] address, or
+///   `platform_admin` when no escrow contract is configured.
+/// - `volume_delta` must be normalised to 7-decimal stroops before
+///   accumulation; raw token amounts in non-standard decimals will produce
+///   incorrect threshold comparisons.
+///
+/// ## Storage side-effects
+/// - `DataKey::UserMetrics(address)` — read, incremented, written, TTL extended.
+/// - `DataKey::Config` — read to check auto-verify thresholds.
+/// - May transitively write `DataKey::UserProfile(address)` and append
+///   compact verification history entries when auto-verification triggers.
+///
+/// ## Off-chain consumers
+/// Indexers should subscribe to `UserVerified` events (see [`OnboardingContract::auto_verify_user`])
+/// rather than polling this struct to detect when a user crosses the
+/// verification threshold. The `total_volume` field is in 7-decimal
+/// stroop precision and must be divided by `10^7` before display.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UserMetrics {
+    /// Total number of completed seller-side escrows recorded by the escrow contract.
+    ///
+    /// Incremented by [`OnboardingContract::update_user_metrics`] on each
+    /// seller-side escrow settlement. Never decremented. Compared against
+    /// [`OnboardingConfig::min_escrow_count_for_verify`] during auto-verify.
+    pub total_escrow_count: u32,
+    /// Cumulative seller volume in stroops at 7-decimal precision (not raw token units).
+    ///
+    /// Accumulated by normalising each settlement amount to 7 decimal places
+    /// before addition, ensuring token-agnostic threshold comparisons. Compared
+    /// against [`OnboardingConfig::min_volume_for_verify`] during auto-verify.
+    pub total_volume: i128,
+}
+
+/// Event emitted when a new user successfully onboards via [`OnboardingContract::onboard_user`].
+///
+/// Topic: `("UserOnboarded",)` — emitted to the contract's event stream.
+/// Data shape: `UserOnboardedEvent { schema_version, user, username, role }`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UserOnboardedEvent {
+    /// Lifecycle event schema version. Consumers must branch on this before decoding.
+    pub schema_version: u32,
+    /// The newly onboarded user's address
+    pub user: Address,
+    /// Normalized username assigned to the user
+    pub username: String,
+    /// Role the user selected during onboarding
+    pub role: UserRole,
+}
+
+/// Event emitted when [`onboard_user`] fails due to a validation error.
+///
+/// Topic: `("OnboardCallFailed",)` — emitted before panicking,
+/// so off-chain indexers can distinguish validation failures from
+/// host panics / network errors without parsing host error codes.
+///
+/// # Note
+/// `reason` is stored as a `u32` (the raw error discriminant) because
+/// `contracterror` types cannot be used as fields of `contracttype`
+/// structs. Off-chain consumers should match on the numeric value
+/// against the [`Error`] enum discriminants.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct OnboardCallFailedEvent {
+    pub schema_version: u32,
+    /// The address that attempted to onboard
+    pub user: Address,
+    /// The error discriminant that caused the failure (see [`Error`])
+    pub reason: u32,
+    /// Ledger timestamp when the failure occurred
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoVerifiedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub escrow_count: u32,
+    pub volume: u64,
+}
+
+/// A single entry in a user's verification history log (#63).
+///
+/// Returned by [`OnboardingContract::get_verification_history`]. On-chain storage
+/// uses compact [`VerificationActionCode`] values; this struct exposes human-readable
+/// `action` strings for off-chain indexers and client UIs.
+///
+/// # Integration notes — issue #425 / component #24
+///
+/// ## Purpose
+/// Each `VerificationEntry` is a record of a discrete verification lifecycle
+/// event for a user: a request, an approval, a rejection, an automatic
+/// threshold-based verification, or a revocation triggered by a username
+/// change. Together these entries form the user's complete verification audit
+/// trail, enabling off-chain indexers and admin dashboards to reconstruct the
+/// full history.
+///
+/// ## Preconditions
+/// - Entries are appended only by functions in [`OnboardingContract`] that
+///   mutate verification state (`request_verification`, `approve_verification`,
+///   `reject_verification`, `auto_verify_user`, `change_username`).
+/// - No external contract or account may write entries directly.
+///
+/// ## Storage side-effects
+/// Entries are stored under two key patterns:
+/// - `DataKey::VerifyHistoryCount(Address)` — count of entries (u32)
+/// - `DataKey::VerifyHistoryIndexed(Address, u32)` — per-entry compact
+///   record ([`CompactVerificationEntry`]); the `action` field is stored as
+///   [`VerificationActionCode`] to minimise on-chain size.
+///
+/// Both keys have their TTL extended on every write and on reads that touch
+/// the history. The legacy `DataKey::VerificationHistory(Address)` Vec-based
+/// key is migrated lazily on first read and should not be written by new code.
+///
+/// ## Emitted events
+/// The functions that append history entries also emit named events on the
+/// contract's event stream. Indexers should prefer events over polling:
+/// - `request_verification` → `VerificationRequested`
+/// - `approve_verification` → `UserVerified`
+/// - `reject_verification`  → `VerificationRejected`
+/// - `auto_verify_user`     → `UserVerified`
+/// - `change_username`      → `UsernameChanged` (if verification is revoked)
+///
+/// ## Off-chain consumers
+/// The `action` field is a human-readable [`Symbol`] — one of:
+/// `"requested"`, `"approved"`, `"rejected"`, `"auto_verified"`,
+/// `"username_changed_revoked"`.
+/// Indexers may store this verbatim; no further decoding is required.
+/// The `by` field carries the actor's address for admin-initiated actions
+/// and is `None` for auto-verification events, which have no single actor.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct VerificationEntry {
+    /// Ledger timestamp (seconds) when the action was recorded.
+    pub timestamp: u64,
+    /// One of: `"requested"`, `"approved"`, `"rejected"`, `"auto_verified"`,
+    /// `"username_changed_revoked"`. See issue #473 / component #72.
+    pub action: Symbol,
+    /// Address that performed the action; `None` for auto-verification events.
+    pub by: Option<Address>,
+}
+
+/// Compact action code for indexed verification history storage (#519).
+///
+/// # Integration notes — issue #429 / component #28
+///
+/// ## Purpose
+/// [`VerificationActionCode`] is the on-chain wire representation of a
+/// verification lifecycle action, encoded as a `u32` discriminant. Using
+/// a compact code rather than a full [`Symbol`] string reduces the size of
+/// each [`CompactVerificationEntry`] ledger entry, lowering rent costs at
+/// scale when users accumulate many history records.
+///
+/// ## Preconditions
+/// - Only values defined in this enum are written to storage. Any unknown
+///   discriminant encountered during a future upgrade indicates a schema
+///   mismatch and should be treated as an error by migration tooling.
+///
+/// ## Storage side-effects
+/// - Stored as the `action` field inside
+///   [`DataKey::VerifyHistoryIndexed`]`(Address, u32)` entries.
+/// - Discriminant values are **stable** — adding new variants is safe;
+///   reordering or removing variants is a breaking schema change.
+///
+/// ## Off-chain consumers
+/// Decode the discriminant using the mapping below:
+/// - `0` → `"requested"` (user submitted a manual review request)
+/// - `1` → `"approved"`  (admin approved the verification request)
+/// - `2` → `"rejected"`  (admin rejected the verification request)
+/// - `3` → `"auto_verified"` (activity thresholds triggered auto-verification)
+/// - `4` → `"username_changed_revoked"` (username change revoked verification)
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(u32)]
+enum VerificationActionCode {
+    Requested = 0,
+    Approved = 1,
+    Rejected = 2,
+    AutoVerified = 3,
+    UsernameChangedRevoked = 4,
+}
+
+/// Lightweight on-chain verification history entry (#519).
+///
+/// # Integration notes — issue #429 / component #28 (continued)
+///
+/// ## Purpose
+/// `CompactVerificationEntry` is the actual bytes persisted under
+/// [`DataKey::VerifyHistoryIndexed`]`(Address, u32)`. It mirrors
+/// [`VerificationEntry`] but stores `action` as a [`VerificationActionCode`]
+/// discriminant rather than a heap-allocated [`Symbol`], keeping each
+/// storage entry small and rent-efficient.
+///
+/// ## Storage side-effects
+/// - Key: `DataKey::VerifyHistoryIndexed(user_address, index_u32)`
+/// - TTL is extended immediately after every write and on reads within
+///   `get_verification_history`.
+/// - The corresponding count is maintained under
+///   `DataKey::VerifyHistoryCount(user_address)`.
+///
+/// ## Off-chain consumers
+/// Indexers receive the decoded [`VerificationEntry`] form (with
+/// human-readable `action` symbols) from
+/// [`OnboardingContract::get_verification_history`] — this struct is
+/// internal and does not appear in any public ABI. Clients should never
+/// need to decode `CompactVerificationEntry` directly.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+struct CompactVerificationEntry {
+    timestamp: u64,
+    action: VerificationActionCode,
+    by: Option<Address>,
+}
+
+/// Contract configuration for the onboarding module.
+///
+/// # Integration notes — issue #437 / component #36
+///
+/// ## Purpose
+/// `OnboardingConfig` is the single on-chain configuration record for the
+/// [`OnboardingContract`]. It is stored as a singleton under
+/// [`DataKey::Config`] and read by nearly every public function. Admins
+/// manage it through dedicated setter functions; it should never be written
+/// directly by external contracts.
+///
+/// ## Preconditions
+/// - Only the `platform_admin` address may call functions that mutate this
+///   config (e.g. `set_config`, `set_auto_verify_config`,
+///   `set_escrow_contract`). Each mutating function calls
+///   `platform_admin.require_auth()` before any storage write.
+/// - `min_username_length` must be ≤ `max_username_length`.
+/// - `min_escrow_count_for_verify` and `min_volume_for_verify` are advisory
+///   thresholds; setting both to `0` effectively disables the count/volume
+///   gates while `auto_verify_enabled` remains the master switch.
+///
+/// ## Storage side-effects
+/// - Stored persistently under `DataKey::Config` (singleton).
+/// - TTL is extended on every read and write via `extend_persistent`.
+/// - Any function that reads `Config` and finds the entry absent will panic
+///   with [`Error::NotInitialized`]; callers should ensure `initialize` has
+///   been called before any other contract function.
+///
+/// ## Emitted events
+/// Configuration mutations emit a `ConfigUpdated` event per changed field so
+/// indexers can track admin actions without scanning storage. No event is
+/// emitted during `initialize`.
+///
+/// ## Off-chain consumers
+/// - Read the singleton via `get_config` (if exposed) or listen to
+///   `ConfigUpdated` events to maintain a local mirror.
+/// - Cache `require_username`, `min_username_length`, and
+///   `max_username_length` client-side to validate usernames before
+///   submitting `onboard_user` or `change_username` transactions.
+/// - `escrow_contract` identifies the only address authorized to call
+///   `update_user_metrics` and `update_reputation`; indexers can use this
+///   to validate event sources.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct OnboardingConfig {
+    /// Whether a username is required during onboarding (default: `true`)
+    pub require_username: bool,
+    /// Minimum byte-length of a normalized username (default: 3)
+    pub min_username_length: u32,
+    /// Maximum byte-length of a normalized username (default: 50)
+    pub max_username_length: u32,
+    /// Platform administrator address — the only address that can call admin-gated functions
+    pub platform_admin: Address,
+    /// Whether threshold-based auto-verification is active (default: `true`)
+    pub auto_verify_enabled: bool,
+    /// Minimum completed escrow count for auto-verification (default: 5) (#63)
+    pub min_escrow_count_for_verify: u32,
+    /// Minimum total volume (7-decimal normalized) for auto-verification (default: 10_000_000_000) (#63)
+    pub min_volume_for_verify: i128,
+    /// Address of the ESCROW_CONTRACT authorized to call `update_reputation` / `update_user_metrics`.
+    /// If `None`, the `platform_admin` is used as fallback caller. (#63, #100)
+    pub escrow_contract: Option<Address>,
+}
+
+/// Proof-of-Humanity credential attached to a user identity (#940).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PohCredential {
+    pub provider_id: Symbol,
+    pub credential_hash: Bytes,
+    pub verified_at: u64,
+    pub expires_at: u64,
+}
+
+/// Record tracking suspicious activity and anti-Sybil review state for a user (#940).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SuspiciousActivityFlag {
+    pub reason_code: u32,
+    pub flagged_at: u64,
+    pub flagged_by: Address,
+    pub delay_until: u64,
+}
+
+/// Lifecycle of a revision-bound Sybil review case (#1086).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum SybilReviewStatus {
+    ReviewRequired = 0,
+    Approved = 1,
+    Rejected = 2,
+    Appealed = 3,
+    Expired = 4,
+}
+
+/// Review state is bound to the exact profile revision that was restricted.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewCase {
+    pub profile_revision: u32,
+    pub reason_code: u32,
+    pub status: SybilReviewStatus,
+    pub opened_at: u64,
+    pub expires_at: u64,
+    pub decided_at: u64,
+    pub decided_by: Option<Address>,
+    pub appeal_count: u32,
+}
+
+/// Rate limit tracking entry per user address (#940).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RateLimitRecord {
+    pub window_start: u64,
+    pub count: u32,
+    pub last_attempt: u64,
+}
+
+/// Versioned per-account and global attempt limits (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRatePolicy {
+    pub revision: u32,
+    pub onboarding_window_secs: u64,
+    pub max_onboarding_per_account: u32,
+    pub max_onboarding_global: u32,
+    pub verification_window_secs: u64,
+    pub max_verification_per_account: u32,
+    pub max_verification_global: u32,
+}
+
+/// Emitted when an onboarding or verification attempt is rate-limited (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRateLimitedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub operation: Symbol,
+    pub scope: Symbol,
+    pub policy_revision: u32,
+    pub retry_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilPatternDetectedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub reason: Symbol,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PohCredentialRegisteredEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub provider_id: Symbol,
+    pub credential_hash: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct IdentityCorrelatedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub identity_hash: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ProfileFlaggedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub reason_code: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReviewCompletedEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub action: Symbol,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewDecisionEvent {
+    pub schema_version: u32,
+    pub user: Address,
+    pub reviewer: Address,
+    pub profile_revision: u32,
+    pub outcome: SybilReviewStatus,
+    pub timestamp: u64,
+}
+
+/// Global policy controlling trust-score decay and anti-farming (#939).
+///
+/// Stored as a singleton under [`DataKey::ReputationPolicy`]. Admins mutate it
+/// via [`OnboardingContract::set_reputation_policy`]. When absent (legacy
+/// deployments), readers fall back to the compile-time defaults.
+///
+/// ## Policy semantics
+/// Decay is modelled as **deterministic time buckets** (#1082). Time is divided
+/// into consecutive buckets of `decay_interval_secs` seconds. Each time the
+/// score is (re)computed at ledger time `now`, the whole number of buckets that
+/// have elapsed since `last_decay_at` is `buckets = (now - last_decay_at) /
+/// decay_interval_secs`. The score is then multiplied by
+/// `(10_000 - decay_bps) / 10_000` exactly `buckets` times, using floor
+/// (truncating) integer arithmetic so the result is identical for the same
+/// inputs and can never exceed the pre-decay value.
+///
+/// ### Determinism & safety guarantees
+/// - **Same history → same score.** The decayed score is a pure function of the
+///   stored `trust_score`, `last_decay_at`, the policy, and the ledger time.
+///   Repeated reads at the same ledger time always return the same value.
+/// - **No underflow / no inflation.** Decay only ever multiplies by a factor
+///   `<= 1`, saturating at `0`. It can never produce a negative score or create
+///   trust that was not earned.
+/// - **Bounded CPU.** At most [`MAX_DECAY_INTERVALS_PER_CALL`] buckets are
+///   applied in a single evaluation; any remaining elapsed time is carried
+///   forward and applied on the next lazy or scheduled evaluation, keeping every
+///   call within the contract budget even after years of inactivity.
+///
+/// ### Lazy vs scheduled application
+/// - **Lazy:** decay is applied automatically inside every read
+///   ([`OnboardingContract::get_trust_score`],
+///   [`OnboardingContract::get_reputation_state`]) and write
+///   ([`OnboardingContract::update_reputation`],
+///   [`OnboardingContract::update_reputation_for_settlement`]). Callers always
+///   observe a current score without any background job.
+/// - **Scheduled:** off-chain indexers / cron jobs can force an evaluation and
+///   persist the result via
+///   [`OnboardingContract::apply_reputation_decay_now`], keeping scores current
+///   independently of user activity.
+///
+/// Successful increments are rejected while
+/// `now < last_success_update_at + update_cooldown_secs`. Inside each
+/// `farming_window_secs` window, at most `max_successful_per_window` successful
+/// increments are credited. Disputed increments are never delayed or capped —
+/// adverse outcomes always apply so bad actors cannot hide behind cooldown.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReputationPolicy {
+    /// Seconds between decay steps applied to `trust_score`.
+    pub decay_interval_secs: u64,
+    /// Basis points of trust score removed each decay interval (max 10_000).
+    pub decay_bps: u32,
+    /// Minimum seconds between credited successful trust-score increases.
+    pub update_cooldown_secs: u64,
+    /// Rolling window length for the anti-farming cap.
+    pub farming_window_secs: u64,
+    /// Maximum successful increments credited inside one farming window.
+    pub max_successful_per_window: u32,
+}
+
+/// Per-user decaying trust score and anti-farming window (#939).
+///
+/// Lifetime trade counters on [`UserProfile`] remain an audit trail; this state
+/// is the marketplace-facing trust metric that decays and resists farming.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReputationState {
+    /// Decaying trust score. +1 per credited success, −1 per dispute.
+    pub trust_score: u32,
+    /// Ledger timestamp when decay was last applied.
+    pub last_decay_at: u64,
+    /// Ledger timestamp of the last *credited* successful increment.
+    pub last_success_update_at: u64,
+    /// Start of the current anti-farming window.
+    pub window_started_at: u64,
+    /// Successful increments already credited in the current window.
+    pub window_successful_applied: u32,
+}
+
+/// Reason code for a reputation history entry (#939).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(u32)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+enum ReputationReasonCode {
+    /// Requested deltas were fully credited.
+    Applied = 0,
+    /// Successful delta blocked by update cooldown (disputes may still apply).
+    CooldownBlocked = 1,
+    /// Successful delta reduced or zeroed by the farming-window cap.
+    FarmingCapped = 2,
+    /// Successful delta rejected because no meaningful settlement value was supplied.
+    BelowMinimumSettlement = 3,
+}
+
+/// Public reputation history entry returned to clients (#939).
+///
+/// Indexers and abuse-detection tooling reconstruct farming / cooldown patterns
+/// from this log. `reason` is one of `"applied"`, `"cooldown_blocked"`,
+/// `"farming_capped"`, `"below_minimum_settlement"`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReputationHistoryEntry {
+    pub timestamp: u64,
+    pub successful_requested: u32,
+    pub disputed_requested: u32,
+    pub successful_applied: u32,
+    pub disputed_applied: u32,
+    pub trust_score_after: u32,
+    pub reason: Symbol,
+}
+
+/// Compact on-chain reputation history record (#939).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+struct CompactReputationHistoryEntry {
+    pub timestamp: u64,
+    pub successful_requested: u32,
+    pub disputed_requested: u32,
+    pub successful_applied: u32,
+    pub disputed_applied: u32,
+    pub trust_score_after: u32,
+    pub reason: ReputationReasonCode,
+}
+
+/// Errors returned by the onboarding contract.
+///
+/// All variants map to a `u32` discriminant so they can be returned as
+/// Soroban contract errors and decoded by SDK clients.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Error {
+    /// Contract has not been initialized — call `initialize` first
+    NotInitialized = 1,
+    /// No profile found for the given address
+    UserNotFound = 2,
+    /// The requested username is already registered by another user
+    UsernameTaken = 3,
+    /// Normalized username is shorter than `min_username_length`
+    UsernameTooShort = 4,
+    /// Normalized username is longer than `max_username_length`
+    UsernameTooLong = 5,
+    /// Role value is not valid for the requested operation
+    InvalidRole = 6,
+    /// A profile already exists for this address
+    AlreadyOnboarded = 7,
+    /// Caller is not authorized to perform this operation
+    Unauthorized = 8,
+    /// The profile has been deactivated and cannot be used
+    ProfileDeactivated = 9,
+    /// Cannot deactivate a profile that has active escrows
+    ActiveEscrowsExist = 10,
+    /// Username change fee must be ≥ 0
+    InvalidFee = 11,
+    /// Operation requires the user to have the `Artisan` role
+    NotAnArtisan = 12,
+    /// The provided portfolio CID does not pass IPFS CID validation
+    InvalidPortfolioCid = 13,
+    /// Username change cooldown period has not yet elapsed (30 days)
+    CooldownActive = 14,
+    /// Attempted to decrement active contract count below zero
+    ActiveContractUnderflow = 15,
+    /// The escrow contract is paused — onboarding is temporarily disabled
+    ContractPaused = 16,
+    /// Reputation policy parameters are invalid (#939)
+    InvalidReputationPolicy = 17,
+    /// Onboarding or verification rate limit exceeded (#940)
+    RateLimitExceeded = 18,
+    /// Proof-of-Humanity credential hash is already registered to another user (#940)
+    DuplicateIdentityCredential = 19,
+    /// Correlated identity hash is already linked to another user (#940)
+    DuplicateIdentityCorrelation = 20,
+    /// Profile is currently under administrative or automated review (#940)
+    ProfileUnderReview = 21,
+    /// Profile has been flagged for suspicious activity (#940)
+    ProfileFlagged = 22,
+    /// Proof-of-Humanity credential is invalid or missing (#940)
+    InvalidPohCredential = 23,
+    /// Proof-of-Humanity credential has expired (#940)
+    PohCredentialExpired = 24,
+    /// Cooldown period for manual verification request is still active (#940)
+    VerificationCooldownActive = 25,
+    /// The onboarding state revision cannot be incremented further.
+    StateRevisionExhausted = 26,
+    /// An onboarding attestation is absent, stale, malformed, or inconsistent.
+    InvalidAttestation = 27,
+    /// An operation binding has already been consumed.
+    AttestationReplay = 28,
+    /// Volume accumulator overflowed
+    VolumeOverflow = 29,
+    /// Escrow count accumulator overflowed (#1028)
+    EscrowCountOverflow = 30,
+    /// Active contracts accumulator overflowed (#1028)
+    ActiveContractOverflow = 31,
+    /// Profile schema version is not supported by this contract (#1056)
+    UnsupportedProfileVersion = 32,
+    /// Attempt rate policy contains an unusable limit configuration (#1084)
+    InvalidRateLimitPolicy = 33,
+    /// Review decision does not match the current profile revision (#1086)
+    ReviewRevisionMismatch = 34,
+    /// Review window expired before a decision was submitted (#1086)
+    ReviewExpired = 35,
+    /// Requested review transition is not valid from the current state (#1086)
+    InvalidReviewTransition = 36,
+    /// Caller is not an authorized Sybil reviewer (#1086)
+    UnauthorizedReviewer = 37,
+    /// Token transfer failed while collecting a fee.
+    TokenTransferFailed = 38,
+}
+
+/// Cross-contract interface the onboarding contract uses to query the escrow
+/// contract.
+///
+/// The `#[contractclient]` attribute generates an `EscrowClient` that onboarding
+/// uses to call into the configured [`OnboardingConfig::escrow_contract`]. This
+/// is the only outbound cross-contract dependency of the onboarding contract.
+///
+/// Integrators implementing an escrow-compatible contract must expose a matching
+/// `has_active_escrows` entrypoint with this exact signature, otherwise
+/// [`OnboardingContract::deactivate_profile`] will fail to resolve the call.
+#[soroban_sdk::contractclient(name = "EscrowClient")]
+pub trait EscrowInterface {
+    /// Returns `true` when `user` still has at least one open/active escrow.
+    ///
+    /// Called during [`OnboardingContract::deactivate_profile`] to enforce the
+    /// "no deactivation with active escrows" rule ([`Error::ActiveEscrowsExist`]).
+    ///
+    /// # Parameters
+    /// - `user`: address whose active-escrow status is being queried.
+    fn has_active_escrows(env: Env, user: Address) -> bool;
+    /// Returns `true` when the escrow contract is paused.
+    fn is_paused(env: Env) -> bool;
+}
+
+/// Normalize a raw username string into its canonical on-chain form.
+///
+/// # Integration notes — issue #497 / component #96
+///
+/// ## Purpose
+/// All username storage keys and uniqueness checks operate on the
+/// *normalized* form produced by this function. Clients and indexers
+/// must apply the same normalization before constructing lookup keys or
+/// comparing usernames.
+///
+/// ## Normalization rules (applied in order)
+/// 1. ASCII alphanumeric characters (`a-z`, `A-Z`, `0-9`) are kept and
+///    lowercased.
+/// 2. Separator characters (space ` `, underscore `_`, hyphen `-`,
+///    period `.`) are collapsed to a single `_`. Consecutive separators
+///    produce exactly one `_`; leading and trailing separators are
+///    stripped.
+/// 3. A subset of Latin-extended and Cyrillic Unicode code points are
+///    transliterated to their closest ASCII equivalents via
+///    `map_username_bytes` (e.g. `ä` → `a`, `ß` → `ss`). Zero-width
+///    joiners and BOM sequences are silently dropped.
+/// 4. Any other byte sequence that is not matched by the above rules is
+///    replaced with a single `_` separator (subject to the collapsing
+///    rule in step 2).
+/// 5. The result is always lowercase ASCII.
+///
+/// ## Input constraints
+/// - Maximum input length: 256 bytes. Inputs exceeding this limit cause
+///   a panic; callers should validate length before invoking.
+/// - The function does **not** enforce minimum or maximum username
+///   length — that is the responsibility of the calling function
+///   (`onboard_user`, `change_username`) using the configured
+///   `min_username_length` / `max_username_length` values.
+///
+/// ## Storage side-effects
+/// - None. This is a pure transformation with no persistent reads or
+///   writes.
+///
+/// ## Off-chain consumers
+/// - Apply the same rules client-side before calling `is_username_taken`
+///   or `get_user_by_username` to avoid false negatives caused by
+///   un-normalized input.
+/// - The `UserOnboarded` and `UsernameChanged` events carry the
+///   already-normalized username; use those values verbatim for display
+///   and reverse lookups.
+///
+/// # Arguments
+/// * `env` - Soroban environment reference
+/// * `username` - Raw username string provided by the caller
+///
+/// # Returns
+/// Normalized username as a `soroban_sdk::String` (lowercase ASCII,
+/// separators collapsed, no leading/trailing `_`).
+fn normalize_username(env: &Env, username: &String) -> String {
+    const MAX_INPUT_BYTES: usize = 256;
+    const MAX_OUTPUT_BYTES: usize = 256;
+    let len = username.len() as usize;
+    if len > MAX_INPUT_BYTES {
+        // Can't use env.panic_with_error here without Env.
+        // But we can just use unwrap() on a None or something similar if we want to save space,
+        // or just let it panic without a string.
+        panic!();
+    }
+
+    let mut buf = [0u8; MAX_INPUT_BYTES];
+    username.copy_into_slice(&mut buf[..len]);
+    let mut normalized = [0u8; MAX_OUTPUT_BYTES];
+    let mut out_len = 0usize;
+    let mut last_was_separator = false;
+    let mut index = 0usize;
+
+    while index < len {
+        let byte = buf[index];
+
+        if byte.is_ascii_alphanumeric() {
+            normalized[out_len] = byte.to_ascii_lowercase();
+            out_len += 1;
+            last_was_separator = false;
+            index += 1;
+            continue;
+        }
+
+        if matches!(byte, b' ' | b'_' | b'-' | b'.') {
+            if out_len > 0 && !last_was_separator {
+                normalized[out_len] = b'_';
+                out_len += 1;
+                last_was_separator = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((mapped, consumed)) = map_username_bytes(&buf[index..len]) {
+            for mapped_byte in mapped {
+                if *mapped_byte == b'_' {
+                    if out_len == 0 || last_was_separator {
+                        continue;
+                    }
+                    normalized[out_len] = b'_';
+                    out_len += 1;
+                    last_was_separator = true;
+                } else {
+                    normalized[out_len] = *mapped_byte;
+                    out_len += 1;
+                    last_was_separator = false;
+                }
+            }
+            index += consumed;
+            continue;
+        }
+
+        if out_len > 0 && !last_was_separator {
+            normalized[out_len] = b'_';
+            out_len += 1;
+            last_was_separator = true;
+        }
+        index += utf8_char_len(byte);
+    }
+
+    while out_len > 0 && normalized[out_len - 1] == b'_' {
+        out_len -= 1;
+    }
+
+    String::from_bytes(env, &normalized[..out_len])
+}
+
+/// Transliterate the leading multi-byte character of a username to its ASCII
+/// equivalent (component #48 — username normalization interface).
+///
+/// This is the lookup table that drives [`normalize_username`]: it maps the
+/// first UTF-8 character of `input` (accented Latin letters, Greek, and
+/// Cyrillic look-alikes, plus zero-width/BOM separators) to a stable ASCII
+/// byte sequence so that visually-similar usernames collapse to one canonical
+/// form. Canonicalization is what makes the `DataKey::Username` index a true
+/// uniqueness constraint and blocks homoglyph squatting (e.g. Cyrillic "о" vs
+/// Latin "o").
+///
+/// # Off-chain integration
+///
+/// Clients and indexers that need to predict the on-chain canonical username
+/// (for example, to check availability before submitting `onboard_user`) must
+/// reproduce this exact mapping. The mapping is intentionally append-only:
+/// existing entries are never repointed, so a username that normalized a given
+/// way on registration continues to resolve identically across upgrades.
+///
+/// # Parameters
+/// - `input`: the remaining username bytes, positioned at the start of a UTF-8
+///   character. Only the leading byte(s) are inspected.
+///
+/// # Returns
+/// - `Some((ascii, consumed))` — `ascii` is the replacement byte slice to emit
+///   and `consumed` is the number of input bytes the matched character
+///   occupied (so the caller can advance its cursor).
+/// - `None` — the leading character has no transliteration rule; the caller
+///   handles it with its default lowercasing/separator logic.
+fn map_username_bytes(input: &[u8]) -> Option<(&'static [u8], usize)> {
+    match input {
+        [0xC3, 0x84, ..]
+        | [0xC3, 0xA4, ..]
+        | [0xC3, 0x80, ..]
+        | [0xC3, 0xA0, ..]
+        | [0xC3, 0x81, ..]
+        | [0xC3, 0xA1, ..]
+        | [0xC3, 0x82, ..]
+        | [0xC3, 0xA2, ..]
+        | [0xC3, 0x83, ..]
+        | [0xC3, 0xA3, ..]
+        | [0xC3, 0x85, ..]
+        | [0xC3, 0xA5, ..]
+        | [0xCE, 0x91, ..]
+        | [0xD0, 0xB0, ..] => Some((b"a", 2)),
+        [0xC3, 0x87, ..] | [0xC3, 0xA7, ..] | [0xD0, 0xA1, ..] | [0xD1, 0x81, ..] => {
+            Some((b"c", 2))
+        }
+        [0xC3, 0x88, ..]
+        | [0xC3, 0xA8, ..]
+        | [0xC3, 0x89, ..]
+        | [0xC3, 0xA9, ..]
+        | [0xC3, 0x8A, ..]
+        | [0xC3, 0xAA, ..]
+        | [0xC3, 0x8B, ..]
+        | [0xC3, 0xAB, ..]
+        | [0xCE, 0x95, ..]
+        | [0xD0, 0x95, ..]
+        | [0xD0, 0xB5, ..] => Some((b"e", 2)),
+        [0xC3, 0x8D, ..]
+        | [0xC3, 0xAD, ..]
+        | [0xC3, 0x8E, ..]
+        | [0xC3, 0xAE, ..]
+        | [0xC3, 0x8F, ..]
+        | [0xC3, 0xAF, ..]
+        | [0xD0, 0x86, ..]
+        | [0xD1, 0x96, ..] => Some((b"i", 2)),
+        [0xC3, 0x91, ..] | [0xC3, 0xB1, ..] => Some((b"n", 2)),
+        [0xC3, 0x96, ..]
+        | [0xC3, 0xB6, ..]
+        | [0xC3, 0x93, ..]
+        | [0xC3, 0xB3, ..]
+        | [0xC3, 0x94, ..]
+        | [0xC3, 0xB4, ..]
+        | [0xC3, 0x95, ..]
+        | [0xC3, 0xB5, ..]
+        | [0xC3, 0x92, ..]
+        | [0xC3, 0xB2, ..]
+        | [0xC3, 0x98, ..]
+        | [0xC3, 0xB8, ..]
+        | [0xC5, 0x90, ..]
+        | [0xC5, 0x91, ..]
+        | [0xCE, 0x9F, ..]
+        | [0xD0, 0x9E, ..]
+        | [0xD0, 0xBE, ..] => Some((b"o", 2)),
+        [0xC3, 0x9C, ..]
+        | [0xC3, 0xBC, ..]
+        | [0xC3, 0x9A, ..]
+        | [0xC3, 0xBA, ..]
+        | [0xC3, 0x99, ..]
+        | [0xC3, 0xB9, ..]
+        | [0xC3, 0x9B, ..]
+        | [0xC3, 0xBB, ..] => Some((b"u", 2)),
+        [0xC3, 0x9F, ..] => Some((b"ss", 2)),
+        [0xC3, 0x86, ..] | [0xC3, 0xA6, ..] => Some((b"ae", 2)),
+        [0xC5, 0x92, ..] | [0xC5, 0x93, ..] => Some((b"oe", 2)),
+        [0xD0, 0xA0, ..] | [0xD1, 0x80, ..] => Some((b"p", 2)),
+        [0xD0, 0xA5, ..] | [0xD1, 0x85, ..] => Some((b"x", 2)),
+        [0xD0, 0xA3, ..] | [0xD1, 0x83, ..] => Some((b"y", 2)),
+        [0xD0, 0x9D, ..] | [0xD2, 0xBB, ..] => Some((b"h", 2)),
+        [0xE2, 0x80, 0x8B, ..]
+        | [0xE2, 0x80, 0x8C, ..]
+        | [0xE2, 0x80, 0x8D, ..]
+        | [0xE2, 0x81, 0xA0, ..]
+        | [0xEF, 0xBB, 0xBF, ..] => Some((b"", 3)),
+        _ => None,
+    }
+}
+
+/// Return the length, in bytes, of the UTF-8 character that begins with
+/// `first_byte` (component #48 — username normalization interface).
+///
+/// Used by [`normalize_username`] and [`map_username_bytes`] to advance the
+/// byte cursor one full character at a time when scanning a username, since
+/// `no_std` Soroban strings are processed as raw byte buffers rather than as
+/// `char` iterators. The length is derived purely from the leading byte's
+/// high bits per the UTF-8 encoding:
+///
+/// - `0x00..=0x7F` → 1 byte (ASCII)
+/// - `0xC0..=0xDF` → 2 bytes
+/// - `0xE0..=0xEF` → 3 bytes
+/// - `0xF0..=0xF7` → 4 bytes
+///
+/// # Parameters
+/// - `first_byte`: the first byte of a UTF-8 character.
+///
+/// # Returns
+/// The byte length of the character (1–4). Continuation bytes and any invalid
+/// leading byte fall back to `1` so the scanner always makes forward progress
+/// and never loops on malformed input.
+fn utf8_char_len(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// Validate IPFS CID format (v0 and v1 with multibase prefixes).
+///
+/// Shared validation logic for portfolio CIDs (Issue #112) and escrow
+/// metadata hashes. Returns `true` when the string is a well-formed CID;
+/// callers should treat `false` as `Error::InvalidPortfolioCid` in
+/// onboarding or the equivalent escrow error in the main contract.
+///
+/// Supports:
+/// - CIDv0: 46-char Base58btc starting with "Qm"
+/// - CIDv1 base32lower (prefix 'b'): lowercase a-z + 2-7
+/// - CIDv1 base16lower (prefix 'f'): lowercase hex 0-9 + a-f
+/// - CIDv1 base58btc  (prefix 'z'): Base58 alphabet
+fn is_base58_btc_char(byte: u8) -> bool {
+    BASE58_BTC_CHARSET[byte as usize]
+}
+
+fn validate_ipfs_cid(cid: &String) -> bool {
+    let len = cid.len() as usize;
+    if len == 0 || len > 128 {
+        return false;
+    }
+
+    let mut buf = [0u8; 128];
+    cid.copy_into_slice(&mut buf[0..len]);
+    let cid_bytes = &buf[0..len];
+
+    // CIDv0: exactly 46 chars, starts with "Qm", Base58btc alphabet
+    let is_v0 = len == 46
+        && cid_bytes[0] == b'Q'
+        && cid_bytes[1] == b'm'
+        && cid_bytes.iter().all(|b| is_base58_btc_char(*b));
+
+    if is_v0 {
+        return true;
+    }
+
+    // CIDv1: minimum 3 chars (multibase prefix + version byte + codec)
+    if len < 3 {
+        return false;
+    }
+
+    let prefix = cid_bytes[0];
+    let payload = &cid_bytes[1..];
+
+    match prefix {
+        // base32lower (most common CIDv1 encoding)
+        b'b' => {
+            // Stricter length check for typical CIDv1 base32 (sha256/dag-pb is 59 chars)
+            // Allow range for different hash types but enforce minimum for valid multihash payload
+            if !(50..=100).contains(&len) {
+                return false;
+            }
+            // Logic check: CIDv1 base32 ALWAYS starts with 'ba' because version byte 0x01
+            // starts with 'a' in base32 bit-alignment.
+            if cid_bytes[1] != b'a' {
+                return false;
+            }
+            payload
+                .iter()
+                .all(|b| matches!(*b, b'a'..=b'z' | b'2'..=b'7'))
+        }
+        // base16lower (hex)
+        b'f' => {
+            // CIDv1 base16 typically ~73 chars for sha256
+            if !(60..=120).contains(&len) {
+                return false;
+            }
+            // Logic check: CIDv1 base16 ALWAYS starts with 'f01' (0x01 version byte)
+            if cid_bytes[1] != b'0' || cid_bytes[2] != b'1' {
+                return false;
+            }
+            payload
+                .iter()
+                .all(|b| matches!(*b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        // base58btc
+        b'z' => {
+            // CIDv1 base58 typically ~50 chars
+            if !(40..=100).contains(&len) {
+                return false;
+            }
+            payload.iter().all(|b| is_base58_btc_char(*b))
+        }
+        _ => false,
+    }
+}
+
+#[contract]
+/// CraftNexus onboarding contract.
+///
+/// This contract owns the user onboarding registry (profiles + usernames) and
+/// exposes integration endpoints used by the escrow contract to:
+/// - Update reputation counters (`update_reputation`)
+/// - Update activity metrics (`update_user_metrics`)
+/// - Maintain the active-contract counter used for business rules
+///   (`update_active_contracts`)
+pub struct OnboardingContract;
+
+#[contractimpl]
+impl OnboardingContract {
+    fn get_queue_pointer(env: &Env, key: &DataKey) -> u64 {
+        Self::read_persistent(env, key).unwrap_or(0u64)
+    }
+
+    fn set_queue_pointer(env: &Env, key: DataKey, value: u64) {
+        env.storage().persistent().set(&key, &value);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn get_verification_queue_count(env: &Env) -> u32 {
+        Self::read_persistent(env, &DataKey::VerificationQueueCount).unwrap_or(0u32)
+    }
+
+    fn set_verification_queue_count(env: &Env, count: u32) {
+        let key = DataKey::VerificationQueueCount;
+        if count == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &count);
+            Self::extend_persistent(env, &key);
+        }
+    }
+
+    /// Decrement the pending verification request count without going negative.
+    ///
+    /// Issue #730: concurrent admin approve/clear of the same request must not
+    /// underflow this counter. Saturating subtraction keeps storage consistent
+    /// even if a caller clears after the pending marker is already gone.
+    fn decrement_verification_queue_count(env: &Env) {
+        let count = Self::get_verification_queue_count(env);
+        Self::set_verification_queue_count(env, count.saturating_sub(1));
+    }
+
+    fn is_verification_pending_internal(env: &Env, user: &Address) -> bool {
+        let key = DataKey::VerificationRequest(user.clone());
+        // Issue #702: pending markers live in temporary storage. Do not call
+        // extend_ttl — temporary entries are cleared on process/clear and rely
+        // on short default expiry rather than persistent rent extensions.
+        // Also accept a legacy persistent marker from pre-#702 deployments
+        // without refreshing its TTL (that would defeat this optimization).
+        env.storage().temporary().has(&key) || env.storage().persistent().has(&key)
+    }
+
+    fn enqueue_verification_request(env: &Env, user: &Address) {
+        let tail = Self::get_queue_pointer(env, &DataKey::VerificationQueueTail);
+        let queue_index_key = DataKey::VerificationQueueIndex(tail);
+        env.storage().persistent().set(&queue_index_key, user);
+        Self::extend_persistent(env, &queue_index_key);
+
+        let pending_key = DataKey::VerificationRequest(user.clone());
+        // Temporary write only — no extend_ttl (#702).
         env.storage()
+            .temporary()
+            .set(&pending_key, &env.ledger().timestamp());
+
+        Self::set_queue_pointer(env, DataKey::VerificationQueueTail, tail + 1);
+        let count = Self::get_verification_queue_count(env);
+        Self::set_verification_queue_count(env, count.saturating_add(1));
+    }
+
+    fn advance_verification_head(env: &Env) {
+        let mut head = Self::get_queue_pointer(env, &DataKey::VerificationQueueHead);
+        let tail = Self::get_queue_pointer(env, &DataKey::VerificationQueueTail);
+
+        while head < tail {
+            let queue_index_key = DataKey::VerificationQueueIndex(head);
+            let queued_user: Option<Address> = env.storage().persistent().get(&queue_index_key);
+
+            let Some(queued_user) = queued_user else {
+                head += 1;
+                continue;
+            };
+
+            if Self::is_verification_pending_internal(env, &queued_user) {
+                Self::extend_persistent(env, &queue_index_key);
+                break;
+            }
+
+            env.storage().persistent().remove(&queue_index_key);
+            head += 1;
+        }
+
+        Self::set_queue_pointer(env, DataKey::VerificationQueueHead, head);
+    }
+
+    /// Clear a pending verification request and compact the queue head.
+    ///
+    /// Returns `true` when a pending marker existed and was removed. Concurrent
+    /// admin clears of the same user are idempotent: the second call finds no
+    /// pending marker, skips the count decrement, and returns `false` (#730).
+    fn clear_verification_request(env: &Env, user: &Address) -> bool {
+        let pending_key = DataKey::VerificationRequest(user.clone());
+        if !Self::is_verification_pending_internal(env, user) {
+            return false;
+        }
+
+        env.storage().temporary().remove(&pending_key);
+        // Drop any legacy persistent marker left by pre-#702 deployments.
+        env.storage().persistent().remove(&pending_key);
+        Self::decrement_verification_queue_count(env);
+        Self::advance_verification_head(env);
+        true
+    }
+
+    fn get_attempt_rate_policy_internal(env: &Env) -> AttemptRatePolicy {
+        Self::read_persistent(env, &DataKey::AttemptRatePolicy).unwrap_or_else(|| {
+            AttemptRatePolicy {
+                revision: 1,
+                onboarding_window_secs: Self::read_persistent(
+                    env,
+                    &DataKey::OnboardRateLimitWindow,
+                )
+                .unwrap_or(3_600),
+                max_onboarding_per_account: Self::read_persistent(
+                    env,
+                    &DataKey::MaxOnboardAttempts,
+                )
+                .unwrap_or(3),
+                max_onboarding_global: 100,
+                verification_window_secs: 86_400,
+                max_verification_per_account: 3,
+                max_verification_global: 100,
+            }
+        })
+    }
+
+    fn roll_attempt_window(now: u64, window: u64, mut record: RateLimitRecord) -> RateLimitRecord {
+        if window == 0 || now >= record.window_start.saturating_add(window) {
+            record.window_start = now;
+            record.count = 0;
+        }
+        record.last_attempt = now;
+        record
+    }
+
+    /// Check both account and global capacity before writing either tracker.
+    fn consume_attempt_capacity(env: &Env, user: &Address, verification: bool) {
+        let policy = Self::get_attempt_rate_policy_internal(env);
+        let now = env.ledger().timestamp();
+        let (account_key, global_key, window, account_max, global_max, operation) = if verification
+        {
+            (
+                DataKey::VerifyRateLimitTracker(user.clone()),
+                DataKey::GlobalVerifyRateLimit,
+                policy.verification_window_secs,
+                policy.max_verification_per_account,
+                policy.max_verification_global,
+                Symbol::new(env, "verification"),
+            )
+        } else {
+            (
+                DataKey::RateLimitTracker(user.clone()),
+                DataKey::GlobalOnboardingRateLimit,
+                policy.onboarding_window_secs,
+                policy.max_onboarding_per_account,
+                policy.max_onboarding_global,
+                Symbol::new(env, "onboarding"),
+            )
+        };
+
+        let account = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &account_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+        let global = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &global_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+
+        let limited_scope = if account_max > 0 && account.count >= account_max {
+            Some((Symbol::new(env, "account"), account.window_start))
+        } else if global_max > 0 && global.count >= global_max {
+            Some((Symbol::new(env, "global"), global.window_start))
+        } else {
+            None
+        };
+
+        if let Some((scope, window_start)) = limited_scope {
+            env.events().publish(
+                (Symbol::new(env, "AttemptRateLimited"), operation.clone()),
+                AttemptRateLimitedEvent {
+                    schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                    user: user.clone(),
+                    operation,
+                    scope,
+                    policy_revision: policy.revision,
+                    retry_after: window_start.saturating_add(window),
+                },
+            );
+            env.panic_with_error(Error::RateLimitExceeded);
+        }
+
+        let mut next_account = account;
+        next_account.count = next_account.count.saturating_add(1);
+        let mut next_global = global;
+        next_global.count = next_global.count.saturating_add(1);
+        env.storage().persistent().set(&account_key, &next_account);
+        Self::extend_persistent(env, &account_key);
+        env.storage().persistent().set(&global_key, &next_global);
+        Self::extend_persistent(env, &global_key);
+    }
+
+    fn enqueue_review_request(env: &Env, user: &Address) {
+        let tail = Self::get_queue_pointer(env, &DataKey::ReviewQueueTail);
+        let queue_index_key = DataKey::ReviewQueueIndex(tail);
+        env.storage().persistent().set(&queue_index_key, user);
+        Self::extend_persistent(env, &queue_index_key);
+        Self::set_queue_pointer(env, DataKey::ReviewQueueTail, tail + 1);
+    }
+
+    fn advance_review_head(env: &Env) {
+        let mut head = Self::get_queue_pointer(env, &DataKey::ReviewQueueHead);
+        let tail = Self::get_queue_pointer(env, &DataKey::ReviewQueueTail);
+
+        while head < tail {
+            let queue_index_key = DataKey::ReviewQueueIndex(head);
+            let queued_user: Option<Address> = env.storage().persistent().get(&queue_index_key);
+
+            let Some(queued_user) = queued_user else {
+                head += 1;
+                continue;
+            };
+
+            let profile_opt = Self::try_get_user_profile(env, queued_user.clone());
+            if let Some(profile) = profile_opt {
+                if profile.status == ProfileStatus::UnderReview {
+                    Self::extend_persistent(env, &queue_index_key);
+                    break;
+                }
+            }
+
+            env.storage().persistent().remove(&queue_index_key);
+            head += 1;
+        }
+
+        Self::set_queue_pointer(env, DataKey::ReviewQueueHead, head);
+    }
+
+    fn read_username_fee_token(env: &Env) -> Option<Address> {
+        Self::read_persistent(env, &DataKey::UsernameChangeFeeToken)
+    }
+
+    /// Resolve the wallet that receives username-change fees.
+    ///
+    /// Reads `DataKey::UserChangeFeeWallet`; when unset, falls back to
+    /// `config.platform_admin`. Extends TTL when the key exists.
+    fn read_username_fee_wallet(env: &Env, config: &OnboardingConfig) -> Address {
+        Self::read_persistent(env, &DataKey::UserChangeFeeWallet)
+            .unwrap_or_else(|| config.platform_admin.clone())
+    }
+
+    /// Load persisted activity metrics for `address`, or zeroed defaults.
+    ///
+    /// Extends TTL on `DataKey::UserMetrics(address)` when an entry exists.
+    fn read_user_metrics(env: &Env, address: &Address) -> UserMetrics {
+        Self::read_persistent(env, &DataKey::UserMetrics(address.clone())).unwrap_or(UserMetrics {
+            total_escrow_count: 0,
+            total_volume: 0,
+        })
+    }
+
+    /// Map a compact verification action code to its canonical string label.
+    ///
+    /// Labels are stable API surface for indexers consuming
+    /// [`VerificationEntry::action`] via [`OnboardingContract::get_verification_history`].
+    fn verification_action_to_string(env: &Env, action: VerificationActionCode) -> Symbol {
+        match action {
+            VerificationActionCode::Requested => symbol_short!("requested"),
+            VerificationActionCode::Approved => symbol_short!("approved"),
+            VerificationActionCode::Rejected => symbol_short!("rejected"),
+            VerificationActionCode::AutoVerified => Symbol::new(env, "auto_verified"),
+            VerificationActionCode::UsernameChangedRevoked => Symbol::new(env, "username_revoked"),
+        }
+    }
+
+    /// Parse a legacy verification-history action string into a compact code.
+    ///
+    /// Used during lazy migration from `DataKey::VerificationHistory` (Vec) to
+    /// indexed compact entries (#519). Unknown strings map to
+    /// `UsernameChangedRevoked`.
+    ///
+    /// # Component #84: Integration Interface Documentation
+    ///
+    /// ## Overview
+    /// The onboarding contract provides a unified interface for managing user profiles,
+    /// role assignments, and verification workflows on the CraftNexus platform.
+    ///
+    /// ## Core Structures
+    ///
+    /// ### UserProfile
+    /// - **Purpose**: Represents a user's complete onboarding state
+    /// - **Preconditions**: Must be initialized via `onboard_user` before access
+    /// - **Storage**: Persistent key `DataKey::UserProfile(address)` with TTL auto-refresh
+    /// - **Events Emitted**: `UserOnboardedEvent`, `RoleUpdated`, `PortfolioUpdated`
+    ///
+    /// ### OnboardingConfig
+    /// - **Purpose**: System-wide settings for verification, username constraints
+    /// - **Preconditions**: Must be initialized before any user operations
+    /// - **Storage**: Singleton `DataKey::Config` with extended TTL for stability
+    /// - **Modifiable By**: Platform admin only
+    ///
+    /// ### UserMetrics
+    /// - **Purpose**: Tracks escrow volume and count for auto-verification eligibility
+    /// - **Preconditions**: Populated only by escrow contract via `update_user_metrics`
+    /// - **Storage**: `DataKey::UserMetrics(address)` updated asynchronously
+    /// - **Side-Effects**: Auto-verification triggers when thresholds met
+    ///
+    /// ## API Parameters & Validation
+    ///
+    /// ### Username Constraints (Component #84)
+    /// - **Format**: Normalized to lowercase, UTF-8 canonical form
+    /// - **Length**: 3-50 characters after normalization
+    /// - **Uniqueness**: Case-insensitive across all users (enforced via `DataKey::Username`)
+    /// - **Reserved Names**: "admin" and derivations permanently reserved
+    /// - **Change Cooldown**: 30 days between successive changes (prevents abuse)
+    ///
+    /// ### Role Transitions (Endpoint #85)
+    /// - **Valid Roles**: Buyer, Artisan, Moderator (None and Admin excluded)
+    /// - **Authorization**: Platform admin only; enforced via `require_auth()`
+    /// - **Audit Trail**: All transitions logged to `VerifyHistoryIndexed`
+    /// - **Event Emission**: `RoleUpdated` carries (user, old_role, new_role)
+    ///
+    /// ### Verification Workflow
+    /// - **Auto-Verification**: Triggered when metrics meet thresholds (configurable)
+    /// - **Manual Requests**: Queued in FIFO order via `VerificationQueueHead/Tail`
+    /// - **History**: Last 10 entries retained per user (compact indexed format #519)
+    /// - **State Machine**: none → requested → {approved|rejected} → verified
+    ///
+    /// ## Storage Optimization (Issue #82)
+    /// - **Compact Types**: Uses `symbol_short` and flat `CompactVerificationEntry`
+    /// - **TTL Strategy**: Entries extended only on active reads to conserve rent
+    /// - **Lazy Migration**: Legacy Vec entries converted to indexed on first access
+    /// - **Rent Calculation**: ~600 stroops/ledger for typical profile (28 bytes)
+    ///
+    /// ## Check-Effect-Interactions Pattern (Security)
+    /// All state-mutating endpoints follow strict ordering:
+    /// 1. **Check**: Validate authorization, preconditions, constraints
+    /// 2. **Effect**: Update persistent storage, emit events
+    /// 3. **Interact**: External token transfers (e.g., username change fees) LAST
+    ///
+    /// This prevents reentrancy where malicious callers trigger intermediate states
+    /// via callbacks on arbitrary token contracts before final balance settlement.
+    fn parse_verification_action(env: &Env, action: &Symbol) -> VerificationActionCode {
+        if action == &symbol_short!("requested") {
+            VerificationActionCode::Requested
+        } else if action == &symbol_short!("approved") {
+            VerificationActionCode::Approved
+        } else if action == &symbol_short!("rejected") {
+            VerificationActionCode::Rejected
+        } else if action == &Symbol::new(env, "auto_verified") {
+            VerificationActionCode::AutoVerified
+        } else {
+            VerificationActionCode::UsernameChangedRevoked
+        }
+    }
+
+    fn migrate_legacy_verification_history(env: &Env, user: &Address) {
+        let legacy_key = DataKey::VerificationHistory(user.clone());
+        if !env.storage().persistent().has(&legacy_key) {
+            return;
+        }
+
+        let history: Vec<VerificationEntry> = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Username(normalized.clone()));
-        env.storage()
+            .get(&legacy_key)
+            .unwrap_or(Vec::new(env));
+
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
+        let mut count: u32 = 0;
+        for i in 0..history.len() {
+            if let Some(entry) = history.get(i) {
+                let compact = CompactVerificationEntry {
+                    timestamp: entry.timestamp,
+                    action: Self::parse_verification_action(env, &entry.action),
+                    by: entry.by.clone(),
+                };
+                let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), i);
+                env.storage().persistent().set(&entry_key, &compact);
+                Self::extend_persistent(env, &entry_key);
+                count = i + 1;
+            }
+        }
+
+        if count > 0 {
+            env.storage().persistent().set(&count_key, &count);
+            Self::extend_persistent(env, &count_key);
+        }
+
+        env.storage().persistent().remove(&legacy_key);
+    }
+
+    /// Append a verification history entry with FIFO circular-buffer semantics.
+    ///
+    /// [FEATURE #83] Enhanced business flow: Maintains a compact sliding window of verification
+    /// actions for audit trails and compliance reporting. Implements circular-buffer semantics
+    /// to enforce bounded storage while preserving temporal ordering of recent events.
+    ///
+    /// Developer note: the historical record is stored in indexed slots under
+    /// `DataKey::VerifyHistoryIndexed(user, slot)` and the logical order is defined by
+    /// `DataKey::VerifyHistoryCount(user)`. Readers must iterate from slot `0` through
+    /// `count - 1`; writers must not write to an arbitrary slot based on timestamps or the
+    /// current append count once the buffer is full. When the buffer reaches capacity, older
+    /// entries are shifted down and the new entry is written to the tail slot. This preserves
+    /// the recent history without corrupting earlier entries.
+    ///
+    /// When history reaches MAX_VERIFICATION_HISTORY (10 entries), oldest entries are shifted
+    /// and the newest entry is appended at the tail. This enables long-running contract states
+    /// to support arbitration reviews without unbounded storage growth.
+    ///
+    /// # Arguments
+    /// * `user` - Address of the user whose history is updated
+    /// * `action` - Compact verification action code (Requested, Approved, etc.)
+    /// * `by` - Optional moderator/admin address that triggered the action
+    ///
+    /// # Storage Side-Effects
+    /// - Reads/writes `DataKey::VerifyHistoryCount(user)` (4 bytes)
+    /// - Reads/writes up to 10 entries of `DataKey::VerifyHistoryIndexed(user, slot)`
+    /// - Each entry is ~24 bytes (timestamp u64 + action u32 + optional address 32 bytes)
+    /// - Extends TTL on count and all affected entries to prevent archival
+    ///
+    /// # Performance (Issue #82)
+    /// - Amortized O(1) append for count < MAX_VERIFICATION_HISTORY
+    /// - O(MAX_VERIFICATION_HISTORY) shift cost when buffer is full (rare operation)
+    /// - Single TTL bump per entry = ~100 CPU instructions (vs Vec iteration = 1000+)
+    ///
+    /// # Check-Effect-Interactions
+    /// 1. Check: Validate MAX_VERIFICATION_HISTORY constraint
+    /// 2. Effect: Update persistent storage and TTL
+    /// 3. Interact: No external calls; purely on-chain state management
+    fn append_verification_history(
+        env: &Env,
+        user: &Address,
+        action: VerificationActionCode,
+        by: Option<Address>,
+    ) {
+        Self::migrate_legacy_verification_history(env, user);
+
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
+        // [PERFORMANCE #94] Extend TTL on read so the count key does not expire while
+        // the buffer is still in active use. Without this bump a count entry close to
+        // its TTL deadline could be archived on the same ledger as the write that follows,
+        // silently resetting the history length to zero on the next call.
+        let count: u32 = if let Some(c) = env.storage().persistent().get(&count_key) {
+            Self::extend_persistent(env, &count_key);
+            c
+        } else {
+            0
+        };
+
+        // [FEATURE #83] Circular-buffer rotation for active contracts:
+        // When history is full, shift older entries down and append new entry at end.
+        // This supports long-lived arbitration scenarios without unbounded growth.
+        let slot = if count >= MAX_VERIFICATION_HISTORY {
+            // Shift entries: move index i down to i-1 for all i in [1, MAX-1]
+            for i in 1..MAX_VERIFICATION_HISTORY {
+                let src_key = DataKey::VerifyHistoryIndexed(user.clone(), i);
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, CompactVerificationEntry>(&src_key)
+                {
+                    let dst_key = DataKey::VerifyHistoryIndexed(user.clone(), i - 1);
+                    env.storage().persistent().set(&dst_key, &entry);
+                    Self::extend_persistent(env, &dst_key);
+                    env.storage().persistent().remove(&src_key);
+                }
+            }
+            MAX_VERIFICATION_HISTORY - 1
+        } else {
+            count
+        };
+
+        let entry = CompactVerificationEntry {
+            timestamp: env.ledger().timestamp(),
+            action,
+            by,
+        };
+        let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), slot);
+        env.storage().persistent().set(&entry_key, &entry);
+        Self::extend_persistent(env, &entry_key);
+
+        let new_count = if count >= MAX_VERIFICATION_HISTORY {
+            MAX_VERIFICATION_HISTORY
+        } else {
+            count + 1
+        };
+        env.storage().persistent().set(&count_key, &new_count);
+        Self::extend_persistent(env, &count_key);
+    }
+
+    /// Default reputation decay / anti-farming policy (#939).
+    fn default_reputation_policy() -> ReputationPolicy {
+        ReputationPolicy {
+            decay_interval_secs: DEFAULT_REPUTATION_DECAY_INTERVAL_SECS,
+            decay_bps: DEFAULT_REPUTATION_DECAY_BPS,
+            update_cooldown_secs: DEFAULT_REPUTATION_UPDATE_COOLDOWN_SECS,
+            farming_window_secs: DEFAULT_REPUTATION_FARMING_WINDOW_SECS,
+            max_successful_per_window: DEFAULT_MAX_SUCCESSFUL_PER_WINDOW,
+        }
+    }
+
+    /// Load the reputation policy, falling back to compile-time defaults.
+    fn get_reputation_policy_internal(env: &Env) -> ReputationPolicy {
+        Self::read_persistent(env, &DataKey::ReputationPolicy)
+            .unwrap_or_else(Self::default_reputation_policy)
+    }
+
+    fn get_minimum_reputation_settlement_internal(env: &Env) -> i128 {
+        Self::read_persistent(env, &DataKey::MinRepSettlement)
+            .unwrap_or(DEFAULT_MIN_REPUTATION_SETTLEMENT)
+    }
+
+    /// Convert a token-native amount to the platform's 7-decimal base.
+    fn normalize_token_amount(env: &Env, amount: i128, token_address: &Address) -> i128 {
+        let token_client = token::Client::new(env, token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        if token_decimals < base_decimals {
+            amount.saturating_mul(10i128.pow(base_decimals - token_decimals))
+        } else if token_decimals > base_decimals {
+            amount / 10i128.pow(token_decimals - base_decimals)
+        } else {
+            amount
+        }
+    }
+
+    /// Load or initialize per-user reputation state.
+    fn get_or_init_reputation_state(env: &Env, user: &Address) -> ReputationState {
+        let key = DataKey::ReputationState(user.clone());
+        if let Some(state) = Self::read_persistent::<_, ReputationState>(env, &key) {
+            state
+        } else {
+            let now = env.ledger().timestamp();
+            ReputationState {
+                trust_score: 0,
+                last_decay_at: now,
+                last_success_update_at: 0,
+                window_started_at: now,
+                window_successful_applied: 0,
+            }
+        }
+    }
+
+    /// Persist reputation state and refresh TTL.
+    fn persist_reputation_state(env: &Env, user: &Address, state: &ReputationState) {
+        let key = DataKey::ReputationState(user.clone());
+        env.storage().persistent().set(&key, state);
+        Self::extend_persistent(env, &key);
+    }
+
+    /// Pure deterministic decay arithmetic (#1082).
+    ///
+    /// Applies `steps` decay buckets to `score`, each multiplying by
+    /// `retain_bps / 10_000` with **floor** integer division. The computation is
+    /// a pure function of its arguments: identical inputs always yield the same
+    /// output, it is monotone non-increasing (`retain_bps <= 10_000`), saturates
+    /// at `0`, and can never inflate the score.
+    fn decay_score(score: u32, retain_bps: u32, steps: u64) -> u32 {
+        if steps == 0 || score == 0 {
+            return score;
+        }
+        let denom = REPUTATION_BPS_DENOMINATOR as u128;
+        let retain = retain_bps as u128;
+        let mut value = score as u128;
+        let mut applied = 0u64;
+        while applied < steps && value > 0 {
+            let next = value.saturating_mul(retain) / denom;
+            // Guard against any arithmetic anomaly creating score from nothing:
+            // decay must never increase the score.
+            if next >= value {
+                break;
+            }
+            value = next;
+            applied += 1;
+        }
+        value as u32
+    }
+
+    /// Lazily apply time-based trust-score decay per policy (#939 / #1082).
+    ///
+    /// Decay is bucketised: the number of full `decay_interval_secs` buckets
+    /// elapsed since `last_decay_at` is applied via [`Self::decay_score`].
+    /// Returns `true` when `trust_score` changed. At most
+    /// [`MAX_DECAY_INTERVALS_PER_CALL`] buckets are applied in one call; leftover
+    /// elapsed time is carried forward on the next lazy or scheduled evaluation
+    /// so the result is deterministic and CPU-bounded even after long idleness.
+    fn apply_reputation_decay(
+        env: &Env,
+        state: &mut ReputationState,
+        policy: &ReputationPolicy,
+    ) -> bool {
+        if policy.decay_interval_secs == 0 || policy.decay_bps == 0 || state.trust_score == 0 {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        // Initialise the decay reference on first observation; no decay yet.
+        if state.last_decay_at == 0 {
+            state.last_decay_at = now;
+            return false;
+        }
+        if now <= state.last_decay_at {
+            return false;
+        }
+
+        // Time buckets: whole buckets elapsed since the last application.
+        let elapsed = now - state.last_decay_at;
+        let mut buckets = elapsed / policy.decay_interval_secs;
+        if buckets == 0 {
+            return false;
+        }
+        if buckets > MAX_DECAY_INTERVALS_PER_CALL {
+            buckets = MAX_DECAY_INTERVALS_PER_CALL;
+        }
+
+        let retain_bps = REPUTATION_BPS_DENOMINATOR.saturating_sub(policy.decay_bps);
+        let decayed = Self::decay_score(state.trust_score, retain_bps, buckets);
+        let changed = decayed != state.trust_score;
+        state.trust_score = decayed;
+
+        // Advance the reference by exactly the buckets we applied, keeping the
+        // decay grid aligned so subsequent evaluations stay deterministic.
+        state.last_decay_at = state
+            .last_decay_at
+            .saturating_add(buckets.saturating_mul(policy.decay_interval_secs));
+        changed
+    }
+
+    /// Compute how many successful increments may be credited under cooldown
+    /// and farming-window rules. Disputed deltas are never limited here.
+    fn credit_successful_delta(
+        env: &Env,
+        state: &mut ReputationState,
+        policy: &ReputationPolicy,
+        successful_delta: u32,
+    ) -> (u32, ReputationReasonCode) {
+        if successful_delta == 0 {
+            return (0, ReputationReasonCode::Applied);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Cooldown: reject rapid successful inflation.
+        if policy.update_cooldown_secs > 0
+            && state.last_success_update_at > 0
+            && now
+                < state
+                    .last_success_update_at
+                    .saturating_add(policy.update_cooldown_secs)
+        {
+            return (0, ReputationReasonCode::CooldownBlocked);
+        }
+
+        // Farming window: roll the window forward when expired.
+        if policy.farming_window_secs == 0 {
+            // Window disabled — credit fully (still subject to cooldown above).
+            return (successful_delta, ReputationReasonCode::Applied);
+        }
+
+        if now
+            >= state
+                .window_started_at
+                .saturating_add(policy.farming_window_secs)
+            || state.window_started_at == 0
+        {
+            state.window_started_at = now;
+            state.window_successful_applied = 0;
+        }
+
+        let remaining = policy
+            .max_successful_per_window
+            .saturating_sub(state.window_successful_applied);
+        if remaining == 0 {
+            return (0, ReputationReasonCode::FarmingCapped);
+        }
+
+        let applied = if successful_delta > remaining {
+            remaining
+        } else {
+            successful_delta
+        };
+
+        let reason = if applied < successful_delta {
+            ReputationReasonCode::FarmingCapped
+        } else {
+            ReputationReasonCode::Applied
+        };
+        (applied, reason)
+    }
+
+    fn reputation_reason_symbol(env: &Env, reason: ReputationReasonCode) -> Symbol {
+        match reason {
+            ReputationReasonCode::Applied => Symbol::new(env, "applied"),
+            ReputationReasonCode::CooldownBlocked => Symbol::new(env, "cooldown_blocked"),
+            ReputationReasonCode::FarmingCapped => Symbol::new(env, "farming_capped"),
+            ReputationReasonCode::BelowMinimumSettlement => {
+                Symbol::new(env, "below_minimum_settlement")
+            }
+        }
+    }
+
+    /// Append a reputation history entry with FIFO circular-buffer semantics (#939).
+    fn append_reputation_history(
+        env: &Env,
+        user: &Address,
+        successful_requested: u32,
+        disputed_requested: u32,
+        successful_applied: u32,
+        disputed_applied: u32,
+        trust_score_after: u32,
+        reason: ReputationReasonCode,
+    ) {
+        let count_key = DataKey::ReputationHistoryCount(user.clone());
+        let count: u32 = if let Some(c) = env.storage().persistent().get(&count_key) {
+            Self::extend_persistent(env, &count_key);
+            c
+        } else {
+            0
+        };
+
+        let slot = if count >= MAX_REPUTATION_HISTORY {
+            for i in 1..MAX_REPUTATION_HISTORY {
+                let src_key = DataKey::RepHistoryIndexed(user.clone(), i);
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, CompactReputationHistoryEntry>(&src_key)
+                {
+                    let dst_key = DataKey::RepHistoryIndexed(user.clone(), i - 1);
+                    env.storage().persistent().set(&dst_key, &entry);
+                    Self::extend_persistent(env, &dst_key);
+                    env.storage().persistent().remove(&src_key);
+                }
+            }
+            MAX_REPUTATION_HISTORY - 1
+        } else {
+            count
+        };
+
+        let entry = CompactReputationHistoryEntry {
+            timestamp: env.ledger().timestamp(),
+            successful_requested,
+            disputed_requested,
+            successful_applied,
+            disputed_applied,
+            trust_score_after,
+            reason,
+        };
+        let entry_key = DataKey::RepHistoryIndexed(user.clone(), slot);
+        env.storage().persistent().set(&entry_key, &entry);
+        Self::extend_persistent(env, &entry_key);
+
+        let new_count = if count >= MAX_REPUTATION_HISTORY {
+            MAX_REPUTATION_HISTORY
+        } else {
+            count + 1
+        };
+        env.storage().persistent().set(&count_key, &new_count);
+        Self::extend_persistent(env, &count_key);
+    }
+
+    fn collect_username_change_fee(
+        env: &Env,
+        user: &Address,
+        config: &OnboardingConfig,
+        snapshotted_token: Option<Address>,
+    ) {
+        let fee_amount: i128 = env
+            .storage()
             .persistent()
-            .remove(&DataKey::UserStateRevision(user.clone()));
-    });
+            .get(&DataKey::UsernameChangeFee)
+            .unwrap_or(0);
 
-    let recovered = client.onboard_user(&user, &username, &UserRole::Buyer);
-    assert_eq!(recovered.address, original.address);
-    assert_eq!(recovered.registered_at, original.registered_at);
-    assert_eq!(recovered.state_version, 1);
-    assert_eq!(client.get_active_user_count(), active_count);
-    assert_eq!(client.get_user_by_username(&username).address, user);
-}
+        if fee_amount <= 0 {
+            return;
+        }
 
-#[test]
-fn test_explicit_recovery_restores_profile_indexes() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "explicit_repair");
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-    let normalized = normalize_username(&env, &username);
+        Self::extend_persistent(env, &DataKey::UsernameChangeFee);
 
-    env.as_contract(&client.address, || {
-        env.storage()
+        let fee_token = match snapshotted_token {
+            Some(ref token) => {
+                let current = Self::read_username_fee_token(env)
+                    .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+                assert_eq!(current, *token, "Fee token changed mid-call");
+                current
+            }
+            None => Self::read_username_fee_token(env)
+                .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized)),
+        };
+        let fee_wallet = Self::read_username_fee_wallet(env, config);
+
+        let token_client = token::Client::new(env, &fee_token);
+        match token_client.try_transfer(user, &fee_wallet, &fee_amount) {
+            Ok(Ok(())) => {}
+            _ => env.panic_with_error(Error::TokenTransferFailed),
+        }
+    }
+
+    fn string_to_bytes(env: &Env, s: &String) -> Bytes {
+        let mut cid_bytes = Bytes::new(env);
+        let len = s.len() as usize;
+        let mut buf = [0u8; 128];
+        s.copy_into_slice(&mut buf[..len]);
+        cid_bytes.extend_from_slice(&buf[..len]);
+        cid_bytes
+    }
+
+    fn stored_to_public(
+        env: &Env,
+        stored: StoredUserProfile,
+        portfolio_cid: Option<Bytes>,
+    ) -> UserProfile {
+        let state_version =
+            Self::read_persistent(env, &DataKey::UserStateRevision(stored.address.clone()))
+                .unwrap_or(1);
+        UserProfile {
+            version: stored.version,
+            address: stored.address,
+            role: stored.role,
+            username: stored.username,
+            registered_at: stored.registered_at,
+            is_verified: stored.is_verified,
+            successful_trades: stored.successful_trades,
+            disputed_trades: stored.disputed_trades,
+            portfolio_cid,
+            status: stored.status,
+            state_version,
+        }
+    }
+
+    fn public_to_stored(profile: &UserProfile) -> StoredUserProfile {
+        StoredUserProfile {
+            version: profile.version,
+            address: profile.address.clone(),
+            role: profile.role,
+            username: profile.username.clone(),
+            registered_at: profile.registered_at,
+            is_verified: profile.is_verified,
+            successful_trades: profile.successful_trades,
+            disputed_trades: profile.disputed_trades,
+            status: profile.status,
+        }
+    }
+    fn read_portfolio_cid(env: &Env, user: &Address) -> Option<Bytes> {
+        Self::read_persistent(env, &DataKey::UserPortfolio(user.clone()))
+    }
+
+    fn write_portfolio_cid(env: &Env, user: &Address, portfolio_cid: Option<Bytes>) {
+        let key = DataKey::UserPortfolio(user.clone());
+        match portfolio_cid {
+            Some(cid) => {
+                env.storage().persistent().set(&key, &cid);
+                Self::extend_persistent(env, &key);
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
+        }
+    }
+
+    fn persist_stored_user_profile(env: &Env, user: &Address, profile: &StoredUserProfile) {
+        let key = DataKey::UserProfile(user.clone());
+        env.storage().persistent().set(&key, profile);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn persist_public_user_profile(env: &Env, user: &Address, profile: &UserProfile) {
+        Self::persist_stored_user_profile(env, user, &Self::public_to_stored(profile));
+        Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        Self::bump_state_revision(env, user);
+    }
+
+    fn ensure_state_revision(env: &Env, user: &Address) {
+        let key = DataKey::UserStateRevision(user.clone());
+        if !env.storage().persistent().has(&key) {
+            env.storage().persistent().set(&key, &1u32);
+            Self::extend_persistent(env, &key);
+        }
+    }
+
+    fn bump_state_revision(env: &Env, user: &Address) {
+        let key = DataKey::UserStateRevision(user.clone());
+        let revision = env.storage().persistent().get::<_, u32>(&key).unwrap_or(0);
+        let next = revision
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::StateRevisionExhausted));
+        env.storage().persistent().set(&key, &next);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn state_revision(env: &Env, user: &Address) -> u64 {
+        let key = DataKey::UserStateRevision(user.clone());
+        let revision = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Username(normalized.clone()));
-    });
-
-    let recovered = client.recover_onboarding_profile(&user, &username);
-    assert_eq!(recovered.address, user);
-    assert_eq!(client.get_user_by_username(&username).address, user);
-}
-
-#[test]
-fn test_same_account_username_reservation_is_retryable() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "reserved_retry");
-    let normalized = normalize_username(&env, &username);
-
-    env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Username(normalized), &user);
-    });
-
-    let profile = client.onboard_user(&user, &username, &UserRole::Buyer);
-    assert_eq!(profile.address, user);
-    assert_eq!(client.get_user_by_username(&username).address, user);
-}
-
-#[test]
-fn test_onboard_username_too_short() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "ab");
-
-    let result = client.try_onboard_user(&user, &username, &UserRole::Buyer);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_onboard_username_too_long() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    // 51 character username (max is 50)
-    let long_username =
-        String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-
-    let result = client.try_onboard_user(&user, &long_username, &UserRole::Buyer);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_onboard_invalid_role() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "test");
-
-    let result = client.try_onboard_user(&user, &username, &UserRole::Admin);
-    assert!(result.is_err());
-}
-
-// ===== Username Uniqueness =====
-
-#[test]
-fn test_onboard_duplicate_username_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-    let username = String::from_str(&env, "craftsman");
-
-    client.onboard_user(&user1, &username, &UserRole::Buyer);
-    let result = client.try_onboard_user(&user2, &username, &UserRole::Artisan);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_onboard_duplicate_username_case_insensitive() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-
-    client.onboard_user(&user1, &String::from_str(&env, "Alice"), &UserRole::Buyer);
-    // "alice" should match "Alice" after normalization
-    let _result =
-        client.try_onboard_user(&user2, &String::from_str(&env, "alice"), &UserRole::Artisan);
-    let result =
-        client.try_onboard_user(&user2, &String::from_str(&env, "alice"), &UserRole::Artisan);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_onboard_duplicate_username_mixed_case() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-
-    client.onboard_user(
-        &user1,
-        &String::from_str(&env, "CraftMaster"),
-        &UserRole::Buyer,
-    );
-    let result = client.try_onboard_user(
-        &user2,
-        &String::from_str(&env, "CRAFTMASTER"),
-        &UserRole::Artisan,
-    );
-    assert!(result.is_err());
-}
-
-// ===== Username Lookup =====
-
-#[test]
-fn test_get_user_by_username() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "craft_user");
-
-    client.onboard_user(&user, &username, &UserRole::Buyer);
-
-    let profile = client.get_user_by_username(&username);
-    assert_eq!(profile.address, user);
-    assert_eq!(profile.username, Symbol::new(&env, "craft_user"));
-}
-
-#[test]
-fn test_get_user_by_username_case_insensitive() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "john_doe"), &UserRole::Buyer);
-
-    // Should find user regardless of case
-    let profile = client.get_user_by_username(&String::from_str(&env, "JOHN_DOE"));
-    assert_eq!(profile.address, user);
-
-    let profile2 = client.get_user_by_username(&String::from_str(&env, "John_Doe"));
-    assert_eq!(profile2.address, user);
-}
-
-#[test]
-#[should_panic]
-fn test_get_user_by_username_not_found() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    client.get_user_by_username(&String::from_str(&env, "nonexistent"));
-}
-
-// ===== Username Availability =====
-
-#[test]
-fn test_is_username_taken() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "craft_user");
-
-    // Before registration
-    assert!(!client.is_username_taken(&username));
-
-    client.onboard_user(&user, &username, &UserRole::Buyer);
-
-    // After registration
-    assert!(client.is_username_taken(&username));
-    // Case-insensitive check
-    assert!(client.is_username_taken(&String::from_str(&env, "CRAFT_USER")));
-    assert!(client.is_username_taken(&String::from_str(&env, "Craft_User")));
-    // Different username should be available
-    assert!(!client.is_username_taken(&String::from_str(&env, "other_user")));
-}
-
-// ===== Existing Feature Tests =====
-
-#[test]
-fn test_get_user() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "test_user");
-
-    client.onboard_user(&user, &username, &UserRole::Buyer);
-
-    let profile = client.get_user(&user);
-    assert_eq!(profile.username, Symbol::new(&env, "test_user"));
-}
-
-#[test]
-#[should_panic]
-fn test_get_user_not_found() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.get_user(&user); // Should panic
-}
-
-#[test]
-fn test_is_onboarded() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-
-    assert!(!client.is_onboarded(&user));
-
-    client.onboard_user(&user, &String::from_str(&env, "test"), &UserRole::Buyer);
-
-    assert!(client.is_onboarded(&user));
-}
-
-#[test]
-fn test_get_user_role() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let buyer = Address::generate(&env);
-    let artisan = Address::generate(&env);
-
-    client.onboard_user(
-        &buyer,
-        &String::from_str(&env, "buyer_user"),
-        &UserRole::Buyer,
-    );
-    client.onboard_user(
-        &artisan,
-        &String::from_str(&env, "artisan_user"),
-        &UserRole::Artisan,
-    );
-
-    assert_eq!(client.get_user_role(&buyer), UserRole::Buyer);
-    assert_eq!(client.get_user_role(&artisan), UserRole::Artisan);
-    assert_eq!(
-        client.get_user_role(&Address::generate(&env)),
-        UserRole::None
-    );
-}
-
-#[test]
-fn test_update_user_role() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "test_user"),
-        &UserRole::Buyer,
-    );
-
-    let updated = client.update_user_role(&user, &UserRole::Artisan);
-    assert_eq!(updated.role, UserRole::Artisan);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_update_user_role_to_admin_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "test_user_admin"),
-        &UserRole::Buyer,
-    );
-
-    // This should panic with Error::InvalidRole (code 6)
-    client.update_user_role(&user, &UserRole::Admin);
-}
-
-#[test]
-fn test_set_moderator() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "moderator_user"),
-        &UserRole::Buyer,
-    );
-
-    let updated = client.set_moderator(&user);
-    assert_eq!(updated.role, UserRole::Moderator);
-    assert!(client.has_role(&user, &UserRole::Moderator));
-}
-
-#[test]
-fn test_verify_user() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "test_user"),
-        &UserRole::Artisan,
-    );
-
-    let verified = client.verify_user(&user);
-    assert!(verified.is_verified);
-}
-
-#[test]
-fn test_has_role() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "test_user"),
-        &UserRole::Artisan,
-    );
-
-    assert!(client.has_role(&user, &UserRole::Artisan));
-    assert!(!client.has_role(&user, &UserRole::Buyer));
-}
-
-#[test]
-fn test_is_verified() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "test_user"),
-        &UserRole::Artisan,
-    );
-
-    assert!(!client.is_verified(&user));
-
-    client.verify_user(&user);
-
-    assert!(client.is_verified(&user));
-}
-
-// ============================================================
-// Issue #63 – Artisan Verification Logic Enhancement
-// ============================================================
-
-/// Reputation counters are zero for a freshly onboarded user.
-#[test]
-fn test_new_user_has_zero_reputation() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "artisan1"),
-        &UserRole::Artisan,
-    );
-
-    let (successful, disputed) = client.get_user_reputation(&user);
-    assert_eq!(successful, 0);
-    assert_eq!(disputed, 0);
-}
-
-/// get_user_metrics returns zeroed struct for a user with no recorded activity.
-#[test]
-fn test_get_user_metrics_defaults_to_zero() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty"), &UserRole::Artisan);
-
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, 0);
-    assert_eq!(metrics.total_volume, 0);
-}
-
-/// auto_verify_user returns false (no-op) when thresholds are not yet met.
-#[test]
-fn test_auto_verify_not_triggered_below_threshold() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty2"), &UserRole::Artisan);
-
-    // No metrics recorded yet – should not verify
-    let verified = client.auto_verify_user(&user);
-    assert!(!verified);
-    assert!(!client.is_verified(&user));
-}
-
-/// update_user_metrics triggers auto-verification once thresholds are crossed.
-#[test]
-fn test_auto_verify_triggers_on_threshold() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty3"), &UserRole::Artisan);
-
-    // Default thresholds: 5 escrows and 10_000_000_000 volume.
-    // Call update_user_metrics with enough to cross both thresholds.
-    let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin);
-    client.update_user_metrics(&user, &5u32, &10_000_000_000i128, &token.address());
-
-    // Should now be auto-verified
-    assert!(client.is_verified(&user));
-
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, 5);
-    assert_eq!(metrics.total_volume, 10_000_000_000);
-}
-
-#[test]
-fn test_auto_verify_can_be_disabled() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "manualonly"),
-        &UserRole::Artisan,
-    );
-
-    client.set_auto_verify_enabled(&false);
-
-    let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin);
-    client.update_user_metrics(&user, &5u32, &10_000_000_000i128, &token.address());
-
-    assert!(!client.is_verified(&user));
-    assert!(!client.auto_verify_user(&user));
-
-    client.verify_user(&user);
-    assert!(client.is_verified(&user));
-
-    let config = client.get_config();
-    assert!(!config.auto_verify_enabled);
-}
-
-/// auto_verify_user is a no-op on an already verified user.
-#[test]
-fn test_auto_verify_no_op_when_already_verified() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty4"), &UserRole::Artisan);
-
-    // Manual admin verification
-    client.verify_user(&user);
-    assert!(client.is_verified(&user));
-
-    // Public auto_verify should be a no-op
-    let result = client.auto_verify_user(&user);
-    assert!(!result); // false because already verified
-}
-
-/// Manual verification override still works regardless of metrics.
-#[test]
-fn test_manual_verification_override() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty5"), &UserRole::Artisan);
-
-    // No metrics, but admin verifies manually
-    client.verify_user(&user);
-    assert!(client.is_verified(&user));
-}
-
-/// Verification thresholds can be updated by admin.
-#[test]
-fn test_configurable_thresholds() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "arty6"), &UserRole::Artisan);
-
-    // Lower thresholds to 1 escrow and 1 unit of volume
-    client.set_verification_thresholds(&1u32, &1i128);
-
-    // Providing minimal metrics should now trigger auto-verification
-    let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin);
-    client.update_user_metrics(&user, &1u32, &1i128, &token.address());
-    assert!(client.is_verified(&user));
-}
-
-/// request_verification adds the user to the queue exactly once.
-#[test]
-fn test_request_verification_queue() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "queued1"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user);
-
-    let queue = client.get_verification_queue();
-    assert_eq!(queue.len(), 1);
-
-    // Calling again is idempotent
-    client.request_verification(&user);
-    let queue2 = client.get_verification_queue();
-    assert_eq!(queue2.len(), 1);
-}
-
-/// process_verification_request with approve=true verifies the user and clears queue.
-#[test]
-fn test_process_verification_request_approve() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "queued2"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user);
-    client.process_verification_request(&user, &true);
-
-    assert!(client.is_verified(&user));
-
-    // Queue should now be empty
-    let queue = client.get_verification_queue();
-    assert_eq!(queue.len(), 0);
-}
-
-/// process_verification_request with approve=false leaves user unverified.
-#[test]
-fn test_process_verification_request_reject() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "queued3"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user);
-    client.process_verification_request(&user, &false);
-
-    assert!(!client.is_verified(&user));
-    let queue = client.get_verification_queue();
-    assert_eq!(queue.len(), 0);
-}
-
-#[test]
-fn test_process_verification_request_preserves_other_pending_users() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user_one = Address::generate(&env);
-    let user_two = Address::generate(&env);
-
-    client.onboard_user(
-        &user_one,
-        &String::from_str(&env, "queued4"),
-        &UserRole::Artisan,
-    );
-    client.onboard_user(
-        &user_two,
-        &String::from_str(&env, "queued5"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user_one);
-    client.request_verification(&user_two);
-    client.process_verification_request(&user_one, &true);
-
-    let queue = client.get_verification_queue();
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue.get(0), Some(user_two));
-}
-
-/// [SECURITY] Endpoint #53 (issue #454): `process_verification_request` is the
-/// privileged verification state transition and must reject any caller that is
-/// not the platform admin. With no auth mocked, `require_auth()` aborts the
-/// invocation and the Soroban host rolls the transaction back before the target
-/// profile's `is_verified` flag is touched.
-#[test]
-#[should_panic]
-fn test_process_verification_request_unauthorized() {
-    let env = Env::default();
-
-    // Deliberately do NOT call env.mock_all_auths(); we want require_auth() to
-    // enforce real authorization so an unauthorized invocation rolls back.
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    // Seed the config and a target profile directly as the contract so the
-    // endpoint is reachable without running `initialize` (which itself requires
-    // auth). This isolates the test to the endpoint's own authorization guard.
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-
-    env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-        let profile = StoredUserProfile {
+            .get::<_, u32>(&key)
+            .unwrap_or(1u32);
+        Self::extend_persistent_if_present(env, &key);
+        revision as u64
+    }
+
+    fn attestation_digest(
+        env: &Env,
+        account: &Address,
+        profile_version: u32,
+        role: UserRole,
+        is_verified: bool,
+        status: ProfileStatus,
+        state_revision: u64,
+        ledger_sequence: u32,
+        operation_id: &Bytes,
+        contract_instance: &Address,
+    ) -> BytesN<32> {
+        let mut payload = Bytes::from_slice(env, b"CRAFTNEXUS_ONBOARDING_ATTESTATION_V1");
+        let account_string = account.to_string();
+        let mut account_bytes = [0u8; 64];
+        let account_len = account_string.len() as usize;
+        payload.extend_from_slice(&(account_len as u32).to_be_bytes());
+        account_string.copy_into_slice(&mut account_bytes[..account_len]);
+        payload.extend_from_slice(&account_bytes[..account_len]);
+        payload.extend_from_slice(&profile_version.to_be_bytes());
+        payload.push_back(role as u8);
+        payload.push_back(if is_verified { 1 } else { 0 });
+        payload.push_back(status as u8);
+        payload.extend_from_slice(&state_revision.to_be_bytes());
+        payload.extend_from_slice(&ledger_sequence.to_be_bytes());
+        payload.extend_from_slice(&(operation_id.len() as u32).to_be_bytes());
+        payload.append(operation_id);
+        let contract_string = contract_instance.to_string();
+        let mut contract_bytes = [0u8; 64];
+        let contract_len = contract_string.len() as usize;
+        payload.extend_from_slice(&(contract_len as u32).to_be_bytes());
+        contract_string.copy_into_slice(&mut contract_bytes[..contract_len]);
+        payload.extend_from_slice(&contract_bytes[..contract_len]);
+        env.crypto().sha256(&payload).into()
+    }
+
+    /// Ensure the reverse username index points at the canonical account.
+    /// A missing index is a recoverable partial-onboarding state; an index
+    /// owned by another account is a real uniqueness conflict (#1085).
+    fn ensure_username_claim(env: &Env, normalized: &String, user: &Address) {
+        let key = DataKey::Username(normalized.clone());
+        match Self::read_persistent::<_, Address>(env, &key) {
+            Some(owner) if owner != *user => env.panic_with_error(Error::UsernameTaken),
+            Some(_) => Self::extend_persistent(env, &key),
+            None => {
+                env.storage().persistent().set(&key, user);
+                Self::extend_persistent(env, &key);
+            }
+        }
+    }
+
+    /// Repair secondary state for an existing account-keyed canonical profile.
+    fn repair_onboarding_state(env: &Env, normalized: &String, user: &Address) {
+        Self::ensure_username_claim(env, normalized, user);
+        let version_key = DataKey::UserStateRevision(user.clone());
+        if !env.storage().persistent().has(&version_key) {
+            env.storage().persistent().set(&version_key, &1u32);
+        }
+        Self::extend_persistent(env, &version_key);
+    }
+
+    fn migrate_embedded_versioned_profile(
+        env: &Env,
+        user: &Address,
+        profile: UserProfile,
+    ) -> (StoredUserProfile, bool) {
+        if profile.portfolio_cid.is_some() {
+            Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        }
+
+        let stored = StoredUserProfile {
             version: CURRENT_USER_PROFILE_VERSION,
-            address: user.clone(),
-            role: UserRole::Artisan,
-            username: soroban_sdk::Symbol::new(&env, "pending_user"),
-            registered_at: 0,
-            is_verified: false,
-            successful_trades: 0,
-            disputed_trades: 0,
+            address: profile.address,
+            role: profile.role,
+            username: profile.username,
+            registered_at: profile.registered_at,
+            is_verified: profile.is_verified,
+            successful_trades: profile.successful_trades,
+            disputed_trades: profile.disputed_trades,
+            status: profile.status,
+        };
+        Self::persist_stored_user_profile(env, user, &stored);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserStateRevision(user.clone()), &1u32);
+        Self::extend_persistent(env, &DataKey::UserStateRevision(user.clone()));
+        (stored, true)
+    }
+
+    fn migrate_legacy_profile(
+        env: &Env,
+        user: &Address,
+        legacy: LegacyUserProfile,
+    ) -> StoredUserProfile {
+        if let Some(cid) = legacy.portfolio_cid {
+            Self::write_portfolio_cid(env, user, Some(Self::string_to_bytes(env, &cid)));
+        }
+
+        let stored = StoredUserProfile {
+            version: CURRENT_USER_PROFILE_VERSION,
+            address: legacy.address,
+            role: legacy.role,
+            username: legacy.username,
+            registered_at: legacy.registered_at,
+            is_verified: legacy.is_verified,
+            successful_trades: legacy.successful_trades,
+            disputed_trades: legacy.disputed_trades,
             status: ProfileStatus::Active,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserProfile(user.clone()), &profile);
-    });
-
-    // No platform-admin signature is present, so require_auth() must panic and
-    // the verification state transition must never execute.
-    client.process_verification_request(&user, &true);
-}
-
-// ============================================================
-// Issue #41 – admin_clear_verification_request authorization
-// ============================================================
-
-/// Admin can force-clear a pending verification request, advancing the queue.
-#[test]
-fn test_admin_clear_verification_request_authorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "stale_req"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user);
-    assert!(client.is_verification_pending(&user));
-
-    let was_pending = client.admin_clear_verification_request(&user);
-    assert!(was_pending);
-
-    // Request is gone and the queue has been compacted.
-    assert!(!client.is_verification_pending(&user));
-    assert_eq!(client.get_verification_queue().len(), 0);
-
-    // The admin's authorization was the one that gated the call.
-    let auths = env.auths();
-    assert!(auths.iter().any(|(addr, _)| addr == &admin));
-}
-
-/// Clearing a user with no pending request is an idempotent no-op returning false.
-#[test]
-fn test_admin_clear_verification_request_no_pending() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "no_req"), &UserRole::Artisan);
-
-    let was_pending = client.admin_clear_verification_request(&user);
-    assert!(!was_pending);
-}
-
-/// Unauthorized callers cannot clear another user's verification request:
-/// without the admin signature the require_auth() check rolls the call back.
-#[test]
-#[should_panic]
-fn test_admin_clear_verification_request_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "victim"), &UserRole::Artisan);
-    client.request_verification(&user);
-
-    // Drop all mocked authorizations so the admin's require_auth() fails.
-    env.set_auths(&[]);
-    client.admin_clear_verification_request(&user);
-}
-
-/// A cleared request must not have flipped the user's verification status —
-/// force-clear is a queue-hygiene operation, not an approval.
-#[test]
-fn test_admin_clear_verification_request_does_not_verify() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "unverified"),
-        &UserRole::Artisan,
-    );
-
-    client.request_verification(&user);
-    client.admin_clear_verification_request(&user);
-
-    assert!(!client.is_verified(&user));
-}
-
-// ============================================================
-// Issue #730 – verification queue count underflow on multi-admin races
-// ============================================================
-
-fn read_verification_queue_count(env: &Env, contract: &Address) -> u32 {
-    env.as_contract(contract, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::VerificationQueueCount)
-            .unwrap_or(0u32)
-    })
-}
-
-/// Pending request count increments on enqueue and decrements once on clear.
-#[test]
-fn test_verification_queue_count_tracks_pending_requests() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user_a = Address::generate(&env);
-    let user_b = Address::generate(&env);
-    client.onboard_user(&user_a, &String::from_str(&env, "qcnt_a"), &UserRole::Artisan);
-    client.onboard_user(&user_b, &String::from_str(&env, "qcnt_b"), &UserRole::Artisan);
-
-    assert_eq!(read_verification_queue_count(&env, &client.address), 0);
-
-    client.request_verification(&user_a);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 1);
-
-    client.request_verification(&user_b);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 2);
-
-    client.admin_clear_verification_request(&user_a);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 1);
-
-    client.process_verification_request(&user_b, &true);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 0);
-}
-
-/// Two sequential admin clears of the same request must not drive the count negative.
-#[test]
-fn test_verification_queue_count_not_negative_on_double_clear() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "race_clr"), &UserRole::Artisan);
-
-    client.request_verification(&user);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 1);
-
-    // First admin wins the clear.
-    assert!(client.admin_clear_verification_request(&user));
-    assert_eq!(read_verification_queue_count(&env, &client.address), 0);
-
-    // Second admin's concurrent clear is a no-op for the counter (#730).
-    assert!(!client.admin_clear_verification_request(&user));
-    assert_eq!(
-        read_verification_queue_count(&env, &client.address),
-        0,
-        "queue count must stay non-negative after a raced second clear"
-    );
-    assert_eq!(client.get_verification_queue().len(), 0);
-}
-
-/// Approve then clear (or double-process) must not underflow the pending count.
-#[test]
-fn test_verification_queue_count_not_negative_on_process_then_clear() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "race_proc"), &UserRole::Artisan);
-
-    client.request_verification(&user);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 1);
-
-    // Admin A approves (clears + decrements once).
-    client.process_verification_request(&user, &true);
-    assert_eq!(read_verification_queue_count(&env, &client.address), 0);
-
-    // Admin B races a clear / second process against the same request.
-    assert!(!client.admin_clear_verification_request(&user));
-    client.process_verification_request(&user, &true);
-
-    assert_eq!(
-        read_verification_queue_count(&env, &client.address),
-        0,
-        "queue count must stay non-negative after process+clear race"
-    );
-    assert_eq!(client.get_verification_queue().len(), 0);
-}
-
-/// Verification history is tracked across request, approve, and auto-verify actions.
-#[test]
-fn test_verification_history_tracking() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "hist1"), &UserRole::Artisan);
-
-    // Request → Approve
-    client.request_verification(&user);
-    client.process_verification_request(&user, &true);
-
-    let history = client.get_verification_history(&user);
-    assert!(history.len() >= 2);
-}
-
-// ============================================================
-// Issue #100 – Reputation System (Trust Score)
-// ============================================================
-
-/// update_reputation increments successful_trades and disputed_trades correctly.
-#[test]
-fn test_update_reputation_increments_counters() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "rep1"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &2u32, &1u32);
-    let (successful, disputed) = client.get_user_reputation(&user);
-    assert_eq!(successful, 2);
-    assert_eq!(disputed, 1);
-
-    // Increments are additive
-    client.update_reputation(&user, &1u32, &0u32);
-    let (successful2, disputed2) = client.get_user_reputation(&user);
-    assert_eq!(successful2, 3);
-    assert_eq!(disputed2, 1);
-}
-
-/// get_user_reputation returns (0, 0) for an unknown address.
-#[test]
-fn test_get_user_reputation_unknown_address() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let unknown = Address::generate(&env);
-
-    let (successful, disputed) = client.get_user_reputation(&unknown);
-    assert_eq!(successful, 0);
-    assert_eq!(disputed, 0);
-}
-
-/// update_reputation on an unknown address silently skips without panicking.
-#[test]
-fn test_update_reputation_unknown_address_is_no_op() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let unknown = Address::generate(&env);
-
-    // Should not panic
-    client.update_reputation(&unknown, &1u32, &0u32);
-    let (successful, disputed) = client.get_user_reputation(&unknown);
-    assert_eq!(successful, 0);
-    assert_eq!(disputed, 0);
-}
-
-/// Issue #100 / #666 — update_reputation with zero trades is a no-op.
-#[test]
-fn test_reputation_zero_trades_no_op() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "repzero"),
-        &UserRole::Artisan,
-    );
-
-    client.update_reputation(&user, &0u32, &0u32);
-    let (successful, disputed) = client.get_user_reputation(&user);
-    assert_eq!(successful, 0);
-    assert_eq!(disputed, 0);
-}
-
-/// Issue #100 / #666 — update_reputation with u32::MAX handles overflow with saturating add.
-#[test]
-fn test_reputation_max_trades_no_overflow() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "repmax"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &u32::MAX, &u32::MAX);
-    let (successful, disputed) = client.get_user_reputation(&user);
-    assert_eq!(successful, u32::MAX);
-    assert_eq!(disputed, u32::MAX);
-
-    // Adding more does not overflow or panic, saturates at u32::MAX
-    client.update_reputation(&user, &10u32, &10u32);
-    let (successful2, disputed2) = client.get_user_reputation(&user);
-    assert_eq!(successful2, u32::MAX);
-    assert_eq!(disputed2, u32::MAX);
-}
-
-// ============================================================
-// Issue #939 – Reputation Decay & Anti-Farming Controls
-// ============================================================
-
-/// Default policy is seeded on initialize.
-#[test]
-fn test_reputation_policy_defaults_on_initialize() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let policy = client.get_reputation_policy();
-
-    assert_eq!(
-        policy.decay_interval_secs,
-        DEFAULT_REPUTATION_DECAY_INTERVAL_SECS
-    );
-    assert_eq!(policy.decay_bps, DEFAULT_REPUTATION_DECAY_BPS);
-    assert_eq!(
-        policy.update_cooldown_secs,
-        DEFAULT_REPUTATION_UPDATE_COOLDOWN_SECS
-    );
-    assert_eq!(
-        policy.farming_window_secs,
-        DEFAULT_REPUTATION_FARMING_WINDOW_SECS
-    );
-    assert_eq!(
-        policy.max_successful_per_window,
-        DEFAULT_MAX_SUCCESSFUL_PER_WINDOW
-    );
-    assert_eq!(
-        client.get_min_reputation_settlement(),
-        DEFAULT_MIN_REPUTATION_SETTLEMENT
-    );
-}
-
-/// Low-value completions are audited without changing score or consuming limits.
-#[test]
-fn test_reputation_requires_meaningful_completed_settlement() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 2_000);
-
-    let (client, _) = setup_test(&env);
-    client.set_reputation_policy(&1_000_000u64, &0u32, &3_600u64, &86_400u64, &2u32);
-    client.set_min_reputation_settlement(&10_000_000i128);
-
-    let token = register_decimal_test_token(&env, 7);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "settle1"),
-        &UserRole::Artisan,
-    );
-
-    // Repeated dust settlements never gain trust or consume the account cap.
-    for _ in 0..3 {
-        client.update_reputation_for_settlement(&user, &1u32, &0u32, &9_999_999i128, &token);
+        Self::persist_stored_user_profile(env, user, &stored);
+        Self::ensure_state_revision(env, user);
+        stored
     }
-    assert_eq!(client.get_trust_score(&user), 0);
-    assert_eq!(client.get_user_reputation(&user), (0, 0));
-    assert_eq!(
-        client.get_reputation_state(&user).window_successful_applied,
-        0
-    );
 
-    // A meaningful completion at the same timestamp still receives its score.
-    client.update_reputation_for_settlement(&user, &1u32, &0u32, &10_000_000i128, &token);
-    assert_eq!(client.get_trust_score(&user), 1);
-    assert_eq!(client.get_user_reputation(&user), (1, 0));
+    fn try_get_stored_user_profile(env: &Env, user: Address) -> Option<(StoredUserProfile, bool)> {
+        let key = DataKey::UserProfile(user.clone());
+        let stored: Val = env.storage().persistent().get(&key)?;
+        let map = Map::<Symbol, Val>::try_from_val(env, &stored).expect("");
+        let version_key = symbol_short!("version");
+        let portfolio_key = Symbol::new(env, "portfolio_cid");
 
-    // A second qualifying completion is still subject to the normal cooldown.
-    client.update_reputation_for_settlement(&user, &1u32, &0u32, &10_000_000i128, &token);
-    assert_eq!(client.get_trust_score(&user), 1);
-    assert_eq!(client.get_user_reputation(&user), (1, 0));
+        if !map.contains_key(version_key) {
+            let legacy = LegacyUserProfile::try_from_val(env, &stored)
+                .expect("User profile storage corrupted");
+            return Some((Self::migrate_legacy_profile(env, &user, legacy), true));
+        }
 
-    let history = client.get_reputation_history(&user);
-    assert_eq!(history.len(), 5);
-    for index in 0..3 {
-        let entry = history.get(index).unwrap();
-        assert_eq!(entry.reason, Symbol::new(&env, "below_minimum_settlement"));
-        assert_eq!(entry.successful_requested, 1);
-        assert_eq!(entry.successful_applied, 0);
-        assert_eq!(entry.trust_score_after, 0);
+        if map.contains_key(portfolio_key) {
+            let profile =
+                UserProfile::try_from_val(env, &stored).expect("User profile storage corrupted");
+            return Some(Self::migrate_embedded_versioned_profile(
+                env, &user, profile,
+            ));
+        }
+
+        let mut profile =
+            StoredUserProfile::try_from_val(env, &stored).expect("User profile storage corrupted");
+
+        // Validate profile version is supported (#1056)
+        Self::assert_profile_version_supported(env, profile.version);
+
+        let mut changed = false;
+        if profile.version < CURRENT_USER_PROFILE_VERSION {
+            profile.version = CURRENT_USER_PROFILE_VERSION;
+            changed = true;
+        }
+
+        if changed {
+            Self::persist_stored_user_profile(env, &user, &profile);
+        } else {
+            Self::extend_persistent(env, &key);
+        }
+        Self::ensure_state_revision(env, &user);
+
+        Some((profile, changed))
     }
-    assert_eq!(history.get(3).unwrap().reason, Symbol::new(&env, "applied"));
-    assert_eq!(
-        history.get(4).unwrap().reason,
-        Symbol::new(&env, "cooldown_blocked")
-    );
-}
 
-/// Settlement thresholds compare normalized values across token decimals.
-#[test]
-fn test_reputation_minimum_settlement_normalizes_token_decimals() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-    client.set_min_reputation_settlement(&10_000_000i128);
-
-    let six_decimal_token = register_decimal_test_token(&env, 6);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "settle2"),
-        &UserRole::Artisan,
-    );
-
-    // One whole 6-decimal token normalizes to one whole 7-decimal token.
-    client.update_reputation_for_settlement(
-        &user,
-        &1u32,
-        &0u32,
-        &1_000_000i128,
-        &six_decimal_token,
-    );
-    assert_eq!(client.get_trust_score(&user), 1);
-}
-
-/// Adverse outcomes cannot be hidden behind the minimum-settlement gate.
-#[test]
-fn test_reputation_low_value_settlement_still_applies_dispute() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-    let token = register_decimal_test_token(&env, 7);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "settle3"),
-        &UserRole::Artisan,
-    );
-
-    client.update_reputation(&user, &2u32, &0u32);
-    client.update_reputation_for_settlement(&user, &1u32, &1u32, &1i128, &token);
-
-    assert_eq!(client.get_trust_score(&user), 1);
-    assert_eq!(client.get_user_reputation(&user), (2, 1));
-    let history = client.get_reputation_history(&user);
-    let last = history.get(history.len() - 1).unwrap();
-    assert_eq!(last.successful_applied, 0);
-    assert_eq!(last.disputed_applied, 1);
-    assert_eq!(last.reason, Symbol::new(&env, "below_minimum_settlement"));
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #17)")]
-fn test_minimum_reputation_settlement_rejects_negative_value() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    client.set_min_reputation_settlement(&-1i128);
-}
-
-/// Successful reputation gains are blocked by the update cooldown.
-#[test]
-fn test_reputation_cooldown_blocks_rapid_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000;
-    });
-
-    let (client, _) = setup_test(&env);
-    // Keep farming permissive; exercise cooldown only.
-    client.set_reputation_policy(
-        &DEFAULT_REPUTATION_DECAY_INTERVAL_SECS,
-        &DEFAULT_REPUTATION_DECAY_BPS,
-        &3_600u64, // 1 hour cooldown
-        &0u64,
-        &u32::MAX,
-    );
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "cool1"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &1u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 1);
-    assert_eq!(client.get_user_reputation(&user), (1, 0));
-
-    // Immediate second success must be blocked.
-    client.update_reputation(&user, &1u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 1);
-    assert_eq!(client.get_user_reputation(&user), (1, 0));
-
-    let history = client.get_reputation_history(&user);
-    assert_eq!(history.len(), 2);
-    assert_eq!(
-        history.get(1).unwrap().reason,
-        Symbol::new(&env, "cooldown_blocked")
-    );
-    assert_eq!(history.get(1).unwrap().successful_applied, 0);
-
-    // After cooldown elapses, success is credited again.
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000 + 3_600 + 1;
-    });
-    client.update_reputation(&user, &1u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 2);
-    assert_eq!(client.get_user_reputation(&user), (2, 0));
-}
-
-/// Disputed increments still apply while success is cooldown-blocked.
-#[test]
-fn test_reputation_cooldown_allows_disputed() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.timestamp = 5_000;
-    });
-
-    let (client, _) = setup_test(&env);
-    client.set_reputation_policy(
-        &DEFAULT_REPUTATION_DECAY_INTERVAL_SECS,
-        &0u32, // no decay noise
-        &3_600u64,
-        &0u64,
-        &u32::MAX,
-    );
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "cool2"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &3u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 3);
-
-    // Success blocked, dispute applied → trust drops.
-    client.update_reputation(&user, &2u32, &1u32);
-    assert_eq!(client.get_trust_score(&user), 2);
-    assert_eq!(client.get_user_reputation(&user), (3, 1));
-
-    let history = client.get_reputation_history(&user);
-    let last = history.get(history.len() - 1).unwrap();
-    assert_eq!(last.reason, Symbol::new(&env, "cooldown_blocked"));
-    assert_eq!(last.successful_applied, 0);
-    assert_eq!(last.disputed_applied, 1);
-}
-
-/// Anti-farming window caps rapid successful inflation.
-#[test]
-fn test_reputation_farming_window_caps_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.timestamp = 10_000;
-    });
-
-    let (client, _) = setup_test(&env);
-    client.set_reputation_policy(
-        &DEFAULT_REPUTATION_DECAY_INTERVAL_SECS,
-        &0u32,
-        &0u64, // no cooldown so farming alone is tested
-        &86_400u64,
-        &5u32,
-    );
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "farm1"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &3u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 3);
-
-    client.update_reputation(&user, &3u32, &0u32);
-    // Only 2 more fit under the cap of 5.
-    assert_eq!(client.get_trust_score(&user), 5);
-    assert_eq!(client.get_user_reputation(&user), (5, 0));
-
-    let history = client.get_reputation_history(&user);
-    let last = history.get(history.len() - 1).unwrap();
-    assert_eq!(last.reason, Symbol::new(&env, "farming_capped"));
-    assert_eq!(last.successful_requested, 3);
-    assert_eq!(last.successful_applied, 2);
-
-    // Further success in the same window is fully blocked.
-    client.update_reputation(&user, &1u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 5);
-
-    // After the window rolls, credits resume.
-    env.ledger().with_mut(|li| {
-        li.timestamp = 10_000 + 86_400 + 1;
-    });
-    client.update_reputation(&user, &2u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 7);
-}
-
-/// Trust score decays over time according to policy.
-#[test]
-fn test_reputation_decay_over_time() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.timestamp = 100;
-    });
-
-    let (client, _) = setup_test(&env);
-    // 10% decay every 1_000 seconds; no cooldown/farming interference.
-    client.set_reputation_policy(&1_000u64, &1_000u32, &0u64, &0u64, &u32::MAX);
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "decay1"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &100u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 100);
-    // Lifetime counters are an audit trail and do not decay.
-    assert_eq!(client.get_user_reputation(&user), (100, 0));
-
-    env.ledger().with_mut(|li| {
-        li.timestamp = 100 + 1_000;
-    });
-    // One interval: 100 * 0.9 = 90
-    assert_eq!(client.get_trust_score(&user), 90);
-
-    env.ledger().with_mut(|li| {
-        li.timestamp = 100 + 2_000;
-    });
-    // Second interval: 90 * 0.9 = 81
-    assert_eq!(client.get_trust_score(&user), 81);
-    assert_eq!(client.get_user_reputation(&user), (100, 0));
-}
-
-/// Score history records applied and blocked updates for pattern detection.
-#[test]
-fn test_reputation_history_detects_farming_pattern() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.timestamp = 50_000;
-    });
-
-    let (client, _) = setup_test(&env);
-    client.set_reputation_policy(&1_000_000u64, &0u32, &0u64, &86_400u64, &2u32);
-
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "hist1"), &UserRole::Artisan);
-
-    client.update_reputation(&user, &2u32, &0u32);
-    client.update_reputation(&user, &1u32, &0u32); // capped to 0 remaining
-    client.update_reputation(&user, &1u32, &0u32); // still capped
-
-    let history = client.get_reputation_history(&user);
-    assert_eq!(history.len(), 3);
-    assert_eq!(history.get(0).unwrap().reason, Symbol::new(&env, "applied"));
-    assert_eq!(history.get(0).unwrap().successful_applied, 2);
-    assert_eq!(
-        history.get(1).unwrap().reason,
-        Symbol::new(&env, "farming_capped")
-    );
-    assert_eq!(history.get(1).unwrap().successful_applied, 0);
-    assert_eq!(
-        history.get(2).unwrap().reason,
-        Symbol::new(&env, "farming_capped")
-    );
-
-    // Repeated zero-applied successes in history = detectable farming pattern.
-    let blocked: u32 = history
-        .iter()
-        .filter(|e| e.successful_requested > 0 && e.successful_applied == 0)
-        .count() as u32;
-    assert_eq!(blocked, 2);
-}
-
-/// Invalid decay_bps is rejected.
-#[test]
-#[should_panic(expected = "Error(Contract, #17)")]
-fn test_set_reputation_policy_rejects_invalid_decay_bps() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    client.set_reputation_policy(&1_000u64, &10_001u32, &0u64, &0u64, &5u32);
-}
-
-// ============================================================
-// Issue #1082 – Deterministic Reputation Decay Policy
-// ============================================================
-
-/// Advance the ledger clock for deterministic decay assertions.
-fn set_ledger_time(env: &Env, ts: u64) {
-    env.ledger().with_mut(|li| {
-        li.timestamp = ts;
-    });
-}
-
-/// Decay applies exactly one bucket per `decay_interval_secs` of elapsed time,
-/// with floor integer arithmetic and no decay inside a partial bucket (#1082).
-#[test]
-fn test_decay_at_bucket_boundaries_is_deterministic() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-
-    let user = Address::generate(&env);
-    let interval = DEFAULT_REPUTATION_DECAY_INTERVAL_SECS; // 30 days
-                                                           // retain_bps = 10_000 - 500 = 9500
-
-    // Seed at t0 with trust_score = 100.
-    set_ledger_time(&env, 1_000_000);
-    client.onboard_user(&user, &String::from_str(&env, "decayb"), &UserRole::Artisan);
-    client.update_reputation(&user, &100u32, &0u32);
-    assert_eq!(client.get_trust_score(&user), 100);
-
-    // t0 + 1 bucket: 100 * 9500 / 10000 = 95
-    set_ledger_time(&env, 1_000_000 + interval);
-    assert_eq!(client.get_trust_score(&user), 95);
-
-    // t0 + 2 buckets: 95 * 9500 / 10000 = 90 (floor of 90.25)
-    set_ledger_time(&env, 1_000_000 + 2 * interval);
-    assert_eq!(client.get_trust_score(&user), 90);
-
-    // t0 + 3 buckets: 90 * 9500 / 10000 = 85 (floor of 85.5)
-    set_ledger_time(&env, 1_000_000 + 3 * interval);
-    assert_eq!(client.get_trust_score(&user), 85);
-
-    // Inside the next bucket (one second before the boundary) → no further decay.
-    set_ledger_time(&env, 1_000_000 + 4 * interval - 1);
-    assert_eq!(client.get_trust_score(&user), 85);
-
-    // Exactly at the boundary → one more decay: 85 * 9500 / 10000 = 80 (80.75)
-    set_ledger_time(&env, 1_000_000 + 4 * interval);
-    assert_eq!(client.get_trust_score(&user), 80);
-}
-
-/// Repeated reads at the same ledger time always return the same score, and
-/// replaying the same history reproduces the same score (#1082 determinism).
-#[test]
-fn test_decay_is_deterministic_and_reproducible() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-
-    let user = Address::generate(&env);
-    let interval = DEFAULT_REPUTATION_DECAY_INTERVAL_SECS;
-
-    set_ledger_time(&env, 5_000_000);
-    client.onboard_user(&user, &String::from_str(&env, "decayr"), &UserRole::Artisan);
-    client.update_reputation(&user, &200u32, &0u32);
-
-    // Jump forward 7 buckets.
-    set_ledger_time(&env, 5_000_000 + 7 * interval);
-
-    let a = client.get_trust_score(&user);
-    let b = client.get_trust_score(&user); // same ledger time, second read
-    let c = client.get_trust_score(&user); // third read
-    assert_eq!(a, b);
-    assert_eq!(b, c);
-    assert!(a < 200, "decay must reduce the score");
-    assert!(a > 0, "decay must not underflow to nothing here");
-
-    // Replay the identical history on a fresh user → identical final score.
-    let user2 = Address::generate(&env);
-    set_ledger_time(&env, 5_000_000);
-    client.onboard_user(
-        &user2,
-        &String::from_str(&env, "decayr2"),
-        &UserRole::Artisan,
-    );
-    client.update_reputation(&user2, &200u32, &0u32);
-    set_ledger_time(&env, 5_000_000 + 7 * interval);
-    assert_eq!(client.get_trust_score(&user2), a);
-}
-
-/// Decay can never underflow below zero nor create score from nothing (#1082).
-#[test]
-fn test_decay_never_underflows_or_inflates() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-
-    let user = Address::generate(&env);
-    let interval = DEFAULT_REPUTATION_DECAY_INTERVAL_SECS;
-
-    set_ledger_time(&env, 3_000_000);
-    client.onboard_user(&user, &String::from_str(&env, "decayu"), &UserRole::Artisan);
-    client.update_reputation(&user, &1u32, &0u32); // smallest possible score
-
-    // One bucket: 1 * 9500 / 10000 = 0 → score collapses, never negative.
-    set_ledger_time(&env, 3_000_000 + interval);
-    assert_eq!(client.get_trust_score(&user), 0);
-
-    // Even after enormous idle time it stays at 0 (no underflow, no inflation).
-    set_ledger_time(&env, 3_000_000 + 1000 * interval);
-    assert_eq!(client.get_trust_score(&user), 0);
-
-    // Disputes can only reduce further or hold at 0; they never mint trust.
-    client.update_reputation(&user, &0u32, &5u32);
-    assert_eq!(client.get_trust_score(&user), 0);
-}
-
-/// The scheduled application (`apply_reputation_decay_now`) produces the same
-/// decayed score as the lazy read path at the same ledger time (#1082).
-#[test]
-fn test_scheduled_decay_matches_lazy_decay() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-
-    let user = Address::generate(&env);
-    let interval = DEFAULT_REPUTATION_DECAY_INTERVAL_SECS;
-
-    set_ledger_time(&env, 9_000_000);
-    client.onboard_user(&user, &String::from_str(&env, "decays"), &UserRole::Artisan);
-    client.update_reputation(&user, &50u32, &0u32);
-
-    set_ledger_time(&env, 9_000_000 + 5 * interval);
-
-    // Scheduled evaluation applies and persists the same decayed value.
-    let scheduled = client.apply_reputation_decay_now(&user);
-    // Lazy read at the identical ledger time must agree (no further elapsed time).
-    let lazy = client.get_trust_score(&user);
-    assert_eq!(scheduled, lazy);
-    // 50 * 9500 / 10000 = 475000 / 10000 = 47 (floor).
-    assert_eq!(lazy, 47);
-}
-
-/// A single evaluation is CPU-bounded by [`MAX_DECAY_INTERVALS_PER_CALL`]; any
-/// remaining elapsed buckets are carried forward on the next evaluation, so the
-/// decay is applied in full over time yet never oversteps the per-call budget.
-#[test]
-fn test_decay_cap_is_carried_forward() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-
-    let user = Address::generate(&env);
-    let interval = DEFAULT_REPUTATION_DECAY_INTERVAL_SECS;
-
-    set_ledger_time(&env, 2_000_000);
-    client.onboard_user(&user, &String::from_str(&env, "decayc"), &UserRole::Artisan);
-    client.update_reputation(&user, &100u32, &0u32);
-
-    // Jump far beyond the per-call cap (64 buckets).
-    let elapsed = (MAX_DECAY_INTERVALS_PER_CALL + 10) * interval;
-    set_ledger_time(&env, 2_000_000 + elapsed);
-
-    let first = client.get_trust_score(&user);
-    assert!(first > 0, "capped decay still leaves residual trust");
-    assert!(first < 100, "decay must have reduced the score");
-
-    // A second read at the SAME ledger time carries the remaining 10 buckets
-    // forward; the score keeps decreasing deterministically.
-    let second = client.get_trust_score(&user);
-    assert!(second < first);
-
-    // A third read at the same time: nothing left to apply → stable.
-    let third = client.get_trust_score(&user);
-    assert_eq!(second, third);
-}
-
-#[test]
-fn test_get_user_migrates_legacy_profile() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = string_to_bytes(&env, &portfolio_cid);
-    let legacy = LegacyUserProfile {
-        address: user.clone(),
-        role: UserRole::Buyer,
-        username: Symbol::new(&env, "legacy_user"),
-        registered_at: 1234,
-        is_verified: false,
-        successful_trades: 0,
-        disputed_trades: 0,
-        portfolio_cid: Some(portfolio_cid),
-    };
-
-    env.as_contract(&client.address, || {
+    fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
+        let (stored, _) = Self::try_get_stored_user_profile(env, user.clone())?;
+        let portfolio_cid = Self::read_portfolio_cid(env, &user);
+        Some(Self::stored_to_public(env, stored, portfolio_cid))
+    }
+
+    fn get_user_profile(env: &Env, user: Address) -> UserProfile {
+        Self::try_get_user_profile(env, user)
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
+    }
+
+    /// Validate that a profile schema version is supported by this contract.
+    ///
+    /// Rejects versions > CURRENT_USER_PROFILE_VERSION (unsupported future versions,
+    /// likely indicating corrupted data or a version mismatch). This prevents
+    /// silently misinterpreting unknown-version profiles using the latest
+    /// interpretation logic, which is the core bug Issue #1056 aims to fix.
+    ///
+    /// # Arguments
+    /// - `version`: The profile schema version to validate
+    ///
+    /// # Panics
+    /// With `Error::UnsupportedProfileVersion` if version > CURRENT_USER_PROFILE_VERSION
+    fn assert_profile_version_supported(env: &Env, version: u32) {
+        if version > CURRENT_USER_PROFILE_VERSION {
+            env.panic_with_error(Error::UnsupportedProfileVersion);
+        }
+    }
+
+    fn bump_state_version(env: &Env, user: &Address) -> u32 {
+        let key = DataKey::UserStateRevision(user.clone());
+        let current: u32 = Self::read_persistent(env, &key).unwrap_or(1u32);
+        let next: u32 = current.saturating_add(1);
+        env.storage().persistent().set(&key, &next);
+        Self::extend_persistent(env, &key);
+        next
+    }
+
+    /// Assert that `user` is onboarded and their profile is currently active.
+    ///
+    /// Panics with the status-specific error when the profile is deactivated,
+    /// under review, or flagged. Used by state-mutating endpoints that must not
+    /// operate on restricted accounts (e.g. `update_user_role` and
+    /// `deactivate_profile`).
+    ///
+    /// # Returns
+    /// The loaded [`UserProfile`] so callers do not have to fetch it again.
+    fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
+        let profile = Self::get_user_profile(env, user);
+        match profile.status {
+            ProfileStatus::Deactivated => env.panic_with_error(Error::ProfileDeactivated),
+            ProfileStatus::UnderReview => env.panic_with_error(Error::ProfileUnderReview),
+            ProfileStatus::Flagged => env.panic_with_error(Error::ProfileFlagged),
+            ProfileStatus::Active => {}
+        }
+        profile
+    }
+
+    /// Extend the TTL of a persistent storage entry using standardized values.
+    ///
+    /// Soroban charges rent per ledger entry, so persistent state for an
+    /// active escrow / profile must have its TTL refreshed regularly to
+    /// avoid archival. Using a single helper keeps the threshold/extension
+    /// pair (`TTL_THRESHOLD`, `TTL_EXTENSION`) consistent across every
+    /// read/write path — drift between sites is the usual cause of
+    /// entries being archived earlier than callers expect.
+    ///
+    /// Callers do not need to check existence first: `extend_ttl` on a
+    /// missing key is a no-op, but it still costs CPU. For hot paths that
+    /// may legitimately call the helper with absent keys, use
+    /// [`Self::extend_persistent_if_present`] instead.
+    ///
+    /// # Issue #702 — temporary storage
+    /// Never route temporary keys through this helper. Pending verification
+    /// markers (`DataKey::VerificationRequest`) use temporary storage and must
+    /// not pay for `extend_ttl`; they are cleared on approve/reject/clear.
+    fn extend_persistent(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
         env.storage()
             .persistent()
-            .set(&DataKey::UserProfile(user.clone()), &legacy);
-    });
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
+    }
 
-    let migrated = client.get_user(&user);
-    assert_eq!(migrated.version, CURRENT_USER_PROFILE_VERSION);
-    assert_eq!(migrated.username, Symbol::new(&env, "legacy_user"));
-    assert_eq!(migrated.portfolio_cid, Some(expected.clone()));
-
-    let stored: StoredUserProfile = env.as_contract(&client.address, || {
+    fn extend_persistent_read(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
         env.storage()
             .persistent()
-            .get(&DataKey::UserProfile(user))
-            .unwrap()
-    });
-    assert_eq!(stored.version, CURRENT_USER_PROFILE_VERSION);
+            .extend_ttl(key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+    }
 
-    let stored_portfolio: Bytes = env.as_contract(&client.address, || {
-        env.storage()
+    /// Load a persistent entry and refresh its TTL in a single storage pass
+    /// (Issue #447).
+    ///
+    /// The canonical "read and keep alive" idiom in this contract used to be
+    /// `get(..)` followed by `has(..)` before calling `extend_persistent`. The
+    /// `has` probe is pure overhead: `get` already reports presence through its
+    /// `Option`, so the extra probe charges a second ledger-entry read on every
+    /// read-path invocation without changing behaviour. Routing reads through
+    /// this helper keeps the TTL refresh guaranteed (`extend_ttl` on an absent
+    /// key traps, so it must stay guarded) while paying for exactly one read.
+    ///
+    /// Returns `None` — leaving TTL untouched — when the entry does not exist.
+    fn read_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        V: TryFromVal<Env, Val>,
+    {
+        let value = env.storage().persistent().get::<K, V>(key);
+        if value.is_some() {
+            Self::extend_persistent(env, key);
+        }
+        value
+    }
+
+    fn increment_persistent_u32(env: &Env, key: &DataKey) {
+        let count: u32 = Self::read_persistent(env, key).unwrap_or(0);
+        let next = count.saturating_add(1);
+        env.storage().persistent().set(key, &next);
+        Self::extend_persistent(env, key);
+    }
+
+    fn update_active_user_count(env: &Env, delta: i32) {
+        let key = DataKey::ActiveUserCount;
+        let count: u32 = Self::read_persistent(env, &key).unwrap_or(0);
+        let new_count = if delta > 0 {
+            count.saturating_add(delta as u32)
+        } else {
+            count.saturating_sub((-delta) as u32)
+        };
+        env.storage().persistent().set(&key, &new_count);
+        Self::extend_persistent(env, &key);
+    }
+
+    /// TTL-bump variant that first checks the entry exists (Issue #82 optimization).
+    ///
+    /// [PERFORMANCE #82] Optimized storage layout: Validates storage entry presence before
+    /// applying `extend_ttl` to avoid redundant CPU cycles when refreshing archived or
+    /// non-existent keys. Particularly useful during batched operations where stale references
+    /// may surface (e.g., escrow references during verification sweeps).
+    ///
+    /// On-chain economics: `persistent().has()` costs ~50 CPU units, while `extend_ttl` on
+    /// a missing key wastes ~100 units. This check saves 100% of `extend_ttl` cost for
+    /// archived entries (gas savings ~5-10 stroops per stale reference).
+    ///
+    /// # Storage Optimization Strategy
+    /// - Compact representation: Only stores minimal required state per entry
+    /// - Lazy TTL refresh: Only bump when entry is actively accessed (read pattern)
+    /// - Indexed access: O(1) lookups via `DataKey::VerifyHistoryIndexed(user, slot)`
+    /// - No Vec allocations: Eliminates runtime allocation overhead (Issue #82)
+    ///
+    /// # Arguments
+    /// * `key` - Storage key to conditionally refresh (must implement `IntoVal<Env, Val>`)
+    ///
+    /// # Returns
+    /// `true` if entry existed and TTL was extended; `false` if key was absent
+    ///
+    /// # Usage Pattern
+    /// ```ignore
+    /// if Self::extend_persistent_if_present(env, &user_profile_key) {
+    ///     // Profile was active and TTL refreshed; safe to proceed
+    /// } else {
+    ///     // Profile archived; handle stale reference gracefully
+    /// }
+    /// ```
+    fn extend_persistent_if_present<K>(env: &Env, key: &K) -> bool
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val> + Clone,
+    {
+        if env.storage().persistent().has(key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn require_ttl_bump_auth(config: &OnboardingConfig) {
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+    }
+
+    /// Refresh the persistent TTL for a user's profile entry (#103, Issue #82).
+    ///
+    /// [PERFORMANCE #82] Storage optimization endpoint: Active escrow contracts call this
+    /// during long-running escrow lifecycles to prevent participant profiles from being
+    /// archived while escrows remain open. Implements conditional TTL refresh to avoid
+    /// wasted CPU on already-archived entries.
+    ///
+    /// This endpoint is essential for maintaining consistency between escrow and
+    /// onboarding contract state during disputes that span multiple ledger epochs.
+    /// Only the registered escrow contract or the platform admin may invoke this.
+    ///
+    /// # Enhanced business flow — issue #496
+    ///
+    /// The Config entry TTL is now extended after auth passes. Previously the
+    /// Config read was not accompanied by a TTL bump, meaning a Config entry
+    /// close to expiry could be archived on the same ledger as a valid
+    /// `bump_user_profile_ttl` call. Extending Config here keeps the contract
+    /// configuration live for the full `TTL_EXTENSION` window whenever an
+    /// authorized escrow settlement touches this endpoint.
+    ///
+    /// # Returns
+    /// `true` if the profile existed and its TTL was refreshed; `false` if the
+    /// key was absent (profile archived or never created).
+    ///
+    /// # Preconditions
+    /// - Escrow contract must be registered via `set_escrow_contract`
+    /// - Caller must be either escrow contract or platform admin
+    pub fn bump_user_profile_ttl(env: Env, user: Address) -> bool {
+        let config: OnboardingConfig = env
+            .storage()
             .persistent()
-            .get(&DataKey::UserPortfolio(migrated.address.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored_portfolio, expected);
-}
-
-// ============================================================
-// Issue #114 – Username Change Mechanism Tests
-// ============================================================
-
-#[test]
-fn test_change_username_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let original_username = String::from_str(&env, "original_user");
-
-    // Onboard user
-    client.onboard_user(&user, &original_username, &UserRole::Buyer);
-
-    // Change username
-    let new_username = String::from_str(&env, "new_user");
-    let updated_profile = client.change_username(&user, &new_username);
-
-    assert_eq!(updated_profile.username, Symbol::new(&env, "new_user"));
-    assert_eq!(updated_profile.address, user);
-
-    // Verify old username is no longer taken
-    assert!(!client.is_username_taken(&original_username));
-
-    // Verify new username is taken
-    assert!(client.is_username_taken(&new_username));
-
-    // Verify can retrieve user by new username
-    let retrieved = client.get_user_by_username(&new_username);
-    assert_eq!(retrieved.address, user);
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_cooldown_active() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "original_user"),
-        &UserRole::Buyer,
-    );
-    client.change_username(&user, &String::from_str(&env, "first_change"));
-
-    // Immediate second change should be blocked by cooldown.
-    client.change_username(&user, &String::from_str(&env, "second_change"));
-}
-
-#[test]
-fn test_change_username_case_insensitive() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(&user, &String::from_str(&env, "original"), &UserRole::Buyer);
-
-    // Change to different case
-    let new_username = String::from_str(&env, "NewUser");
-    let updated = client.change_username(&user, &new_username);
-
-    // Should be normalized to lowercase
-    assert_eq!(updated.username, Symbol::new(&env, "newuser"));
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_to_existing() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-
-    client.onboard_user(&user1, &String::from_str(&env, "user1"), &UserRole::Buyer);
-    client.onboard_user(&user2, &String::from_str(&env, "user2"), &UserRole::Buyer);
-
-    // Try to change user2's username to user1's username
-    client.change_username(&user2, &String::from_str(&env, "user1"));
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_too_short() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "original_user"),
-        &UserRole::Buyer,
-    );
-
-    // Try to change to a username that's too short
-    client.change_username(&user, &String::from_str(&env, "ab"));
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_too_long() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "original_user"),
-        &UserRole::Buyer,
-    );
-
-    // Try to change to a username that's too long (> 50 chars)
-    let long_username = String::from_str(
-        &env,
-        "this_is_a_very_long_username_that_exceeds_the_maximum_allowed_length_for_usernames",
-    );
-    client.change_username(&user, &long_username);
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_not_onboarded() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    // Try to change username for non-existent user
-    client.change_username(&user, &String::from_str(&env, "new_username"));
-}
-
-#[test]
-fn test_username_change_fee_management() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    // Set username change fee
-    client.set_username_change_fee(&1_000_000);
-
-    let fee = client.get_username_change_fee();
-    assert_eq!(fee, 1_000_000);
-
-    // Update fee
-    client.set_username_change_fee(&2_000_000);
-    let new_fee = client.get_username_change_fee();
-    assert_eq!(new_fee, 2_000_000);
-
-    // Disable fee
-    client.set_username_change_fee(&0);
-    let disabled_fee = client.get_username_change_fee();
-    assert_eq!(disabled_fee, 0);
-}
-
-#[test]
-fn test_change_username_collects_configured_fee() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let fee_wallet = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
-    let token_client = token::Client::new(&env, &token_contract.address());
-
-    token_admin_client.mint(&user, &5_000_000);
-
-    client.onboard_user(&user, &String::from_str(&env, "fee_user"), &UserRole::Buyer);
-    client.set_username_change_fee(&1_000_000);
-    client.set_username_fee_token(&token_contract.address());
-    client.set_username_fee_wallet(&fee_wallet);
-
-    client.change_username(&user, &String::from_str(&env, "fee_user_new"));
-
-    assert_eq!(token_client.balance(&user), 4_000_000);
-    assert_eq!(token_client.balance(&fee_wallet), 1_000_000);
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_fee_requires_token_configuration() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "needs_fee"),
-        &UserRole::Buyer,
-    );
-    client.set_username_change_fee(&1_000_000);
-
-    client.change_username(&user, &String::from_str(&env, "still_needs_fee"));
-}
-
-#[test]
-#[should_panic]
-fn test_change_username_fee_transfer_failure_leaves_state_unchanged() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let fee_wallet = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
-
-    // User has 0 balance, so fee transfer will fail
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "fee_user_no_bal"),
-        &UserRole::Buyer,
-    );
-    client.set_username_change_fee(&1_000_000);
-    client.set_username_fee_token(&token_contract.address());
-    client.set_username_fee_wallet(&fee_wallet);
-
-    // This should panic with TokenTransferFailed
-    client.change_username(&user, &String::from_str(&env, "new_username_attempt"));
-}
-
-#[test]
-fn test_change_username_with_special_characters() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(&user, &String::from_str(&env, "original"), &UserRole::Buyer);
-
-    // Change to username with special characters (should be normalized)
-    let new_username = String::from_str(&env, "New-User_Name.123");
-    let updated = client.change_username(&user, &new_username);
-
-    // Should be normalized with underscores
-    assert_eq!(updated.username, Symbol::new(&env, "new_user_name_123"));
-}
-
-#[test]
-fn test_change_username_preserves_other_fields() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    let original = client.onboard_user(
-        &user,
-        &String::from_str(&env, "original"),
-        &UserRole::Artisan,
-    );
-    assert_eq!(original.role, UserRole::Artisan);
-    assert!(!original.is_verified);
-
-    // Change username
-    let updated = client.change_username(&user, &String::from_str(&env, "new_name"));
-
-    // Verify other fields are preserved
-    assert_eq!(updated.role, UserRole::Artisan);
-    assert!(!updated.is_verified);
-    assert_eq!(updated.address, user);
-    assert_eq!(updated.registered_at, original.registered_at);
-}
-
-#[test]
-#[should_panic]
-fn test_bump_user_profile_ttl_unauthorized() {
-    let env = Env::default();
-
-    // Do NOT call env.mock_all_auths(); we want require_auth() to enforce real auth.
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    // Populate config and a user profile directly as the contract to avoid
-    // needing to run `initialize` (which itself requires auth). This lets us
-    // test that calling `bump_user_profile_ttl` without the proper signer
-    // will be rejected by `require_auth()`.
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-
-    env.as_contract(&client.address, || {
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::require_ttl_bump_auth(&config);
+        // Issue #496 — extend Config TTL after auth so the configuration
+        // entry stays live for the full extension window on every authorized
+        // call, preventing silent archival during active escrow lifecycles.
+        Self::extend_persistent(&env, &DataKey::Config);
+        Self::extend_persistent_if_present(&env, &DataKey::UserProfile(user))
+    }
+
+    /// Refresh the persistent TTL for a user's activity metrics entry (#107, Issue #82).
+    ///
+    /// [PERFORMANCE #82] Complements `bump_user_profile_ttl` for escrow contracts that
+    /// read or write activity metrics during settlement. Uses conditional TTL extension
+    /// to optimize storage rent calculations and prevent premature archival of metrics
+    /// during multi-ledger arbitration workflows. Only the registered escrow
+    /// contract or the platform admin may invoke this.
+    ///
+    /// # Enhanced business flow — issue #496
+    ///
+    /// Config TTL is extended after auth passes, matching the pattern applied
+    /// to `bump_user_profile_ttl` above.
+    ///
+    /// # Returns
+    /// `true` if the metrics entry existed and its TTL was refreshed; `false`
+    /// if the key was absent.
+    ///
+    /// # Preconditions
+    /// - Metrics must have been initialized via `update_user_metrics`
+    /// - Caller must be either registered escrow contract or platform admin
+    pub fn bump_user_metrics_ttl(env: Env, user: Address) -> bool {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::require_ttl_bump_auth(&config);
+        // Issue #496 — extend Config TTL after auth, same as bump_user_profile_ttl.
+        Self::extend_persistent(&env, &DataKey::Config);
+        Self::extend_persistent_if_present(&env, &DataKey::UserMetrics(user))
+    }
+
+    /// Initialize the onboarding contract system.
+    ///
+    /// Sets up the `OnboardingConfig` singleton and reserves the "admin" username.
+    /// Creates the initial admin user profile with full platform privileges.
+    ///
+    /// # Arguments
+    /// * `admin` - Platform administrator address (must call this method to authorize)
+    ///
+    /// # Storage Side-Effects
+    /// - Writes singleton `DataKey::Config` with default verification thresholds
+    /// - Writes `DataKey::UserProfile(admin)` with Admin role
+    /// - Writes `DataKey::Username("admin")` pointing to admin address (reserved)
+    /// - Extends TTL on all initialized entries
+    pub fn initialize(env: Env, admin: Address) -> OnboardingConfig {
+        // Only the deployer can initialize
+        admin.require_auth();
+
+        let config = OnboardingConfig {
+            require_username: true,
+            min_username_length: 3,
+            max_username_length: 50,
+            platform_admin: admin.clone(),
+            auto_verify_enabled: true,
+            min_escrow_count_for_verify: 5,
+            min_volume_for_verify: 10_000_000_000, // 1000 USDC at 7 decimals
+            escrow_contract: None,
+        };
+
+        // Store the configuration
         env.storage().persistent().set(&DataKey::Config, &config);
-        let profile = StoredUserProfile {
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        // Seed default anti-Sybil configuration (#940)
+        env.storage()
+            .persistent()
+            .set(&DataKey::OnboardRateLimitWindow, &3600u64);
+        Self::extend_persistent(&env, &DataKey::OnboardRateLimitWindow);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxOnboardAttempts, &3u32);
+        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationCooldown, &86400u64);
+        Self::extend_persistent(&env, &DataKey::VerificationCooldown);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PohReqForAutoVerify, &false);
+        Self::extend_persistent(&env, &DataKey::PohReqForAutoVerify);
+
+        // Issue #939 — seed default reputation decay / anti-farming policy.
+        let reputation_policy = Self::default_reputation_policy();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReputationPolicy, &reputation_policy);
+        Self::extend_persistent(&env, &DataKey::ReputationPolicy);
+
+        let admin_username = String::from_str(&env, "admin");
+        let normalized = normalize_username(&env, &admin_username);
+
+        // Store admin as initial admin role
+        let admin_profile = UserProfile {
+            version: CURRENT_USER_PROFILE_VERSION,
+            address: admin.clone(),
+            role: UserRole::Admin,
+            username: Symbol::new(&env, "admin"),
+            registered_at: env.ledger().timestamp(),
+            is_verified: true,
+            successful_trades: 0,
+            disputed_trades: 0,
+            portfolio_cid: None,
+            status: ProfileStatus::Active,
+            state_version: 1,
+        };
+
+        Self::persist_public_user_profile(&env, &admin, &admin_profile);
+
+        // Reserve the "admin" username
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(normalized.clone()), &admin);
+        Self::extend_persistent(&env, &DataKey::Username(normalized));
+
+        config
+    }
+
+    /// Onboard a new user to the CraftNexus platform.
+    ///
+    /// Creates a versioned [`UserProfile`] for `user`, normalizes and reserves
+    /// the requested `username`, and emits a `UserOnboarded` event. This is
+    /// the primary entry point for new participants.
+    ///
+    /// ## Checks-Effects-Interactions
+    /// All validation (auth, role, username length, uniqueness) is performed
+    /// before any storage writes, following the CEI pattern to prevent
+    /// partial-state corruption on revert.
+    ///
+    /// # Preconditions
+    /// - The caller must be the `user` address (`user.require_auth()` is enforced).
+    /// - The contract must be initialized.
+    /// - The normalized username length must be within configured minimum and maximum limits.
+    /// - The `user` must not have been onboarded already.
+    /// - The normalized username must not be taken.
+    /// - The `role` must be either `UserRole::Buyer` or `UserRole::Artisan`.
+    ///
+    /// # Storage Side-effects
+    /// - Writes a new `UserProfile` struct to `DataKey::UserProfile(user)`.
+    /// - Writes the unique username mapping to `DataKey::Username(normalized_username)`.
+    /// - Refreshes the TTL of `DataKey::Config`, the new user profile, and the new username key.
+    ///
+    /// # Emitted Events
+    /// - Publishes a `UserOnboarded` event containing the user address, normalized username, and role.
+    ///
+    /// # Arguments
+    /// * `user` - User's wallet address
+    /// * `username` - Desired username
+    /// * `role` - Desired role (Buyer or Artisan)
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized ([`DataKey::Config`] must exist).
+    /// - `user` must not already have a profile.
+    /// - Normalized `username` must be unique (not in [`DataKey::Username`] index).
+    /// - Normalized `username` length must be within `[min_username_length, max_username_length]`.
+    /// - `role` must be `Buyer` or `Artisan`.
+    ///
+    /// # Storage Side-Effects
+    /// - **Write** [`DataKey::UserProfile(user)`] — new profile at version
+    ///   [`CURRENT_USER_PROFILE_VERSION`], `is_verified = false`
+    /// - **Write** [`DataKey::Username(normalized)`] — maps username → `user`
+    /// - **Read** [`DataKey::Config`] — TTL extended on read
+    /// - **Read** [`DataKey::UserProfile(user)`] — existence check (TTL extended if found)
+    ///
+    /// # Emitted Events
+    /// - Topic: `(Symbol("UserOnboarded"),)` — Data: [`UserOnboardedEvent`]
+    ///   `{ user, username: normalized, role }`
+    ///
+    /// # Errors
+    /// - Panics with `"Invalid role: can only onboard as Buyer or Artisan"` if role is invalid
+    /// - Panics with [`Error::NotInitialized`] if config is missing
+    /// - Panics with `"User already onboarded"` if profile exists
+    /// - Panics with `"Username already taken"` if normalized username is in use
+    /// - Panics with `"Username too short"` / `"Username too long"` on length violation
+    ///
+    /// # Example
+    /// ```ignore
+    /// let profile = client.onboard_user(
+    ///     &user_address,
+    ///     &String::from_str(&env, "Alice"),
+    ///     &UserRole::Artisan,
+    /// );
+    /// assert_eq!(profile.username, String::from_str(&env, "alice"));
+    /// assert!(!profile.is_verified);
+    /// ```
+    /// Emit an [`OnboardCallFailedEvent`] before panicking with the given error.
+    fn emit_onboard_failed_and_panic(env: &Env, user: &Address, reason: Error) -> ! {
+        env.events().publish(
+            (Symbol::new(env, "OnboardCallFailed"),),
+            OnboardCallFailedEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                reason: reason as u32,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        env.panic_with_error(reason)
+    }
+
+    /// Onboard a new user, emitting an [`OnboardCallFailedEvent`] and
+    /// panicking with a proper error code on validation failure.
+    ///
+    /// Callers that prefer to handle errors gracefully (without panicking)
+    /// should invoke the auto-generated `try_onboard_user` client method,
+    /// which wraps this function in the host's `try_call` and returns the
+    /// error code as `Err(soroban_sdk::Error)`.
+    ///
+    /// # Security
+    /// * `user.require_auth()` — the registering user signs.
+    /// * `config.platform_admin.require_auth()` — the platform co-signs.
+    ///
+    /// # Errors (panic)
+    /// * [`Error::NotInitialized`] — `initialize` has not been called.
+    /// * [`Error::InvalidRole`] — `role` is not `Buyer` or `Artisan`.
+    /// * [`Error::AlreadyOnboarded`] — the address already has a profile with a
+    ///   different username or role.
+    /// * [`Error::UsernameTaken`] — the normalized username is in use.
+    /// * [`Error::UsernameTooShort`] / [`Error::UsernameTooLong`].
+    pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole) -> UserProfile {
+        Self::onboard_user_with_identity(env.clone(), user, username, role, Bytes::new(&env))
+    }
+
+    /// Onboard a new user while optionally attaching an off-chain identity correlation hash (#940).
+    ///
+    /// Enforces rate limits per address and detects duplicate identity correlation hashes.
+    pub fn onboard_user_with_identity(
+        env: Env,
+        user: Address,
+        username: String,
+        role: UserRole,
+        identity_hash: Bytes,
+    ) -> UserProfile {
+        user.require_auth();
+
+        if role != UserRole::Buyer && role != UserRole::Artisan {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::InvalidRole);
+        }
+
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::NotInitialized)
+            });
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        config.platform_admin.require_auth();
+
+        if let Some(ref escrow_addr) = config.escrow_contract {
+            let escrow_client = EscrowClient::new(&env, escrow_addr);
+            if escrow_client.is_paused() {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::ContractPaused);
+            }
+        }
+
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
+        let optimized_username = Symbol::new(&env, s);
+
+        if (username_len as u32) < config.min_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooShort);
+        }
+        if (username_len as u32) > config.max_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooLong);
+        }
+
+        // The account-keyed profile is canonical. An exact retry returns it and
+        // repairs any missing secondary index without incrementing counters or
+        // repeating identity/rate-limit side effects (#1085).
+        if let Some((existing, _)) = Self::try_get_stored_user_profile(&env, user.clone()) {
+            if existing.username != optimized_username || existing.role != role {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::AlreadyOnboarded);
+            }
+            Self::repair_onboarding_state(&env, &normalized, &user);
+            return Self::stored_to_public(&env, existing, Self::read_portfolio_cid(&env, &user));
+        }
+
+        // Check per-account and global capacity only after an idempotent retry
+        // has been ruled out, and before identity/profile writes (#1084, #1085).
+        let now = env.ledger().timestamp();
+        Self::consume_attempt_capacity(&env, &user, false);
+
+        // [ANTI-SYBIL] Identity Correlation Check
+        if !identity_hash.is_empty() {
+            let corr_key = DataKey::IdentityCorrelation(identity_hash.clone());
+            if let Some(existing_user) = Self::read_persistent::<_, Address>(&env, &corr_key) {
+                if existing_user != user {
+                    env.events().publish(
+                        (Symbol::new(&env, "SybilPatternDetected"),),
+                        SybilPatternDetectedEvent {
+                            schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                            user: user.clone(),
+                            reason: Symbol::new(&env, "DuplicateCorrelation"),
+                            timestamp: now,
+                        },
+                    );
+                    env.events().publish(
+                        (Symbol::new(&env, "IdentityCorrelated"),),
+                        IdentityCorrelatedEvent {
+                            schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                            user: user.clone(),
+                            identity_hash: identity_hash.clone(),
+                        },
+                    );
+                    Self::emit_onboard_failed_and_panic(
+                        &env,
+                        &user,
+                        Error::DuplicateIdentityCorrelation,
+                    );
+                }
+            } else {
+                env.storage().persistent().set(&corr_key, &user);
+                Self::extend_persistent(&env, &corr_key);
+                env.events().publish(
+                    (Symbol::new(&env, "IdentityCorrelated"),),
+                    IdentityCorrelatedEvent {
+                        schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                        user: user.clone(),
+                        identity_hash: identity_hash.clone(),
+                    },
+                );
+            }
+        }
+
+        if let Some(owner) =
+            Self::read_persistent::<_, Address>(&env, &DataKey::Username(normalized.clone()))
+        {
+            // A same-account reservation with no profile is a recoverable
+            // interrupted write; another owner remains a hard conflict.
+            if owner != user {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTaken);
+            }
+        }
+
+        let profile = UserProfile {
             version: CURRENT_USER_PROFILE_VERSION,
             address: user.clone(),
-            role: UserRole::Buyer,
-            username: Symbol::new(&env, "someone"),
+            role,
+            username: optimized_username,
             registered_at: env.ledger().timestamp(),
             is_verified: false,
             successful_trades: 0,
             disputed_trades: 0,
+            portfolio_cid: None,
             status: ProfileStatus::Active,
+            state_version: 1,
+        };
+
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, 1);
+
+        Self::repair_onboarding_state(&env, &normalized, &user);
+
+        // Emitted after all storage writes complete, so subscribers observing this
+        // event can safely query `get_user` and `get_user_by_username` immediately.
+        //
+        // Integration notes for off-chain indexers (#108):
+        //   - Subscribe to topic `"UserOnboarded"` to build a real-time user registry
+        //     without polling `get_user` for every address.
+        //   - The `username` field carries the canonical on-chain form; use it verbatim
+        //     for reverse lookups and display.  Do not re-normalise on the client side
+        //     unless you are constructing a new lookup key (same normalisation rules
+        //     apply: lowercase, separators collapsed to `_`, no leading/trailing `_`).
+        //   - Trigger downstream workflows (welcome emails, dashboard provisioning, etc.)
+        //     only after the event is confirmed in a closed ledger to avoid acting on
+        //     failed transactions.
+        //   - This event is emitted exactly once per address. An identical retry
+        //     returns the canonical profile without emitting another event.
+        env.events().publish(
+            (Symbol::new(&env, "UserOnboarded"),),
+            UserOnboardedEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                username: normalized,
+                role,
+            },
+        );
+        Self::increment_persistent_u32(&env, &DataKey::GlobalOnboardCount);
+
+        profile
+    }
+
+    /// Repair secondary onboarding state from the account-keyed canonical
+    /// profile without creating or replacing a profile (#1085).
+    pub fn recover_onboarding_profile(env: Env, user: Address, username: String) -> UserProfile {
+        user.require_auth();
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let canonical_username = Symbol::new(
+            &env,
+            core::str::from_utf8(&user_buf[..username_len]).unwrap(),
+        );
+        let (stored, _) = Self::try_get_stored_user_profile(&env, user.clone())
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound));
+        if stored.username != canonical_username {
+            env.panic_with_error(Error::AlreadyOnboarded);
+        }
+
+        Self::repair_onboarding_state(&env, &normalized, &user);
+        Self::stored_to_public(&env, stored, Self::read_portfolio_cid(&env, &user))
+    }
+
+    /// Read-only accessor for a user's profile, keyed by their Stellar
+    /// address.
+    ///
+    /// # Integration notes — issue #529
+    ///
+    /// - This is the canonical "is this address onboarded?" entrypoint
+    ///   for off-chain integrations. It **reverts** with
+    ///   `Error::UserNotFound` if no profile exists for `user`, so
+    ///   callers that want a non-erroring probe should wrap the call
+    ///   with the host's `try_invoke_contract` API and treat the
+    ///   `Err` case as "not onboarded".
+    /// - The returned `UserProfile` carries the user's role, status,
+    ///   verification flag, portfolio CID, and metadata fields needed
+    ///   by the escrow and reputation systems. Treat the response as
+    ///   a snapshot; the profile can be mutated by `update_role`,
+    ///   `deactivate_profile`, `verify_user`, `update_portfolio`, and
+    ///   `change_username`, each of which emits an event indexers
+    ///   can subscribe to instead of polling this function.
+    /// - The function is gas-only (no token movements) so it is safe
+    ///   to call from a simulation / preview path.
+    ///
+    /// Transparently migrates legacy profiles (missing `version` or `status`
+    /// fields) to [`CURRENT_USER_PROFILE_VERSION`] on first read and persists
+    /// the upgraded form. This ensures callers always receive a fully-shaped
+    /// [`UserProfile`] regardless of when the account was created.
+    ///
+    /// # Returns
+    /// `UserProfile` if a profile exists, otherwise panics with
+    /// `Error::UserNotFound`.
+    pub fn get_observability_metrics(env: Env) -> ObservabilityMetrics {
+        let metrics: Option<ObservabilityMetrics> =
+            env.storage().persistent().get(&OBSERVABILITY_METRICS_KEY);
+        metrics.unwrap_or(ObservabilityMetrics {
+            version: OBSERVABILITY_METRICS_VERSION,
+            escrow_volume: 0,
+            disputes: 0,
+            staking_events: 0,
+            failures: 0,
+            active_jobs: 0,
+            reset_count: 0,
+            last_reset_ledger: 0,
+        })
+    }
+
+    pub fn reset_observability_metrics(env: Env) {
+        let config: OnboardingConfig = env.storage().persistent().get(&DataKey::Config).unwrap();
+        config.platform_admin.require_auth();
+        let mut metrics = env
+            .storage()
+            .persistent()
+            .get(&OBSERVABILITY_METRICS_KEY)
+            .unwrap_or(ObservabilityMetrics {
+                version: OBSERVABILITY_METRICS_VERSION,
+                escrow_volume: 0,
+                disputes: 0,
+                staking_events: 0,
+                failures: 0,
+                active_jobs: 0,
+                reset_count: 0,
+                last_reset_ledger: 0,
+            });
+        metrics.version = OBSERVABILITY_METRICS_VERSION;
+        metrics.escrow_volume = 0;
+        metrics.disputes = 0;
+        metrics.staking_events = 0;
+        metrics.failures = 0;
+        metrics.active_jobs = 0;
+        metrics.reset_count += 1;
+        metrics.last_reset_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&OBSERVABILITY_METRICS_KEY, &metrics);
+        Self::extend_persistent(&env, &OBSERVABILITY_METRICS_KEY);
+    }
+
+    pub fn get_user(env: Env, user: Address) -> UserProfile {
+        Self::get_user_profile(&env, user)
+    }
+
+    /// Return the monotonic revision of a user's canonical onboarding state.
+    pub fn get_state_revision(env: Env, user: Address) -> u64 {
+        if Self::try_get_user_profile(&env, user.clone()).is_none() {
+            env.panic_with_error(Error::UserNotFound);
+        }
+        Self::state_revision(&env, &user)
+    }
+
+    /// Issue a state-bound proof for one configured escrow operation.
+    pub fn get_onboarding_attestation(
+        env: Env,
+        user: Address,
+        operation_id: Bytes,
+        contract_instance: Address,
+    ) -> OnboardingAttestation {
+        if operation_id.is_empty() {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        if config.escrow_contract != Some(contract_instance.clone()) {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let profile = Self::assert_user_onboarded_and_active(&env, user.clone());
+        let state_revision = Self::state_revision(&env, &user);
+        let ledger_sequence = env.ledger().sequence();
+        let state_digest = Self::attestation_digest(
+            &env,
+            &user,
+            profile.version,
+            profile.role,
+            profile.is_verified,
+            profile.status,
+            state_revision,
+            ledger_sequence,
+            &operation_id,
+            &contract_instance,
+        );
+        OnboardingAttestation {
+            account: user,
+            profile_version: profile.version,
+            role: profile.role,
+            is_verified: profile.is_verified,
+            status: profile.status,
+            state_revision,
+            ledger_sequence,
+            operation_id,
+            contract_instance,
+            state_digest,
+        }
+    }
+
+    /// Validate and consume a state proof. The escrow contract is the only
+    /// configured caller allowed to establish this authorization boundary.
+    pub fn validate_onboarding_attestation(env: Env, attestation: OnboardingAttestation) -> bool {
+        if attestation.operation_id.is_empty() {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        if config.escrow_contract != Some(attestation.contract_instance.clone()) {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        Self::require_ttl_bump_auth(&config);
+        let used_key = DataKey::UsedAttestation(
+            attestation.account.clone(),
+            attestation.operation_id.clone(),
+        );
+        if env.storage().persistent().has(&used_key) {
+            env.panic_with_error(Error::AttestationReplay);
+        }
+        let profile = Self::assert_user_onboarded_and_active(&env, attestation.account.clone());
+        let current_revision = Self::state_revision(&env, &attestation.account);
+        if attestation.ledger_sequence != env.ledger().sequence()
+            || attestation.state_revision != current_revision
+            || attestation.profile_version != profile.version
+            || attestation.role != profile.role
+            || attestation.is_verified != profile.is_verified
+            || attestation.status != profile.status
+        {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let expected = Self::attestation_digest(
+            &env,
+            &attestation.account,
+            profile.version,
+            profile.role,
+            profile.is_verified,
+            profile.status,
+            current_revision,
+            attestation.ledger_sequence,
+            &attestation.operation_id,
+            &attestation.contract_instance,
+        );
+        if expected != attestation.state_digest {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        env.storage().persistent().set(&used_key, &true);
+        Self::extend_persistent(&env, &used_key);
+        true
+    }
+
+    /// Migrate one user profile to the latest flat storage schema (admin only).
+    ///
+    /// Returns `true` when this call rewrote persistent storage and `false`
+    /// when the profile was already at the current schema version.
+    pub fn migrate_user_profile(env: Env, user: Address) -> bool {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+        config.platform_admin.require_auth();
+
+        let (_, changed) = Self::try_get_stored_user_profile(&env, user)
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound));
+        changed
+    }
+
+    /// Check if the user has any active escrows on the configured escrow contract.
+    ///
+    /// [FEATURE #51 / #452] The queried user must authorize this read.
+    /// Returns false if no escrow contract is registered or if the user has no active escrows.
+    pub fn has_active_contracts(env: Env, user: Address) -> bool {
+        user.require_auth();
+
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        let local_key = DataKey::ActiveContractCount(user.clone());
+        if let Some(count) = env.storage().persistent().get::<_, u32>(&local_key) {
+            Self::extend_persistent(&env, &local_key);
+            return count > 0;
+        }
+
+        if let Some(escrow_contract) = config.escrow_contract {
+            let client = EscrowClient::new(&env, &escrow_contract);
+            client.has_active_escrows(&user)
+        } else {
+            false
+        }
+    }
+
+    /// Return the precise number of active escrow contracts tracked for `user`.
+    ///
+    /// # Enhanced business flow — feature #47
+    ///
+    /// [`OnboardingContract::has_active_contracts`] only answers the boolean
+    /// "is the user currently engaged?" question. Complex escrow and reputation
+    /// scenarios — staggered multi-order settlement, reputation weighting by
+    /// concurrent workload, and off-chain risk dashboards — need the exact
+    /// concurrency level, not just a flag. This endpoint exposes the locally
+    /// maintained `DataKey::ActiveContractCount(user)` counter so off-chain
+    /// indexers and client UIs can read it directly without replaying every
+    /// escrow event or making a cross-contract call.
+    ///
+    /// The counter is the same value maintained by
+    /// [`OnboardingContract::update_active_contracts`] (incremented when an
+    /// escrow becomes active, decremented on close). When no local entry exists
+    /// the user has no tracked active contracts and `0` is returned; this is the
+    /// canonical "not engaged" state and is consistent with
+    /// `has_active_contracts` returning `false`.
+    ///
+    /// # Authorization
+    /// - None. This is a read-only query that mutates no business state and
+    ///   therefore needs no `require_auth`; it may be called by indexers and
+    ///   clients freely. It only refreshes the TTL of entries it reads.
+    ///
+    /// # Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Reads and (when present) extends TTL on
+    ///   `DataKey::ActiveContractCount(user)`.
+    /// - No `UserProfile` shape is touched, so no profile-version upgrade is
+    ///   required (`CURRENT_USER_PROFILE_VERSION` unaffected).
+    ///
+    /// # Arguments
+    /// * `user` - Address whose active-contract concurrency is being queried.
+    ///
+    /// # Returns
+    /// The number of currently-active contracts for `user` (`0` when none are
+    /// tracked).
+    ///
+    /// # Reverts if
+    /// - Contract not initialized.
+    pub fn get_active_contract_count(env: Env, user: Address) -> u32 {
+        let _config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        let key = DataKey::ActiveContractCount(user);
+        match env.storage().persistent().get::<_, u32>(&key) {
+            Some(count) => {
+                Self::extend_persistent(&env, &key);
+                count
+            }
+            None => 0,
+        }
+    }
+
+    /// Return the number of profiles currently in active status.
+    pub fn get_active_user_count(env: Env) -> u32 {
+        Self::read_persistent(&env, &DataKey::ActiveUserCount).unwrap_or(0)
+    }
+
+    /// Get user profile by username (case-insensitive)
+    ///
+    /// Normalizes the input username before looking up the owner address in
+    /// the [`DataKey::Username`] index, then delegates to `get_user`.
+    ///
+    /// # Parameters
+    /// - `username`: `String` — The username to look up (any case/separator variant).
+    ///
+    /// # Preconditions
+    /// - The normalized form of `username` must be registered.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Username(normalized)`] — TTL extended on read.
+    /// - **Read** [`DataKey::UserProfile(owner)`] — TTL extended on read.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with `"Username not found"` if the normalized username has no owner.
+    /// - Panics with [`Error::UserNotFound`] if the owner has no profile (should not occur).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let profile = client.get_user_by_username(&String::from_str(&env, "Alice"));
+    /// assert_eq!(profile.username, String::from_str(&env, "alice"));
+    /// ```
+    pub fn get_user_by_username(env: Env, username: String) -> UserProfile {
+        let normalized = normalize_username(&env, &username);
+
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Username(normalized.clone()))
+            .expect("Username not found");
+        Self::extend_persistent(&env, &DataKey::Username(normalized));
+
+        Self::get_user_profile(&env, owner)
+    }
+
+    /// Check if a username is already taken (case-insensitive).
+    ///
+    /// Normalizes the input before checking the [`DataKey::Username`] index.
+    /// Safe to call without auth — read-only.
+    ///
+    /// # Parameters
+    /// - `username`: `String` — Username to check (any case/separator variant).
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Username(normalized)`] — TTL extended if the key exists.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None — always returns a `bool`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// assert!(!client.is_username_taken(&String::from_str(&env, "newuser")));
+    /// ```
+    pub fn is_username_taken(env: Env, username: String) -> bool {
+        let normalized = normalize_username(&env, &username);
+        let has = env
+            .storage()
+            .persistent()
+            .has(&DataKey::Username(normalized.clone()));
+        if has {
+            Self::extend_persistent(&env, &DataKey::Username(normalized));
+        }
+        has
+    }
+
+    /// Check if a user has completed onboarding.
+    ///
+    /// Returns `true` if a [`DataKey::UserProfile`] entry exists for `user`,
+    /// regardless of profile status or version.
+    ///
+    /// # Security — issue #438
+    /// This endpoint is now protected with `require_auth()` to prevent unauthorized
+    /// callers from querying onboarding status. Only the user themselves may invoke
+    /// this check - it is a privileged query.
+    ///
+    /// # Storage Optimization — issue #443
+    /// TTL extension is now applied on read to prevent premature archival of
+    /// user profiles during extended escrow lifecycles.
+    ///
+    /// # Parameters
+    /// - `user`: `Address` — The wallet address to check.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UserProfile(user)`] — existence check with TTL extension.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None — always returns a `bool`.
+    pub fn is_onboarded(env: Env, user: Address) -> bool {
+        user.require_auth();
+        // Issue #423/#435: extend TTL on read to prevent storage expiry.
+        Self::extend_persistent_if_present(&env, &DataKey::UserProfile(user))
+    }
+
+    /// Get a user's role.
+    ///
+    /// Returns [`UserRole::None`] if the user has no profile, rather than
+    /// panicking — safe for use in authorization checks.
+    ///
+    /// # Parameters
+    /// - `user`: `Address` — The wallet address to query.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UserProfile(user)`] — TTL extended if profile exists.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None — returns `UserRole::None` for unknown addresses.
+    pub fn get_user_role(env: Env, user: Address) -> UserRole {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.role
+        } else {
+            UserRole::None
+        }
+    }
+
+    /// Return true if the user's profile exists and is currently active.
+    ///
+    /// Returns `false` for unknown addresses or any inactive status
+    /// (Deactivated, UnderReview, Flagged).
+    pub fn is_profile_active(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.status == ProfileStatus::Active
+        } else {
+            false
+        }
+    }
+
+    /// Return the schema version stored on a user's profile.
+    ///
+    /// Returns `0` if the user has no profile.
+    pub fn get_user_profile_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.version
+        } else {
+            0
+        }
+    }
+
+    /// Return the monotonically increasing state version for a user's profile.
+    ///
+    /// Returns `0` if the user has no profile. Missing `UserStateRevision`
+    /// keys default to `1` on read.
+    pub fn get_user_state_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.state_version
+        } else {
+            0
+        }
+    }
+
+    /// Return true if the user has passed verification (manual or auto).
+    ///
+    /// Returns `false` for unknown addresses.
+    pub fn is_user_verified(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.is_verified
+        } else {
+            false
+        }
+    }
+
+    /// Assign or update the moderator role for a user (admin only).
+    ///
+    /// # Security (#117)
+    /// Requires platform admin authorization before any state transition.
+    /// Promote a user to Moderator role.
+    ///
+    /// # Authorization
+    ///
+    /// **SECURITY**: Only the platform admin can invoke this endpoint.
+    /// The caller's signature is verified via `require_auth()` before any mutation.
+    /// Unauthorized invocation results in immediate transaction rollback.
+    ///
+    /// # Arguments
+    /// * `user` - Address to promote to Moderator
+    ///
+    /// # Returns
+    /// Updated `UserProfile` with the new Moderator role assigned.
+    pub fn set_moderator(env: Env, user: Address) -> UserProfile {
+        Self::extend_persistent_read(&env, &DataKey::Config);
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        // [SECURITY] Endpoint #69: Only the platform admin may promote users to Moderator.
+        // Any caller without a valid admin signature is rejected before state mutation.
+        config.platform_admin.require_auth();
+        Self::update_user_role(env, user, UserRole::Moderator)
+    }
+
+    /// Update a user's platform role (admin-only endpoint).
+    ///
+    /// # Authorization
+    ///
+    /// **SECURITY**: Only the platform admin can invoke this endpoint.
+    /// The caller's signature is verified via `require_auth()` before any state mutation.
+    /// Unauthorized invocation with mismatched credentials results in immediate
+    /// transaction rollback with no state changes applied.
+    ///
+    /// Strictly enforces role transitions to prevent unauthorized state mutations.
+    /// Validates that the new role is a supported platform role (Buyer, Artisan, or Moderator);
+    /// Admin and None roles cannot be assigned via this method to maintain security invariants.
+    ///
+    /// # Arguments
+    /// * `user` - User's wallet address to update
+    /// * `new_role` - New role to assign (must be Buyer, Artisan, or Moderator)
+    ///
+    /// # Returns
+    /// Updated `UserProfile` with the new role and incremented version.
+    ///
+    /// # Storage Side-Effects
+    /// - Writes updated `UserProfile` to persistent storage under `DataKey::UserProfile(user)`
+    /// - Emits `RoleUpdated` event carrying (user, old_role, new_role) for indexer consumption
+    /// - Extends TTL on config and profile entries to prevent archival during state transitions
+    ///
+    /// # Reverts if
+    /// - Caller is not the platform admin (authorization check fails)
+    /// - User not found in persistent storage
+    /// - New role is Admin or None (invalid assignment - prevents unauthorized role escalation)
+    /// - Config not initialized
+    pub fn update_user_role(env: Env, user: Address, new_role: UserRole) -> UserProfile {
+        // Security: Get config to verify admin authorization
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        // [SECURITY] Endpoint #85: Strict authorization check
+        // Only admin can update roles; require_auth() verifies the caller's digital signature
+        config.platform_admin.require_auth();
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        // [SECURITY] Validate new role assignment; prevent unauthorized role escalation
+        match new_role {
+            UserRole::Admin | UserRole::None => {
+                env.panic_with_error(Error::InvalidRole);
+            }
+            _ => {} // Proceed for Buyer, Artisan, Moderator
+        }
+
+        // Fetch and validate existing profile; reject deactivated accounts before mutation
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
+
+        // [SECURITY] Prevent unnecessary state mutations and replay attacks
+        // by recording state transition audit trail for forensic analysis
+        let old_role = profile.role;
+        profile.role = new_role;
+
+        // Store updated profile
+        Self::persist_public_user_profile(&env, &user, &profile);
+
+        // Issue #520 — event now carries (user, old_role, new_role) so
+        // downstream consumers don't need a follow-up read to know what
+        // the role transitioned from.
+        env.events().publish(
+            (Symbol::new(&env, "RoleUpdated"),),
+            (user.clone(), old_role, new_role),
+        );
+
+        Self::bump_state_version(&env, &user);
+
+        profile
+    }
+
+    /// Deactivate the user's profile and release their username.
+    /// Reverts if:
+    /// - User has active escrows (traditional or recurring)
+    /// - User is "admin"
+    /// - Profile is already deactivated
+    /// Deactivate a user profile, preventing further platform activity.
+    ///
+    /// # Authorization
+    ///
+    /// **SECURITY**: Only the user whose profile is being deactivated can invoke this.
+    /// The caller's signature is verified via `require_auth()` before state mutation.
+    /// Unauthorized invocation results in immediate transaction rollback.
+    ///
+    /// # Arguments
+    /// * `user` - Address of the user whose profile to deactivate
+    ///
+    /// # Storage Side-Effects
+    /// - Marks user profile status as `Deactivated` in persistent storage
+    /// - Releases the username back to the pool (not reserved for the deactivated user)
+    /// - Emits `ProfileDeactivated` event with the user address
+    ///
+    /// # Preconditions
+    /// - User must be onboarded (have an existing profile)
+    /// - Profile must not already be deactivated
+    /// - User must not have active escrows (checked via the configured escrow contract)
+    /// - If no escrow contract is registered, deactivation is rejected conservatively because active escrow obligations cannot be verified
+    /// - Admin user profile cannot be deactivated
+    ///
+    /// # Reverts if
+    /// - Caller is not the user being deactivated (authorization failure)
+    /// - Profile already deactivated
+    /// - Active escrows exist for this user
+    /// - User is the admin
+    pub fn deactivate_profile(env: Env, user: Address) {
+        user.require_auth();
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
+
+        let username_string = String::from_str(&env, profile.username.to_string().as_ref());
+        let normalized = normalize_username(&env, &username_string);
+        if normalized == String::from_str(&env, "admin") {
+            env.panic_with_error(Error::Unauthorized);
+        }
+
+        let local_key = DataKey::ActiveContractCount(user.clone());
+        if let Some(count) = env.storage().persistent().get::<_, u32>(&local_key) {
+            Self::extend_persistent(&env, &local_key);
+            if count > 0 {
+                env.panic_with_error(Error::ActiveEscrowsExist);
+            }
+        }
+
+        // Check for active escrows via cross-contract call if available
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        if let Some(escrow_contract) = config.escrow_contract {
+            let client = EscrowClient::new(&env, &escrow_contract);
+            if client.has_active_escrows(&user) {
+                env.panic_with_error(Error::ActiveEscrowsExist);
+            }
+        } else {
+            env.panic_with_error(Error::ActiveEscrowsExist);
+        }
+
+        // Release username so others can take it
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Username(normalized));
+
+        // Update profile state
+        profile.status = ProfileStatus::Deactivated;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+        Self::update_active_user_count(&env, -1);
+
+        // Issue #524 — event payload now carries the user's role at
+        // deactivation time. The role was overwritten in the
+        // `Deactivated` status above, so emitting the captured
+        // `profile.role` here lets an indexer attribute the
+        // deactivation to "an artisan left" vs "a customer left"
+        // without a follow-up profile read.
+        env.events().publish(
+            (Symbol::new(&env, "ProfileDeactivated"), user.clone()),
+            (user, profile.role),
+        );
+    }
+
+    /// Reactivate a previously deactivated profile (Issue #115).
+    ///
+    /// Re-registers the user's original username and sets status back to Active.
+    ///
+    /// # Reverts if
+    /// - Profile is not deactivated
+    /// - Username has been claimed by another user since deactivation
+    /// Re-activate a previously deactivated user profile.
+    ///
+    /// # Authorization
+    ///
+    /// **SECURITY**: Only the user whose profile is being reactivated can invoke this.
+    /// The caller's signature is verified via `require_auth()` before state mutation.
+    /// Unauthorized invocation results in immediate transaction rollback.
+    ///
+    /// # Arguments
+    /// * `user` - Address of the deactivated user to reactivate
+    ///
+    /// # Returns
+    /// Updated `UserProfile` with status changed back to `Active`.
+    ///
+    /// # Storage Side-Effects
+    /// - Marks user profile status as `Active` in persistent storage
+    /// - Re-claims the user's reserved username in persistent storage
+    /// - Emits `ProfileReactivated` event with user address and role
+    /// - Extends TTL on profile and username entries
+    ///
+    /// # Preconditions
+    /// - User must have been previously deactivated
+    /// - User's username must still be available (not taken by another user)
+    /// - Profile must exist and be in deactivated status
+    ///
+    /// # Reverts if
+    /// - Caller is not the user being reactivated (authorization failure)
+    /// - Profile not found in persistent storage
+    /// - Profile is not in Deactivated status
+    /// - Username has been taken by another user while deactivated
+    pub fn reactivate_profile(env: Env, user: Address) -> UserProfile {
+        user.require_auth();
+
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        if profile.status != ProfileStatus::Deactivated {
+            env.panic_with_error(Error::ProfileDeactivated);
+        }
+
+        // Re-claim username — fail if another user took it while deactivated
+        let username_string = String::from_str(&env, profile.username.to_string().as_ref());
+        let normalized = normalize_username(&env, &username_string);
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Username(normalized.clone()))
+        {
+            env.panic_with_error(Error::UsernameTaken);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(normalized.clone()), &user);
+        Self::extend_persistent(&env, &DataKey::Username(normalized));
+
+        profile.status = ProfileStatus::Active;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+        Self::update_active_user_count(&env, 1);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProfileReactivated"), user.clone()),
+            (user, profile.role),
+        );
+
+        profile
+    }
+
+    /// Verify user (admin only)
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `platform_admin`.
+    /// - `user` must have an existing profile.
+    ///
+    /// # Reverts if
+    /// - Caller is not admin
+    /// - User not found
+    /// Mark a user as verified on the platform.
+    ///
+    /// # Authorization
+    ///
+    /// **SECURITY**: Only the platform admin can invoke this endpoint.
+    /// The caller's signature is verified via `require_auth()` before any state mutation.
+    /// Unauthorized invocation results in immediate transaction rollback with
+    /// `Error::Unauthorized`.
+    ///
+    /// # Arguments
+    /// * `user` - Address of the user to verify
+    ///
+    /// # Returns
+    /// Updated `UserProfile` with `is_verified` flag set to true.
+    ///
+    /// # Storage Side-Effects
+    /// - Writes updated `UserProfile` to persistent storage
+    /// - Emits `UserVerified` event containing the verified user address
+    /// - Extends TTL on config and profile entries
+    ///
+    /// # Reverts if
+    /// - Caller is not the platform admin (unauthorized)
+    /// - User not found in persistent storage
+    /// - Config not initialized
+    pub fn verify_user(env: Env, user: Address) -> UserProfile {
+        // Get config to verify admin
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        // Only admin can verify users
+        config.platform_admin.require_auth();
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        // Get existing profile
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        // Set verified
+        profile.is_verified = true;
+
+        // Store updated profile
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+
+        // Emit event
+        env.events()
+            .publish((Symbol::new(&env, "UserVerified"),), &user);
+
+        profile
+    }
+
+    /// Get the onboarding contract configuration.
+    ///
+    /// Read-only. Returns the current [`OnboardingConfig`] singleton.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Config`] — no TTL extension (read-only path).
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    pub fn get_config(env: Env) -> OnboardingConfig {
+        Self::extend_persistent_read(&env, &DataKey::Config);
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized))
+    }
+
+    /// Check if a user has a specific role.
+    ///
+    /// Convenience wrapper around [`get_user_role`]. Returns `false` for
+    /// unknown addresses (no panic).
+    ///
+    /// # Parameters
+    /// - `user`: `Address` — The address to check.
+    /// - `role`: [`UserRole`] — The role to test for.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UserProfile(user)`] — TTL extended if profile exists.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None.
+    pub fn has_role(env: Env, user: Address, role: UserRole) -> bool {
+        Self::get_user_role(env, user) == role
+    }
+
+    /// Check if a user is verified.
+    ///
+    /// Returns `false` for unknown addresses (no panic).
+    ///
+    /// # Security — issue #450
+    /// This endpoint is now protected with `require_auth()` to prevent unauthorized
+    /// callers from querying verification status. Only the authenticated user may
+    /// invoke this check.
+    ///
+    /// # Storage Optimization — issue #443
+    /// TTL extension is applied on read to prevent premature archival during
+    /// extended escrow lifecycles.
+    ///
+    /// # Parameters
+    /// - `user`: `Address` — The address to check.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UserProfile(user)`] — TTL extended if profile exists.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None.
+    pub fn is_verified(env: Env, user: Address) -> bool {
+        user.require_auth();
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.is_verified
+        } else {
+            false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #63 – Artisan Verification Logic Enhancement
+    // -----------------------------------------------------------------------
+
+    /// Register the address of the deployed ESCROW_CONTRACT so it can update
+    /// reputation and activity metrics via cross-contract calls (admin only).
+    ///
+    /// # Security — issue #498
+    ///
+    /// Auth check runs before any TTL extension or storage write, following
+    /// the check-effect-interactions pattern. A non-admin caller is rejected
+    /// by `require_auth` before the contract touches any persistent state,
+    /// preventing unauthorized callers from extending the Config TTL as a
+    /// side-effect of a failed invocation.
+    ///
+    /// # Arguments
+    /// * `contract_address` - Address of the deployed escrow contract
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not platform admin
+    pub fn set_escrow_contract(env: Env, contract_address: Address) {
+        // Issue #498 — load config read-only first, then require_auth,
+        // then extend TTL and write. This ordering ensures unauthorized
+        // callers cannot trigger any storage side-effects.
+        let mut config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        config.platform_admin.require_auth();
+
+        config.escrow_contract = Some(contract_address);
+
+        env.storage().persistent().set(&DataKey::Config, &config);
+        Self::extend_persistent(&env, &DataKey::Config);
+    }
+
+    /// Update the minimum thresholds used for automatic user verification (admin only).
+    ///
+    /// Changes take effect immediately — the next call to [`update_user_metrics`]
+    /// or [`auto_verify_user`] will use the new values.
+    ///
+    /// # Parameters
+    /// - `min_escrow_count`: `u32` — Minimum number of completed escrows required
+    ///   for auto-verification. Stored in [`OnboardingConfig::min_escrow_count_for_verify`].
+    /// - `min_volume`: `i128` — Minimum total transaction volume (7-decimal normalized,
+    ///   USDC base) required. Stored in [`OnboardingConfig::min_volume_for_verify`].
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `platform_admin` (admin-only restriction).
+    ///
+    /// # Storage Side-Effects
+    /// - **Read/Write** [`DataKey::Config`] — thresholds updated, TTL extended.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    pub fn set_verification_thresholds(env: Env, min_escrow_count: u32, min_volume: i128) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        // Auth check before any storage mutation (#422).
+        config.platform_admin.require_auth();
+
+        let mut config = config;
+        config.min_escrow_count_for_verify = min_escrow_count;
+        config.min_volume_for_verify = min_volume;
+
+        env.storage().persistent().set(&DataKey::Config, &config);
+        Self::extend_persistent(&env, &DataKey::Config);
+    }
+
+    /// Enable or disable threshold-based automatic verification (admin only).
+    ///
+    /// When disabled, [`update_user_metrics`] will still accumulate metrics
+    /// but will not trigger auto-verification. Manual verification via
+    /// [`process_verification_request`] and [`verify_user`] remains available.
+    ///
+    /// # Parameters
+    /// - `enabled`: `bool` — `true` to enable auto-verification, `false` to disable.
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `platform_admin`.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read/Write** [`DataKey::Config`] — `auto_verify_enabled` updated, TTL extended.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    pub fn set_auto_verify_enabled(env: Env, enabled: bool) {
+        let mut config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        config.platform_admin.require_auth();
+        config.auto_verify_enabled = enabled;
+
+        env.storage().persistent().set(&DataKey::Config, &config);
+        Self::extend_persistent(&env, &DataKey::Config);
+    }
+
+    /// Get activity metrics for a user.
+    ///
+    /// # Integration notes — issue #469 / component #68
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized (`DataKey::Config` present).
+    /// - `address` may be any Stellar address; no auth is required for this
+    ///   read-only accessor.
+    ///
+    /// ## Storage side-effects
+    /// - Reads `DataKey::UserMetrics(address)` via the internal
+    ///   `read_user_metrics` helper.
+    /// - When a metrics entry already exists, its persistent TTL is extended
+    ///   by `TTL_EXTENSION` ledgers (~30 days). This prevents accumulated
+    ///   counters from silently resetting if the key expires between escrow
+    ///   settlements.
+    /// - When no entry exists, returns zeroed defaults without writing storage.
+    ///
+    /// ## Emitted events
+    /// - None. This is a gas-only read suitable for simulation and indexer
+    ///   backfills.
+    ///
+    /// ## Off-chain consumers
+    /// - Pair with `min_escrow_count_for_verify` and `min_volume_for_verify`
+    ///   from `get_config` to display auto-verification progress.
+    /// - `total_volume` is stored at 7-decimal precision after normalization
+    ///   in `update_user_metrics`; do not assume raw token stroops.
+    /// - Prefer subscribing to `UserVerified` over polling this function once
+    ///   thresholds are met.
+    ///
+    /// # Arguments
+    /// * `address` - The user's Stellar wallet address
+    ///
+    /// # Returns
+    /// [`UserMetrics`] with `total_escrow_count` and `total_volume` populated,
+    /// or zeroed defaults when no escrow activity has been recorded.
+    pub fn get_user_metrics(env: Env, address: Address) -> UserMetrics {
+        // Issue #426/#434: require auth to prevent unauthorized access to user activity data
+        address.require_auth();
+        Self::read_user_metrics(&env, &address)
+    }
+
+    /// Increment a user's activity metrics (called by the escrow contract).
+    ///
+    /// # Integration notes — issue #469 / component #68
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be the registered `OnboardingConfig::escrow_contract`
+    ///   address (authenticated via `require_auth`), or `platform_admin` when
+    ///   no escrow contract is registered yet.
+    /// - `escrow_count_delta` and `volume_delta` are saturating increments;
+    ///   pass `0` for either field to skip that counter.
+    /// - `token_address` must be a valid Soroban token contract; its `decimals()`
+    ///   value drives volume normalization to 7-decimal stroops.
+    ///
+    /// ## Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Reads, writes, and extends TTL on `DataKey::UserMetrics(address)`.
+    /// - When `auto_verify_enabled` is true and thresholds are met after the
+    ///   update, may also read/write `DataKey::UserProfile(address)`, append
+    ///   compact verification history entries, and emit `UserVerified` via the
+    ///   internal `try_auto_verify` path.
+    ///
+    /// ## Emitted event — `UserVerified` (conditional)
+    /// - **Topics:** `(Symbol::new("UserVerified"),)`
+    /// - **Data:** `Address` — the verified user
+    /// - Emitted only when auto-verification triggers inside `try_auto_verify`
+    ///   after this call. No event is emitted when thresholds are not met.
+    ///
+    /// ## Off-chain consumers
+    /// - Escrow contract should call this after each seller-side settlement
+    ///   with the gross token amount and seller address.
+    /// - This function performs no token transfers (check-effect-interactions
+    ///   safe: auth check, storage writes, optional profile update only).
+    /// - Indexers tracking verification progress should listen for
+    ///   `UserVerified` rather than diffing metrics on every escrow event.
+    ///
+    /// # Arguments
+    /// * `address` - Seller whose metrics to increment
+    /// * `escrow_count_delta` - Number of completed escrows to add (typically `1`)
+    /// * `volume_delta` - Gross token amount in the token's native stroops
+    /// * `token_address` - Token contract used for decimal normalization
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not the registered escrow contract (or admin fallback)
+    pub fn update_user_metrics(
+        env: Env,
+        address: Address,
+        escrow_count_delta: u32,
+        volume_delta: i128,
+        token_address: Address,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        let key = DataKey::UserMetrics(address.clone());
+        let mut metrics = Self::read_user_metrics(&env, &address);
+
+        metrics.total_escrow_count = metrics
+            .total_escrow_count
+            .checked_add(escrow_count_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::EscrowCountOverflow));
+
+        // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
+        let token_client = token::Client::new(&env, &token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        let normalized_delta = if token_decimals < base_decimals {
+            let diff = base_decimals - token_decimals;
+            volume_delta
+                .checked_mul(10i128.pow(diff))
+                .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow))
+        } else if token_decimals > base_decimals {
+            let diff = token_decimals - base_decimals;
+            volume_delta / 10i128.pow(diff)
+        } else {
+            volume_delta
+        };
+
+        metrics.total_volume = metrics
+            .total_volume
+            .checked_add(normalized_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow));
+
+        env.storage().persistent().set(&key, &metrics);
+        Self::extend_persistent(&env, &key);
+
+        // Check whether the user now meets the auto-verification threshold.
+        if config.auto_verify_enabled {
+            Self::try_auto_verify(&env, &address, &config, &metrics);
+        }
+    }
+
+    /// Update a user's "active contracts" counter (called by the escrow contract).
+    ///
+    /// This endpoint provides a lightweight, upgrade-safe way for the escrow
+    /// contract to signal that a user has entered or exited an active escrow
+    /// lifecycle. The onboarding contract uses the counter to enforce business
+    /// rules such as "profiles with active escrows cannot be deactivated"
+    /// without making a cross-contract read on every check.
+    ///
+    /// # Authorization
+    /// - Requires auth from `OnboardingConfig::escrow_contract` when configured.
+    /// - Falls back to `platform_admin` auth when no escrow contract is registered.
+    ///
+    /// # Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Reads/writes and extends TTL on `DataKey::ActiveContractCount(user)`.
+    /// - Extends TTL (if present) on `DataKey::UserProfile(user)` and
+    ///   `DataKey::UserMetrics(user)` so active users do not silently fall out of
+    ///   onboarding state due to key expiry between settlements.
+    ///
+    /// # Arguments
+    /// * `user` - User participating in the active contract lifecycle
+    /// * `delta` - Signed increment: `+1` when a contract becomes active, `-1`
+    ///   when it is closed. Other values are allowed but should be used with
+    ///   caution; underflows revert with `Error::ActiveContractUnderflow`.
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not the registered escrow contract (or admin fallback)
+    /// - `delta` would underflow the active counter
+    pub fn update_active_contracts(env: Env, user: Address, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+
+        // A single `get` both yields the counter and tells us whether the entry
+        // exists, so the removal below needs no extra `has` probe. The TTL is
+        // not refreshed here either: this write path always ends by either
+        // removing the entry or rewriting it with a fresh TTL (#447).
+        let key = DataKey::ActiveContractCount(user.clone());
+        let stored = env.storage().persistent().get::<_, u32>(&key);
+        let current = stored.unwrap_or(0u32);
+
+        let next = if delta > 0 {
+            current
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::ActiveContractOverflow))
+        } else {
+            let subtract = (-delta) as u32;
+            if subtract > current {
+                env.panic_with_error(Error::ActiveContractUnderflow);
+            }
+            current - subtract
+        };
+
+        if next == 0 {
+            if stored.is_some() {
+                env.storage().persistent().remove(&key);
+            }
+        } else {
+            env.storage().persistent().set(&key, &next);
+            Self::extend_persistent(&env, &key);
+        }
+
+        Self::extend_persistent_if_present(&env, &DataKey::UserProfile(user.clone()));
+        Self::extend_persistent_if_present(&env, &DataKey::UserMetrics(user));
+    }
+
+    /// Internal helper: verify a user automatically if they meet the configured thresholds.
+    fn try_auto_verify(
+        env: &Env,
+        address: &Address,
+        config: &OnboardingConfig,
+        metrics: &UserMetrics,
+    ) {
+        // Issue #523 — short-circuit on the cheap arithmetic check
+        // BEFORE doing the persistent read of `UserProfile`. The
+        // verification threshold is the hot path; reading + decoding
+        // a `UserProfile` costs persistent-storage CPU instructions
+        // that we charge for every escrow settlement. Bailing out
+        // early when the metric bar isn't met saves that read on
+        // every settle until the user actually qualifies.
+        if metrics.total_escrow_count < config.min_escrow_count_for_verify
+            || metrics.total_volume < config.min_volume_for_verify
+        {
+            return;
+        }
+
+        let mut profile = match Self::try_get_user_profile(env, address.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if profile.is_verified
+            || profile.status == ProfileStatus::UnderReview
+            || profile.status == ProfileStatus::Flagged
+        {
+            return;
+        }
+
+        let poh_required =
+            Self::read_persistent(env, &DataKey::PohReqForAutoVerify).unwrap_or(false);
+        if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
+            return;
+        }
+
+        if metrics.total_escrow_count >= config.min_escrow_count_for_verify
+            && metrics.total_volume >= config.min_volume_for_verify
+        {
+            profile.is_verified = true;
+            Self::persist_public_user_profile(env, address, &profile);
+            Self::bump_state_version(env, address);
+
+            // auto-verification triggered — emit AutoVerifiedEvent (#713)
+            env.events().publish(
+                (Symbol::new(env, "AutoVerifiedEvent"), address.clone()),
+                AutoVerifiedEvent {
+                    schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                    user: address.clone(),
+                    escrow_count: metrics.total_escrow_count,
+                    volume: metrics.total_volume as u64,
+                },
+            );
+
+            // Append auto-verify entry to history
+            Self::append_verification_history(
+                env,
+                address,
+                VerificationActionCode::AutoVerified,
+                None,
+            );
+        }
+    }
+
+    /// Trigger an auto-verification check for a user.
+    ///
+    /// The user being checked must sign the transaction. Even though
+    /// auto-verification only flips a positive flag when on-chain metrics
+    /// already qualify (so a malicious caller could not fabricate a
+    /// verification), gating on `address.require_auth()` keeps the
+    /// endpoint locked to the account owner — preventing third parties
+    /// from forcing a verification event onto a user who has not opted
+    /// in to the auto-flow, and giving auditors a clear authenticated
+    /// source for every `UserVerified` event emitted via this path.
+    ///
+    /// # Returns
+    /// `true` if the user was just auto-verified, `false` if thresholds not met or already verified.
+    pub fn auto_verify_user(env: Env, address: Address) -> bool {
+        // Lock the endpoint to the account being verified. The Soroban
+        // host short-circuits the rest of the call if the signature is
+        // missing or signed by a different address, so an unauthorized
+        // invocation can never reach the state mutation below.
+        address.require_auth();
+
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        if !config.auto_verify_enabled {
+            return false;
+        }
+
+        let profile = Self::get_user_profile(&env, address.clone());
+
+        if profile.is_verified
+            || profile.status == ProfileStatus::UnderReview
+            || profile.status == ProfileStatus::Flagged
+        {
+            return false;
+        }
+
+        let poh_required =
+            Self::read_persistent(&env, &DataKey::PohReqForAutoVerify).unwrap_or(false);
+        if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
+            return false;
+        }
+
+        let metrics: UserMetrics = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserMetrics(address.clone()))
+            .unwrap_or(UserMetrics {
+                total_escrow_count: 0,
+                total_volume: 0,
+            });
+
+        if config.auto_verify_enabled
+            && metrics.total_escrow_count >= config.min_escrow_count_for_verify
+            && metrics.total_volume >= config.min_volume_for_verify
+        {
+            Self::try_auto_verify(&env, &address, &config, &metrics);
+            return true;
+        }
+
+        false
+    }
+
+    /// Submit a manual verification request.
+    ///
+    /// Adds the user's address to the FIFO verification queue for admin review.
+    /// Calling this a second time before the request is processed is a no-op.
+    ///
+    /// Only Buyers and Artisans may invoke this endpoint. Admins and Moderators
+    /// are assigned their roles directly and do not use the verification queue.
+    pub fn request_verification(env: Env, user: Address) {
+        user.require_auth();
+
+        let profile = Self::get_user_profile(&env, user.clone());
+
+        if profile.status == ProfileStatus::UnderReview {
+            env.panic_with_error(Error::ProfileUnderReview);
+        }
+        if profile.status == ProfileStatus::Flagged {
+            env.panic_with_error(Error::ProfileFlagged);
+        }
+
+        let _config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        let poh_required =
+            Self::read_persistent(&env, &DataKey::PohReqForAutoVerify).unwrap_or(false);
+        if poh_required && !Self::is_poh_valid(env.clone(), user.clone()) {
+            env.panic_with_error(Error::InvalidPohCredential);
+        }
+
+        if Self::is_verification_pending_internal(&env, &user) {
+            return;
+        }
+
+        // Capacity is consumed only for a new queue entry, so duplicate pending
+        // requests remain idempotent and never create duplicate records (#1084).
+        Self::consume_attempt_capacity(&env, &user, true);
+
+        let now = env.ledger().timestamp();
+        let last_attempt_key = DataKey::VerifyLastAttempt(user.clone());
+        let cooldown =
+            Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400u64);
+        if let Some(last_attempt) = Self::read_persistent::<_, u64>(&env, &last_attempt_key) {
+            if cooldown > 0 && now < last_attempt + cooldown {
+                env.panic_with_error(Error::VerificationCooldownActive);
+            }
+        }
+        env.storage().persistent().set(&last_attempt_key, &now);
+        Self::extend_persistent(&env, &last_attempt_key);
+
+        // Only Buyers and Artisans may request manual verification.
+        // Admins and Moderators are assigned their roles directly and bypass
+        // the verification queue.
+        assert!(
+            profile.role == UserRole::Buyer || profile.role == UserRole::Artisan,
+            "Only Buyers and Artisans can request verification"
+        );
+
+        Self::enqueue_verification_request(&env, &user);
+
+        Self::append_verification_history(
+            &env,
+            &user,
+            VerificationActionCode::Requested,
+            Some(user.clone()),
+        );
+    }
+
+    /// Check whether a user currently has a pending manual verification request.
+    ///
+    /// The queried user must authorize this read.
+    pub fn is_verification_pending(env: Env, user: Address) -> bool {
+        user.require_auth();
+        Self::is_verification_pending_internal(&env, &user)
+    }
+
+    /// Approve or reject a pending manual verification request (admin only).
+    ///
+    /// # Integration notes — issue #477 / component #76
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `OnboardingConfig::platform_admin`
+    ///   (`require_auth`).
+    /// - `user` must be onboarded (`DataKey::UserProfile(user)`).
+    /// - A pending verification request for `user` is cleared as part of
+    ///   processing (queue head advanced via `clear_verification_request`).
+    ///
+    /// ## Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Reads, writes, and extends TTL on `DataKey::UserProfile(user)`,
+    ///   updating only `is_verified` to match `approve`. Profile version
+    ///   (`CURRENT_USER_PROFILE_VERSION`) and all other fields are preserved.
+    /// - Removes `DataKey::VerificationRequest(user)` and compacts the queue.
+    /// - Saturating-decrements `DataKey::VerificationQueueCount` when a pending
+    ///   request existed (#730); a second concurrent clear is a no-op for the
+    ///   counter so it cannot go negative.
+    /// - Appends a compact history entry with action `"approved"` or
+    ///   `"rejected"` and `by = Some(platform_admin)`.
+    ///
+    /// ## Emitted event — `UserVerified` (on approval only)
+    /// - **Topics:** `(Symbol::new("UserVerified"),)`
+    /// - **Data:** `Address` — the newly verified `user`
+    /// - Not emitted when `approve == false`.
+    ///
+    /// ## Off-chain consumers
+    /// - Indexers should treat `UserVerified` as the canonical signal that
+    ///   `is_verified` flipped to `true`; pair with `get_verification_history`
+    ///   for a full audit trail including rejections.
+    /// - This function performs no token transfers (check-effect-interactions
+    ///   safe: auth check and storage writes only).
+    ///
+    /// # Arguments
+    /// * `user` - Address of the user whose request is being processed
+    /// * `approve` - `true` to verify the user, `false` to reject
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not platform admin
+    /// - User not found
+    pub fn process_verification_request(env: Env, user: Address, approve: bool) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+        // [SECURITY] Endpoint #53 (issue #454): this verification state transition
+        // flips `is_verified` on a user profile and is restricted to the platform
+        // admin role. The config is loaded read-only first, then authorization is
+        // enforced via `require_auth()` before any storage write or TTL extension.
+        // The Soroban host aborts the invocation and rolls back the transaction if
+        // the call is not signed by `platform_admin`, so an unauthorized caller can
+        // never reach the profile mutation, queue update, or event emission below.
+        config.platform_admin.require_auth();
+
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        profile.is_verified = approve;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+
+        Self::clear_verification_request(&env, &user);
+
+        Self::append_verification_history(
+            &env,
+            &user,
+            if approve {
+                VerificationActionCode::Approved
+            } else {
+                VerificationActionCode::Rejected
+            },
+            Some(config.platform_admin.clone()),
+        );
+
+        if approve {
+            env.events()
+                .publish((Symbol::new(&env, "UserVerified"),), &user);
+        }
+    }
+
+    /// Force-clear a pending manual verification request without approving or
+    /// rejecting it (admin only).
+    ///
+    /// # Security — issue #41 / endpoint hardening
+    ///
+    /// Unlike [`OnboardingContract::request_verification`] (which a user invokes
+    /// for themselves) this is a privileged queue-maintenance state transition:
+    /// it removes an arbitrary user's pending request and advances the manual
+    /// verification queue head. Allowing any caller to invoke it would let a
+    /// malicious actor evict legitimate users from the verification queue,
+    /// denying them admin review. The endpoint is therefore locked behind
+    /// `OnboardingConfig::platform_admin.require_auth()`, which is evaluated
+    /// *before* any storage mutation. An unauthorized invocation fails the auth
+    /// check and the host rolls the entire transaction back, leaving the queue
+    /// untouched.
+    ///
+    /// Use this to evict stale or abandoned requests (e.g. from users who later
+    /// deactivated) so the queue head can advance. To verify or reject a request
+    /// and record an audit entry, prefer
+    /// [`OnboardingContract::process_verification_request`] instead.
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `OnboardingConfig::platform_admin` (`require_auth`).
+    ///
+    /// # Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Removes `DataKey::VerificationRequest(user)` (if present) and compacts
+    ///   the queue by advancing `DataKey::VerificationQueueHead`.
+    /// - Saturating-decrements `DataKey::VerificationQueueCount` only when a
+    ///   pending request was actually removed (#730).
+    /// - No `UserProfile` shape is touched, so no profile-version upgrade is
+    ///   required (`CURRENT_USER_PROFILE_VERSION` unaffected).
+    ///
+    /// # Arguments
+    /// * `user` - Address whose pending verification request should be cleared.
+    ///
+    /// # Returns
+    /// `true` if a pending request existed and was cleared; `false` if the user
+    /// had no pending request (call is an idempotent no-op in that case).
+    ///
+    /// # Reverts if
+    /// - Contract not initialized.
+    /// - Caller is not the platform admin.
+    pub fn admin_clear_verification_request(env: Env, user: Address) -> bool {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        // Authorization gate — must run before any state mutation so an
+        // unauthorized caller triggers a full transaction rollback (#41).
+        config.platform_admin.require_auth();
+
+        // clear_verification_request is idempotent: only the first clear of a
+        // pending request decrements VerificationQueueCount (#730).
+        Self::clear_verification_request(&env, &user)
+    }
+
+    /// Get the full verification history for a user.
+    ///
+    /// Only the user themselves may read their own verification history. The read path
+    /// intentionally walks the circular-buffer from slot `0` to `count - 1` using the
+    /// persisted count key as the source of truth; it must not infer slots from timestamps
+    /// or mutate the storage layout while iterating.
+    pub fn get_verification_history(env: Env, user: Address) -> Vec<VerificationEntry> {
+        user.require_auth();
+
+        Self::migrate_legacy_verification_history(&env, &user);
+
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
+        let count: u32 = Self::read_persistent(&env, &count_key).unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+        for index in 0..count {
+            let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), index);
+            if let Some(compact) =
+                Self::read_persistent::<_, CompactVerificationEntry>(&env, &entry_key)
+            {
+                result.push_back(VerificationEntry {
+                    timestamp: compact.timestamp,
+                    action: Self::verification_action_to_string(&env, compact.action),
+                    by: compact.by,
+                });
+            }
+        }
+        result
+    }
+
+    /// Get all addresses currently awaiting manual verification (admin helper).
+    ///
+    /// Advances the queue head past any stale entries (users whose pending
+    /// request was cleared) before building the result. Returns only addresses
+    /// that still have an active [`DataKey::VerificationRequest`] entry.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::VerificationQueueHead`] / [`DataKey::VerificationQueueTail`] — TTL extended.
+    /// - **Read** [`DataKey::VerificationQueueIndex(i)`] for each slot — stale entries removed.
+    /// - **Read** [`DataKey::VerificationRequest(user)`] for each candidate (temporary
+    ///   storage, no TTL extension — issue #702).
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] when the contract configuration is absent.
+    /// - Fails authorization unless the configured `platform_admin` signs the invocation.
+    pub fn get_verification_queue(env: Env) -> Vec<Address> {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+        // [SECURITY] Endpoint #73: Verification queue is sensitive data; only the
+        // platform admin may read it. Unauthorized access results in immediate rollback.
+        config.platform_admin.require_auth();
+
+        Self::advance_verification_head(&env);
+
+        let head = Self::get_queue_pointer(&env, &DataKey::VerificationQueueHead);
+        let tail = Self::get_queue_pointer(&env, &DataKey::VerificationQueueTail);
+        let mut queue = Vec::new(&env);
+
+        for index in head..tail {
+            // Issue #447: every slot walked here has its TTL refreshed, not just
+            // the head slot that `advance_verification_head` touches. Without
+            // this, a queue entry sitting behind a long-lived head request could
+            // be archived and silently drop its user from the queue.
+            let queue_index_key = DataKey::VerificationQueueIndex(index);
+            if let Some(user) = Self::read_persistent::<_, Address>(&env, &queue_index_key) {
+                if Self::is_verification_pending_internal(&env, &user) {
+                    queue.push_back(user);
+                }
+            }
+        }
+
+        queue
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #100 – Reputation System (Trust Score)
+    // Issue #939 – Reputation Decay & Anti-Farming Controls
+    // -----------------------------------------------------------------------
+
+    /// Update a user's reputation counters and decaying trust score.
+    ///
+    /// Called by the ESCROW_CONTRACT after a state change (release / refund /
+    /// resolve). Lifetime counters (`successful_trades` / `disputed_trades`)
+    /// and the marketplace `trust_score` are updated using saturating arithmetic.
+    ///
+    /// ## Anti-farming & decay (#939)
+    /// Before applying deltas the contract:
+    /// 1. Lazily decays `trust_score` per [`ReputationPolicy`].
+    /// 2. Enforces an update cooldown on *successful* increments.
+    /// 3. Caps successful increments inside the farming window.
+    /// Disputed increments always apply in full. Blocked or capped attempts are
+    /// still recorded in reputation history so abuse patterns are detectable.
+    /// Silently skips users who are not onboarded (no panic).
+    ///
+    /// ## Auth
+    /// Requires the registered `escrow_contract` address. If none is set,
+    /// falls back to `platform_admin`.
+    ///
+    /// # Parameters
+    /// - `address`: `Address` — User whose counters to update.
+    /// - `successful_delta`: `u32` — Requested amount to add to successful trades.
+    /// - `disputed_delta`: `u32` — Amount to add to disputed trades (always applied).
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be the registered `escrow_contract` (or `platform_admin` if unset).
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Config`] — reads auth address, TTL extended.
+    /// - **Read** [`DataKey::ReputationPolicy`] — decay / farming rules.
+    /// - **Read/Write** [`DataKey::UserProfile(address)`] — lifetime counters.
+    /// - **Read/Write** [`DataKey::ReputationState(address)`] — trust score + window.
+    /// - **Write** reputation history keys — append audit entry.
+    ///   No-op (returns early) if profile does not exist.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    pub fn update_reputation(
+        env: Env,
+        address: Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+
+        Self::apply_reputation_update(&env, &address, successful_delta, disputed_delta, None);
+    }
+
+    /// Apply reputation for a completed settlement after checking its value.
+    ///
+    /// Successful credit is eligible only when `settlement_amount`, normalized
+    /// to 7 decimals using `token_address`, meets the configured minimum.
+    /// Disputes always apply. Rejected low-value attempts are appended to the
+    /// score history but do not consume cooldown or farming-window capacity.
+    pub fn update_reputation_for_settlement(
+        env: Env,
+        address: Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        settlement_amount: i128,
+        token_address: Address,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+
+        if successful_delta == 0 && disputed_delta == 0 {
+            return;
+        }
+
+        let normalized_amount = if successful_delta > 0 && settlement_amount > 0 {
+            Self::normalize_token_amount(&env, settlement_amount, &token_address)
+        } else {
+            0
+        };
+        let below_minimum = successful_delta > 0
+            && (settlement_amount <= 0
+                || normalized_amount < Self::get_minimum_reputation_settlement_internal(&env));
+
+        Self::apply_reputation_update(
+            &env,
+            &address,
+            successful_delta,
+            disputed_delta,
+            if below_minimum {
+                Some(ReputationReasonCode::BelowMinimumSettlement)
+            } else {
+                None
+            },
+        );
+    }
+
+    fn apply_reputation_update(
+        env: &Env,
+        address: &Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        successful_rejection: Option<ReputationReasonCode>,
+    ) {
+        let mut profile = match Self::try_get_user_profile(env, address.clone()) {
+            Some(p) => p,
+            None => return, // User not onboarded; skip silently
+        };
+
+        if successful_delta == 0 && disputed_delta == 0 {
+            return;
+        }
+
+        let policy = Self::get_reputation_policy_internal(env);
+        let mut state = Self::get_or_init_reputation_state(env, address);
+        Self::apply_reputation_decay(env, &mut state, &policy);
+
+        let (successful_applied, success_reason) = match successful_rejection {
+            Some(reason) => (0, reason),
+            None => Self::credit_successful_delta(env, &mut state, &policy, successful_delta),
+        };
+        // Adverse outcomes always apply — cooldown/farming must not shield bad actors.
+        let disputed_applied = disputed_delta;
+
+        let reason = if successful_delta > 0 {
+            success_reason
+        } else {
+            ReputationReasonCode::Applied
+        };
+
+        profile.successful_trades = profile.successful_trades.saturating_add(successful_applied);
+        profile.disputed_trades = profile.disputed_trades.saturating_add(disputed_applied);
+
+        state.trust_score = state.trust_score.saturating_add(successful_applied);
+        state.trust_score = state.trust_score.saturating_sub(disputed_applied);
+
+        if successful_applied > 0 {
+            let now = env.ledger().timestamp();
+            state.last_success_update_at = now;
+            state.window_successful_applied = state
+                .window_successful_applied
+                .saturating_add(successful_applied);
+        }
+
+        Self::persist_public_user_profile(env, address, &profile);
+        Self::persist_reputation_state(env, address, &state);
+        Self::append_reputation_history(
+            env,
+            address,
+            successful_delta,
+            disputed_delta,
+            successful_applied,
+            disputed_applied,
+            state.trust_score,
+            reason,
+        );
+    }
+
+    /// Get a user's lifetime reputation counters.
+    ///
+    /// Returns `(0, 0)` for unknown addresses — never panics.
+    /// Lifetime counters are an audit trail; for the decaying marketplace
+    /// trust metric see [`get_trust_score`] (#939).
+    ///
+    /// # Parameters
+    /// - `address`: `Address` — The user to query.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UserProfile(address)`] — no TTL extension.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None.
+    ///
+    /// # Returns
+    /// Tuple `(successful_trades, disputed_trades)`.
+    pub fn get_user_reputation(env: Env, address: Address) -> (u32, u32) {
+        // Issue #426/#434/#446: require auth to prevent unauthorized access to sensitive trade data
+        address.require_auth();
+        match Self::try_get_user_profile(&env, address) {
+            Some(profile) => (profile.successful_trades, profile.disputed_trades),
+            None => (0, 0),
+        }
+    }
+
+    /// Get a user's decaying trust score (#939).
+    ///
+    /// Lazily applies reputation decay before returning so callers always see
+    /// a current score without needing a background job. Returns `0` for
+    /// unknown addresses.
+    ///
+    /// # Auth
+    /// Requires `address.require_auth()` (same sensitivity as reputation reads).
+    pub fn get_trust_score(env: Env, address: Address) -> u32 {
+        address.require_auth();
+        if Self::try_get_user_profile(&env, address.clone()).is_none() {
+            return 0;
+        }
+
+        let policy = Self::get_reputation_policy_internal(&env);
+        let mut state = Self::get_or_init_reputation_state(&env, &address);
+        if Self::apply_reputation_decay(&env, &mut state, &policy) {
+            Self::persist_reputation_state(&env, &address, &state);
+        }
+        state.trust_score
+    }
+
+    /// Get the full per-user reputation state (#939).
+    ///
+    /// Useful for dashboards that need window counters alongside the trust
+    /// score. Applies lazy decay. Returns a zeroed state for unknown users.
+    pub fn get_reputation_state(env: Env, address: Address) -> ReputationState {
+        address.require_auth();
+        if Self::try_get_user_profile(&env, address.clone()).is_none() {
+            return ReputationState {
+                trust_score: 0,
+                last_decay_at: 0,
+                last_success_update_at: 0,
+                window_started_at: 0,
+                window_successful_applied: 0,
+            };
+        }
+
+        let policy = Self::get_reputation_policy_internal(&env);
+        let mut state = Self::get_or_init_reputation_state(&env, &address);
+        if Self::apply_reputation_decay(&env, &mut state, &policy) {
+            Self::persist_reputation_state(&env, &address, &state);
+        }
+        state
+    }
+
+    /// Return recent reputation change history for abuse-pattern detection (#939).
+    ///
+    /// Entries are ordered oldest → newest within the bounded window
+    /// ([`MAX_REPUTATION_HISTORY`]). Blocked farming / cooldown attempts are
+    /// included so repeated low-risk inflation attempts are visible.
+    pub fn get_reputation_history(env: Env, address: Address) -> Vec<ReputationHistoryEntry> {
+        address.require_auth();
+
+        let count_key = DataKey::ReputationHistoryCount(address.clone());
+        let count: u32 = Self::read_persistent(&env, &count_key).unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+        for index in 0..count {
+            let entry_key = DataKey::RepHistoryIndexed(address.clone(), index);
+            if let Some(compact) =
+                Self::read_persistent::<_, CompactReputationHistoryEntry>(&env, &entry_key)
+            {
+                result.push_back(ReputationHistoryEntry {
+                    timestamp: compact.timestamp,
+                    successful_requested: compact.successful_requested,
+                    disputed_requested: compact.disputed_requested,
+                    successful_applied: compact.successful_applied,
+                    disputed_applied: compact.disputed_applied,
+                    trust_score_after: compact.trust_score_after,
+                    reason: Self::reputation_reason_symbol(&env, compact.reason),
+                });
+            }
+        }
+        result
+    }
+
+    /// Read the active reputation decay / anti-farming policy (#939).
+    pub fn get_reputation_policy(env: Env) -> ReputationPolicy {
+        Self::get_reputation_policy_internal(&env)
+    }
+
+    /// Read the minimum 7-decimal normalized settlement value for reputation.
+    pub fn get_min_reputation_settlement(env: Env) -> i128 {
+        Self::get_minimum_reputation_settlement_internal(&env)
+    }
+
+    /// Set the minimum completed-settlement value eligible for reputation.
+    pub fn set_min_reputation_settlement(env: Env, minimum_amount: i128) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        if minimum_amount < 0 {
+            env.panic_with_error(Error::InvalidReputationPolicy);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinRepSettlement, &minimum_amount);
+        Self::extend_persistent(&env, &DataKey::MinRepSettlement);
+    }
+
+    /// Set the reputation decay / anti-farming policy (admin only, #939).
+    ///
+    /// # Parameters
+    /// - `decay_interval_secs`: Seconds between decay steps (`0` disables decay).
+    /// - `decay_bps`: Basis points removed each interval (must be ≤ 10_000).
+    /// - `update_cooldown_secs`: Min seconds between successful credit (`0` disables).
+    /// - `farming_window_secs`: Anti-farming window length (`0` disables the cap).
+    /// - `max_successful_per_window`: Max successful credits per window.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    /// - Panics with [`Error::InvalidReputationPolicy`] if `decay_bps > 10_000`.
+    pub fn set_reputation_policy(
+        env: Env,
+        decay_interval_secs: u64,
+        decay_bps: u32,
+        update_cooldown_secs: u64,
+        farming_window_secs: u64,
+        max_successful_per_window: u32,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+
+        config.platform_admin.require_auth();
+
+        if decay_bps > REPUTATION_BPS_DENOMINATOR {
+            env.panic_with_error(Error::InvalidReputationPolicy);
+        }
+
+        let policy = ReputationPolicy {
+            decay_interval_secs,
+            decay_bps,
+            update_cooldown_secs,
+            farming_window_secs,
+            max_successful_per_window,
         };
         env.storage()
             .persistent()
-            .set(&DataKey::UserProfile(user.clone()), &profile);
-    });
-
-    // No auth for the caller here — should panic due to require_auth
-    client.bump_user_profile_ttl(&user);
-}
-
-#[test]
-#[should_panic]
-fn test_bump_user_metrics_ttl_unauthorized() {
-    let env = Env::default();
-
-    // Do NOT call env.mock_all_auths(); we want require_auth() to enforce real auth.
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-
-    env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    // No auth for the caller here — should panic due to require_auth
-    client.bump_user_metrics_ttl(&user);
-}
-#[test]
-fn test_volume_normalization_7_decimal_token() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "vol7"), &UserRole::Artisan);
-
-    let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin);
-    client.update_user_metrics(
-        &user,
-        &AUTO_VERIFY_ESCROW_THRESHOLD,
-        &AUTO_VERIFY_VOLUME_THRESHOLD,
-        &token.address(),
-    );
-
-    assert!(client.is_verified(&user));
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, AUTO_VERIFY_ESCROW_THRESHOLD);
-    assert_eq!(metrics.total_volume, AUTO_VERIFY_VOLUME_THRESHOLD);
-}
-
-#[test]
-fn test_volume_normalization_8_decimal_token() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "vol8"), &UserRole::Artisan);
-
-    let token = register_decimal_test_token(&env, 8);
-    let raw_threshold = AUTO_VERIFY_VOLUME_THRESHOLD * 10;
-    client.update_user_metrics(&user, &AUTO_VERIFY_ESCROW_THRESHOLD, &raw_threshold, &token);
-
-    assert!(client.is_verified(&user));
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, AUTO_VERIFY_ESCROW_THRESHOLD);
-    assert_eq!(metrics.total_volume, AUTO_VERIFY_VOLUME_THRESHOLD);
-}
-
-#[test]
-fn test_volume_normalization_18_decimal_token() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "vol18"), &UserRole::Artisan);
-
-    let token = register_decimal_test_token(&env, 18);
-    let raw_threshold = AUTO_VERIFY_VOLUME_THRESHOLD * 10_i128.pow(11);
-    client.update_user_metrics(&user, &AUTO_VERIFY_ESCROW_THRESHOLD, &raw_threshold, &token);
-
-    assert!(client.is_verified(&user));
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, AUTO_VERIFY_ESCROW_THRESHOLD);
-    assert_eq!(metrics.total_volume, AUTO_VERIFY_VOLUME_THRESHOLD);
-}
-
-// ===== Portfolio Tests (Issue #112) =====
-
-#[test]
-fn test_update_portfolio_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_jane");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Update portfolio with valid CIDv0
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = Bytes::from_slice(&env, portfolio_cid.to_string().as_bytes());
-    let updated = client.update_portfolio(&user, &Some(portfolio_cid.clone()));
-
-    assert_eq!(updated.portfolio_cid, Some(expected));
-    assert_eq!(updated.role, UserRole::Artisan);
-}
-
-#[test]
-fn test_onboard_user_stores_flat_profile_without_portfolio_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_flat");
-
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    let stored: StoredUserProfile = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserProfile(user.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored.version, CURRENT_USER_PROFILE_VERSION);
-
-    let has_portfolio_key = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .has(&DataKey::UserPortfolio(user.clone()))
-    });
-    assert!(!has_portfolio_key);
-}
-
-#[test]
-fn test_update_portfolio_with_cidv1() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_john");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Update portfolio with valid CIDv1 (base32)
-    let portfolio_cid = String::from_str(
-        &env,
-        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-    );
-    let expected = Bytes::from_slice(&env, portfolio_cid.to_string().as_bytes());
-    let updated = client.update_portfolio(&user, &Some(portfolio_cid.clone()));
-
-    assert_eq!(updated.portfolio_cid, Some(expected));
-}
-
-#[test]
-fn test_update_portfolio_remove() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_bob");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Set portfolio
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    client.update_portfolio(&user, &Some(portfolio_cid));
-
-    // Remove portfolio
-    let updated = client.update_portfolio(&user, &None);
-    assert_eq!(updated.portfolio_cid, None);
-}
-
-#[test]
-fn test_update_portfolio_uses_separate_storage_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_split");
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = string_to_bytes(&env, &portfolio_cid);
-    client.update_portfolio(&user, &Some(portfolio_cid));
-
-    let stored: StoredUserProfile = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserProfile(user.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored.version, CURRENT_USER_PROFILE_VERSION);
-
-    let stored_portfolio: Bytes = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserPortfolio(user.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored_portfolio, expected);
-}
-
-#[test]
-#[should_panic]
-fn test_update_portfolio_buyer_cannot_update() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "buyer_jane");
-
-    // Onboard as buyer
-    client.onboard_user(&user, &username, &UserRole::Buyer);
-
-    // Try to update portfolio (should fail)
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    client.update_portfolio(&user, &Some(portfolio_cid));
-}
-
-#[test]
-#[should_panic]
-fn test_update_portfolio_invalid_cid() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_alice");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Try to update with invalid CID
-    let invalid_cid = String::from_str(&env, "invalid_cid_format");
-    client.update_portfolio(&user, &Some(invalid_cid));
-}
-
-#[test]
-#[should_panic]
-fn test_update_portfolio_not_onboarded() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    // Try to update portfolio without onboarding
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    client.update_portfolio(&user, &Some(portfolio_cid));
-}
-
-#[test]
-fn test_portfolio_accessible_via_get_user() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_carol");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Update portfolio
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = Bytes::from_slice(&env, portfolio_cid.to_string().as_bytes());
-    client.update_portfolio(&user, &Some(portfolio_cid.clone()));
-
-    // Verify portfolio is accessible via get_user
-    let profile = client.get_user(&user);
-    assert_eq!(profile.portfolio_cid, Some(expected));
-}
-
-#[test]
-fn test_portfolio_accessible_via_get_user_by_username() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_dave");
-
-    // Onboard as artisan
-    client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Update portfolio
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = Bytes::from_slice(&env, portfolio_cid.to_string().as_bytes());
-    client.update_portfolio(&user, &Some(portfolio_cid.clone()));
-
-    // Verify portfolio is accessible via get_user_by_username
-    let profile = client.get_user_by_username(&username);
-    assert_eq!(profile.portfolio_cid, Some(expected));
-}
-
-#[test]
-fn test_portfolio_none_by_default() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_eve");
-
-    // Onboard as artisan
-    let profile = client.onboard_user(&user, &username, &UserRole::Artisan);
-
-    // Verify portfolio is None by default
-    assert_eq!(profile.portfolio_cid, None);
-}
-
-#[test]
-fn test_portfolio_preserves_other_fields() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let username = String::from_str(&env, "artisan_frank");
-
-    // Onboard as artisan
-    let original = client.onboard_user(&user, &username, &UserRole::Artisan);
-    assert_eq!(original.role, UserRole::Artisan);
-    assert!(!original.is_verified);
-
-    // Update portfolio
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let updated = client.update_portfolio(&user, &Some(portfolio_cid));
-
-    // Verify other fields are preserved
-    assert_eq!(updated.role, UserRole::Artisan);
-    assert!(!updated.is_verified);
-    assert_eq!(updated.address, user);
-    assert_eq!(updated.registered_at, original.registered_at);
-}
-
-#[test]
-fn test_migrate_user_profile_moves_embedded_portfolio_to_separate_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    let portfolio_cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
-    let expected = string_to_bytes(&env, &portfolio_cid);
-
-    let versioned_profile = UserProfile {
-        version: 4,
-        address: user.clone(),
-        role: UserRole::Artisan,
-        username: Symbol::new(&env, "legacy_artisan"),
-        registered_at: 1234,
-        is_verified: true,
-        successful_trades: 2,
-        disputed_trades: 1,
-        portfolio_cid: Some(expected.clone()),
-        status: ProfileStatus::Active,
-        state_version: 0,
-    };
-
-    env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserProfile(user.clone()), &versioned_profile);
-    });
-
-    assert!(client.migrate_user_profile(&user));
-
-    let migrated = client.get_user(&user);
-    assert_eq!(migrated.version, CURRENT_USER_PROFILE_VERSION);
-    assert_eq!(migrated.portfolio_cid, Some(expected.clone()));
-
-    let stored: StoredUserProfile = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserProfile(user.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored.version, CURRENT_USER_PROFILE_VERSION);
-
-    let stored_portfolio: Bytes = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserPortfolio(user.clone()))
-            .unwrap()
-    });
-    assert_eq!(stored_portfolio, expected);
-}
-
-// ===== Error Enum Tests (Issue #120) =====
-
-// ===== Error Enum Tests (Issue #120) =====
-
-#[test]
-fn test_error_enum_has_specific_variants() {
-    // These tests verify that the error enum maintains backward compatibility
-    // and includes required error variants for the platform. Uncomment assertions
-    // as corresponding error variants are added during development.
-
-    // Note: The following variant checks are deferred to a future refactoring
-    // when error codes are consolidated across onboarding and escrow contracts:
-    // assert_eq!(Error::InvalidIpfsHash as u32, 25);
-    // assert_eq!(Error::InvalidMetadataHash as u32, 26);
-    // assert_eq!(Error::BatchLimitExceeded as u32, 27);
-    // assert_eq!(Error::InvalidPortfolioCid as u32, 28);
-    // assert_eq!(Error::NotAnArtisan as u32, 29);
-    // assert_eq!(Error::InvalidVerificationLevel as u32, 30);
-    // assert_eq!(Error::UsernameChangeCooldownActive as u32, 31);
-    // assert_eq!(Error::InvalidDisputeReason as u32, 32);
-    // assert_eq!(Error::EscrowAmountBelowMinimum as u32, 33);
-    // assert_eq!(Error::InvalidReleaseWindow as u32, 34);
-    // assert_eq!(Error::UnauthorizedAdmin as u32, 35);
-}
-
-#[test]
-fn test_error_enum_backward_compatibility() {
-    // Verify that existing error variants maintain their numeric IDs
-    assert_eq!(Error::NotInitialized as u32, 1);
-    assert_eq!(Error::UserNotFound as u32, 2);
-    assert_eq!(Error::UsernameTaken as u32, 3);
-    assert_eq!(Error::UsernameTooShort as u32, 4);
-    assert_eq!(Error::UsernameTooLong as u32, 5);
-    assert_eq!(Error::InvalidRole as u32, 6);
-    assert_eq!(Error::AlreadyOnboarded as u32, 7);
-    assert_eq!(Error::Unauthorized as u32, 8);
-    assert_eq!(Error::ProfileDeactivated as u32, 9);
-    assert_eq!(Error::ActiveEscrowsExist as u32, 10);
-    assert_eq!(Error::InvalidFee as u32, 11);
-    assert_eq!(Error::NotAnArtisan as u32, 12);
-    assert_eq!(Error::InvalidPortfolioCid as u32, 13);
-    assert_eq!(Error::CooldownActive as u32, 14);
-}
-
-/// Issue #117 — set_moderator must reject callers that are not the platform admin.
-#[test]
-#[should_panic]
-fn test_set_moderator_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &soroban_sdk::String::from_str(&env, "target_user"),
-        &UserRole::Buyer,
-    );
-
-    // Clear mocked auths so the next call has no authorization.
-    env.set_auths(&[]);
-
-    // Calling set_moderator without admin auth must panic.
-    client.set_moderator(&user);
-}
-
-/// Issue #514 / #113 — reactivate_profile must reject callers without user authorization.
-#[test]
-#[should_panic]
-fn test_reactivate_profile_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &soroban_sdk::String::from_str(&env, "someuser"),
-        &UserRole::Buyer,
-    );
-    client.deactivate_profile(&user);
-
-    // Clear all mocked auths — no authorization provided.
-    env.set_auths(&[]);
-
-    // Must panic: no auth for `user`.
-    client.reactivate_profile(&user);
-}
-
-#[test]
-fn test_has_active_contracts() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    // 1. No escrow contract registered -> should return false
-    assert!(!client.has_active_contracts(&user));
-
-    // 2. Register and set escrow contract
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    let escrow_client = crate::CraftNexusContractClient::new(&env, &escrow_id);
-
-    let platform_wallet = Address::generate(&env);
-    let arbitrator = Address::generate(&env);
-    escrow_client.initialize(
-        &platform_wallet,
-        &admin,
-        &arbitrator,
-        &500, // 5% platform fee
-        &Some(client.address.clone()),
-    );
-
-    client.set_escrow_contract(&escrow_id);
-
-    // 3. User has no active escrows -> should return false
-    assert!(!client.has_active_contracts(&user));
-
-    // 4. Create an active escrow (buyer is user, seller is artisan)
-    let seller = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin);
-    let _token_client = token::Client::new(&env, &token_id.address());
-    let token_asset = token::StellarAssetClient::new(&env, &token_id.address());
-    token_asset.mint(&user, &10_000_000);
-
-    // Onboard seller as artisan
-    client.onboard_user(
-        &seller,
-        &String::from_str(&env, "artisan"),
-        &UserRole::Artisan,
-    );
-    // Onboard buyer as buyer
-    client.onboard_user(&user, &String::from_str(&env, "buyer"), &UserRole::Buyer);
-
-    // Create escrow
-    escrow_client.create_escrow(&user, &seller, &token_id.address(), &1_000_000, &1, &None);
-
-    // Now has_active_contracts should return true
-    assert!(client.has_active_contracts(&user));
-    assert!(client.has_active_contracts(&seller));
-}
-
-#[test]
-fn test_update_active_contracts_tracks_state() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "tracked"), &UserRole::Buyer);
-
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    let platform_wallet = Address::generate(&env);
-    let arbitrator = Address::generate(&env);
-    let escrow_client = crate::CraftNexusContractClient::new(&env, &escrow_id);
-    escrow_client.initialize(
-        &platform_wallet,
-        &admin,
-        &arbitrator,
-        &500,
-        &Some(client.address.clone()),
-    );
-    client.set_escrow_contract(&escrow_id);
-
-    client.update_active_contracts(&user, &1);
-    assert!(client.has_active_contracts(&user));
-
-    client.update_active_contracts(&user, &-1);
-    assert!(!client.has_active_contracts(&user));
-}
-
-#[test]
-#[should_panic]
-fn test_update_active_contracts_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    // Set an escrow contract so authorization is gated by the registered address.
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    client.set_escrow_contract(&escrow_id);
-
-    // Clear mocked auths so the next call has no authorization.
-    env.set_auths(&[]);
-
-    client.update_active_contracts(&user, &1);
-}
-
-// ============================================================
-// Feature #47 – precise active-contract count for escrow/reputation flows
-// ============================================================
-
-/// get_active_contract_count returns 0 for a user with no tracked contracts.
-#[test]
-fn test_get_active_contract_count_defaults_to_zero() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "counter0"), &UserRole::Buyer);
-
-    assert_eq!(client.get_active_contract_count(&user), 0);
-    assert!(!client.has_active_contracts(&user));
-}
-
-/// get_active_contract_count reflects each increment/decrement state transition
-/// and stays consistent with the has_active_contracts boolean.
-#[test]
-fn test_get_active_contract_count_tracks_transitions() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "counterN"), &UserRole::Buyer);
-
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    let platform_wallet = Address::generate(&env);
-    let arbitrator = Address::generate(&env);
-    let escrow_client = crate::CraftNexusContractClient::new(&env, &escrow_id);
-    escrow_client.initialize(
-        &platform_wallet,
-        &admin,
-        &arbitrator,
-        &500,
-        &Some(client.address.clone()),
-    );
-    client.set_escrow_contract(&escrow_id);
-
-    // 0 -> 2: two concurrent active contracts.
-    client.update_active_contracts(&user, &1);
-    client.update_active_contracts(&user, &1);
-    assert_eq!(client.get_active_contract_count(&user), 2);
-    assert!(client.has_active_contracts(&user));
-
-    // 2 -> 1: one closes.
-    client.update_active_contracts(&user, &-1);
-    assert_eq!(client.get_active_contract_count(&user), 1);
-    assert!(client.has_active_contracts(&user));
-
-    // 1 -> 0: last one closes, entry is removed and count reads back as zero.
-    client.update_active_contracts(&user, &-1);
-    assert_eq!(client.get_active_contract_count(&user), 0);
-    assert!(!client.has_active_contracts(&user));
-}
-
-#[test]
-#[should_panic]
-fn test_update_active_contracts_underflow_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "underflow"),
-        &UserRole::Buyer,
-    );
-
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    client.set_escrow_contract(&escrow_id);
-
-    let _ = admin;
-    client.update_active_contracts(&user, &-1);
-}
-
-#[test]
-#[should_panic]
-fn test_deactivate_profile_rejects_without_registered_escrow_contract() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "noescrow"), &UserRole::Buyer);
-
-    client.deactivate_profile(&user);
-}
-
-#[test]
-#[should_panic]
-fn test_deactivate_profile_rejects_active_contract_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "deact"), &UserRole::Buyer);
-
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    client.set_escrow_contract(&escrow_id);
-
-    client.update_active_contracts(&user, &1);
-    client.deactivate_profile(&user);
-
-    let _ = admin;
-}
-
-#[test]
-#[should_panic]
-fn test_get_verification_queue_unauthorized() {
-    let env = Env::default();
-    // Do NOT call env.mock_all_auths()
-
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-
-    // Initialize state directly in storage without require_auth check
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    // This should panic because mock_all_auths is not set, so admin's require_auth() will fail
-    client.get_verification_queue();
-}
-
-#[test]
-fn test_get_verification_queue_authorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin) = setup_test(&env);
-
-    client.get_verification_queue();
-
-    // Check that admin's authorization was verified
-    let auths = env.auths();
-    assert_eq!(auths.len(), 1);
-    assert_eq!(auths.get(0).unwrap().0, admin);
-}
-
-#[test]
-fn test_is_verification_pending_for_requesting_user() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "pending_user"),
-        &UserRole::Buyer,
-    );
-    client.request_verification(&user);
-
-    assert!(client.is_verification_pending(&user));
-}
-
-#[test]
-#[should_panic]
-fn test_is_verification_pending_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "pending_unauth"),
-        &UserRole::Buyer,
-    );
-    client.request_verification(&user);
-
-    env.set_auths(&[]);
-    client.is_verification_pending(&user);
-}
-
-// ── Issue #470: [SECURITY] Endpoint #69 – set_moderator ─────────────────────
-
-/// Issue #470 — set_moderator must record the admin auth signal on success.
-#[test]
-fn test_set_moderator_records_admin_auth() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &soroban_sdk::String::from_str(&env, "promotee"),
-        &UserRole::Artisan,
-    );
-
-    client.set_moderator(&user);
-
-    let auths = env.auths();
-    let admin_auth = auths.iter().find(|(addr, _)| addr == &admin);
-    assert!(
-        admin_auth.is_some(),
-        "admin auth must be recorded for set_moderator"
-    );
-
-    let profile = client.get_user(&user);
-    assert_eq!(profile.role, UserRole::Moderator);
-}
-
-/// Issue #470 — a non-admin address must not be able to invoke set_moderator.
-#[test]
-#[should_panic]
-fn test_set_moderator_non_admin_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let attacker = Address::generate(&env);
-    let target = Address::generate(&env);
-    client.onboard_user(
-        &target,
-        &soroban_sdk::String::from_str(&env, "victim"),
-        &UserRole::Buyer,
-    );
-
-    // Strip all mocked auths so only a non-admin caller could sign.
-    env.set_auths(&[]);
-
-    // Attempting promotion without admin auth must panic.
-    client.set_moderator(&target);
-    let _ = attacker;
-}
-
-/// Issue #470 — promoting a non-onboarded address via set_moderator must panic.
-#[test]
-#[should_panic]
-fn test_set_moderator_unknown_user_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin) = setup_test(&env);
-    let ghost = Address::generate(&env);
-
-    // Ghost was never onboarded — role update must fail.
-    client.set_moderator(&ghost);
-}
-
-// ── Issue #474: [SECURITY] Endpoint #73 – get_verification_queue ─────────────
-
-/// Issue #474 — non-admin caller must not read the verification queue.
-#[test]
-#[should_panic]
-fn test_get_verification_queue_non_admin_rejected() {
-    let env = Env::default();
-
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let non_admin = Address::generate(&env);
-
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    // Supplying a valid authorization for a different address must not satisfy
-    // the configured platform admin's require_auth() check.
-    client
-        .mock_auths(&[MockAuth {
-            address: &non_admin,
-            invoke: &MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "get_verification_queue",
-                args: soroban_sdk::Vec::new(&env),
-                sub_invokes: &[],
-            },
-        }])
-        .get_verification_queue();
-}
-
-/// Issue #474 — admin receives the queue and the auth signal is recorded.
-#[test]
-fn test_get_verification_queue_returns_pending_users() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &soroban_sdk::String::from_str(&env, "queueuser"),
-        &UserRole::Artisan,
-    );
-    client.request_verification(&user);
-
-    let queue = client.get_verification_queue();
-
-    assert!(
-        queue.contains(&user),
-        "requesting user must appear in the verification queue"
-    );
-
-    let auths = env.auths();
-    let admin_auth = auths.iter().find(|(addr, _)| addr == &admin);
-    assert!(
-        admin_auth.is_some(),
-        "admin auth must be recorded for get_verification_queue"
-    );
-}
-
-// ── Issue #430: [SECURITY] Endpoint #29 – get_user_metrics ───────────────────
-
-/// Issue #430 — get_user_metrics must reject callers without user authorization.
-#[test]
-#[should_panic]
-fn test_get_user_metrics_unauthorized() {
-    let env = Env::default();
-
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    client.get_user_metrics(&user);
-}
-
-// ── Issue #446: [SECURITY] Endpoint #45 – get_user_reputation ──────────────────
-
-/// Issue #446 — get_user_reputation must reject callers without user authorization.
-#[test]
-#[should_panic]
-fn test_get_user_reputation_unauthorized() {
-    let env = Env::default();
-
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    client.get_user_reputation(&user);
-}
-
-/// Issue #446 — get_user_reputation must allow authorized callers.
-#[test]
-fn test_get_user_reputation_authorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    set_permissive_reputation_policy(&client);
-    let user = Address::generate(&env);
-
-    // Onboard user
-    client.onboard_user(&user, &String::from_str(&env, "rep1"), &UserRole::Artisan);
-
-    // Update reputation
-    client.update_reputation(&user, &2u32, &1u32);
-
-    // Get reputation (authorized)
-    let (successful, disputed) = client.get_user_reputation(&user);
-    assert_eq!(successful, 2);
-    assert_eq!(disputed, 1);
-}
-
-// ── Issue #452: [FEATURE] Business flow #51 – active contract authorization ─
-
-/// Issue #452 — has_active_contracts must reject callers without user authorization.
-#[test]
-#[should_panic]
-fn test_has_active_contracts_unauthorized() {
-    let env = Env::default();
-
-    let contract_id = env.register_contract(None, OnboardingContract);
-    let client = OnboardingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    let config = OnboardingConfig {
-        require_username: true,
-        min_username_length: 3,
-        max_username_length: 50,
-        platform_admin: admin.clone(),
-        auto_verify_enabled: true,
-        min_escrow_count_for_verify: 5,
-        min_volume_for_verify: 10_000_000_000,
-        escrow_contract: None,
-    };
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&DataKey::Config, &config);
-    });
-
-    client.has_active_contracts(&user);
-}
-
-/// Issue #452 / #622 — has_active_contracts succeeds for authorized user and refreshes TTL.
-#[test]
-fn test_has_active_contracts_authorized_returns_boolean_and_extends_ttl() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "activeusr"),
-        &UserRole::Buyer,
-    );
-
-    // Initial query returns false (no escrows registered)
-    assert!(!client.has_active_contracts(&user));
-}
-
-// ===== set_verification_thresholds auth tests (#422) =====
-
-#[test]
-fn test_set_verification_thresholds_admin_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    // Admin is authorized via mock_all_auths — must not panic.
-    client.set_verification_thresholds(&10u32, &5_000_000_000i128);
-    let config = client.get_config();
-    assert_eq!(config.min_escrow_count_for_verify, 10);
-    assert_eq!(config.min_volume_for_verify, 5_000_000_000);
-}
-
-#[test]
-#[should_panic]
-fn test_set_verification_thresholds_unauthorized_rejected() {
-    // Without any auth mocked, require_auth must cause a panic.
-    let env = Env::default();
-    let (client, _) = setup_test(&env);
-    client.set_verification_thresholds(&10u32, &5_000_000_000i128);
-}
-
-// ===== Pause-state guard (Issue #621) =====
-
-#[test]
-fn test_onboard_rejected_when_escrow_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    let escrow_id = env.register_contract(None, crate::CraftNexusContract);
-    let escrow_client = crate::CraftNexusContractClient::new(&env, &escrow_id);
-
-    let platform_wallet = Address::generate(&env);
-    let arbitrator = Address::generate(&env);
-    escrow_client.initialize(
-        &platform_wallet,
-        &admin,
-        &arbitrator,
-        &500,
-        &Some(client.address.clone()),
-    );
-
-    client.set_escrow_contract(&escrow_id);
-
-    // Pause the escrow contract
-    escrow_client.set_paused(&true);
-
-    // Onboarding should be rejected
-    let result =
-        client.try_onboard_user(&user, &String::from_str(&env, "newuser"), &UserRole::Buyer);
-    assert!(result.is_err());
-}
-
-// ===== Issue #447 — storage/TTL read-path optimizations =====
-
-/// Every queue slot walked by `get_verification_queue` must have its TTL
-/// refreshed, not only the head slot touched by `advance_verification_head`.
-/// Otherwise a request queued behind a long-lived one is archived and its user
-/// silently disappears from the queue.
-#[test]
-fn test_get_verification_queue_extends_ttl_for_every_slot() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-
-    let mut users = soroban_sdk::Vec::new(&env);
-    for (index, name) in ["ttlqueue1", "ttlqueue2", "ttlqueue3"].iter().enumerate() {
-        let user = Address::generate(&env);
-        client.onboard_user(&user, &String::from_str(&env, name), &UserRole::Artisan);
-        client.request_verification(&user);
-        users.push_back(user);
-        assert_eq!(client.get_verification_queue().len() as usize, index + 1);
+            .set(&DataKey::ReputationPolicy, &policy);
+        Self::extend_persistent(&env, &DataKey::ReputationPolicy);
     }
 
-    let live_before = env.as_contract(&client.address, || {
-        (0..users.len() as u64)
-            .filter(|slot| {
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::VerificationQueueIndex(*slot))
-            })
-            .count()
-    });
-    assert_eq!(live_before, 3);
+    /// Scheduled reputation decay application (Issue #1082).
+    ///
+    /// Explicitly applies any pending time-based decay for `address` and persists
+    /// the result, independent of reads and writes. The decay computed here is
+    /// identical to the **lazy** decay applied inside [`get_trust_score`] and
+    /// [`update_reputation`], so off-chain schedulers (cron jobs, indexers) can
+    /// keep scores current without waiting for user activity. Returns `0` for
+    /// unknown addresses.
+    ///
+    /// # Auth
+    /// Requires `address.require_auth()` (the subject must authorize the
+    /// scheduled evaluation of their own reputation state).
+    pub fn apply_reputation_decay_now(env: Env, address: Address) -> u32 {
+        address.require_auth();
 
-    // Reading the queue must leave every slot live with a refreshed TTL.
-    assert_eq!(client.get_verification_queue().len(), 3);
-
-    env.as_contract(&client.address, || {
-        for slot in 0..users.len() as u64 {
-            let key = DataKey::VerificationQueueIndex(slot);
-            assert!(
-                env.storage().persistent().has(&key),
-                "queue slot {slot} should still be live"
-            );
-            assert!(
-                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
-                "queue slot {slot} should have been extended on read"
-            );
+        if Self::try_get_user_profile(&env, address.clone()).is_none() {
+            return 0;
         }
-    });
-}
 
-// ============================================================
-// Issue #702 – no extend_ttl on temporary verification markers
-// ============================================================
+        let policy = Self::get_reputation_policy_internal(&env);
+        let mut state = Self::get_or_init_reputation_state(&env, &address);
+        Self::apply_reputation_decay(&env, &mut state, &policy);
+        Self::persist_reputation_state(&env, &address, &state);
+        state.trust_score
+    }
 
-/// Pending verification markers live in temporary storage and must not pay for
-/// persistent `extend_ttl` on enqueue or pending checks.
-#[test]
-fn test_verification_request_uses_temporary_storage_without_extend_ttl() {
-    let env = Env::default();
-    env.mock_all_auths();
+    // -----------------------------------------------------------------------
+    // Issue #114 – Username Change Mechanism
+    // -----------------------------------------------------------------------
 
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "temp_vrfy"),
-        &UserRole::Artisan,
-    );
-    client.request_verification(&user);
+    /// Change a user's username (Issue #114).
+    ///
+    /// Atomically removes the old username mapping and registers the new one.
+    /// Resets `is_verified` to `false` (username change revokes verification
+    /// status). Enforces a 30-day cooldown between changes to prevent
+    /// username squatting and rapid identity rotation. Collects a fee if
+    /// configured via [`set_username_change_fee`].
+    ///
+    /// ## Checks-Effects-Interactions
+    /// Fee collection (token transfer) happens after all validation and
+    /// before storage writes, following the CEI pattern.
+    ///
+    /// # Parameters
+    /// - `user`: `Address` — The user changing their username. Must authorize
+    ///   this call (`user.require_auth()`).
+    /// - `new_username`: `String` — Desired new username (will be normalized).
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - `user` must have an existing profile.
+    /// - Normalized `new_username` must be unique.
+    /// - Normalized `new_username` length must be within configured bounds.
+    /// - 30-day cooldown since last change must have elapsed
+    ///   ([`USERNAME_CHANGE_COOLDOWN`]).
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Config`] — reads bounds, TTL extended.
+    /// - **Read** [`DataKey::UserProfile(user)`] — reads current username, TTL extended.
+    /// - **Read** [`DataKey::LastUsernameChange(user)`] — cooldown check.
+    /// - **Read** [`DataKey::UsernameChangeFee`] — reads fee amount, TTL extended.
+    /// - **Read** [`DataKey::UsernameChangeFeeToken`] — reads fee token, TTL extended.
+    /// - **Remove** [`DataKey::Username(old_normalized)`] — releases old username.
+    /// - **Write** [`DataKey::Username(new_normalized)`] — reserves new username, TTL extended.
+    /// - **Write** [`DataKey::UserProfile(user)`] — new username + `is_verified = false`, TTL extended.
+    /// - **Write** [`DataKey::LastUsernameChange(user)`] — records timestamp, TTL extended.
+    /// - **Read/Write** [`DataKey::VerificationHistory(user)`] — appends `"username_changed_revoked"`.
+    ///
+    /// # Emitted Events
+    /// - Topic: `("UsernameChanged",)` — Data: `user` address.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    /// - Panics with [`Error::UserNotFound`] if `user` has no profile.
+    /// - Panics with `"Username already taken"` if new username is in use.
+    /// - Panics with `"Username too short"` / `"Username too long"` on length violation.
+    /// - Panics with `"Username change cooldown active"` if cooldown not elapsed.
+    /// - Panics with [`Error::NotInitialized`] if fee token is not configured but fee > 0.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // After 30+ days since last change:
+    /// let profile = client.change_username(&user, &String::from_str(&env, "NewName"));
+    /// assert_eq!(profile.username, String::from_str(&env, "newname"));
+    /// assert!(!profile.is_verified); // verification revoked
+    /// ```
+    pub fn change_username(env: Env, user: Address, new_username: String) -> UserProfile {
+        user.require_auth();
 
-    assert!(client.is_verification_pending(&user));
+        // Get configuration
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
 
-    env.as_contract(&client.address, || {
-        let key = DataKey::VerificationRequest(user.clone());
+        // Snapshot fee token before any state changes (CEI safety)
+        let snapshotted_fee_token = Self::read_username_fee_token(&env);
+
+        // Get current user profile
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        // Normalize the new username
+        let normalized_new = normalize_username(&env, &new_username);
+
+        // Validate new username length
+        let username_len = normalized_new.len();
         assert!(
-            env.storage().temporary().has(&key),
-            "pending marker must be stored in temporary storage"
+            username_len >= config.min_username_length,
+            "Username too short"
         );
         assert!(
-            !env.storage().persistent().has(&key),
-            "pending marker must not be duplicated into persistent storage"
+            username_len <= config.max_username_length,
+            "Username too long"
         );
-    });
 
-    // Clearing removes the temporary marker and empties the queue.
-    assert!(client.admin_clear_verification_request(&user));
-    assert!(!client.is_verification_pending(&user));
-    env.as_contract(&client.address, || {
-        let key = DataKey::VerificationRequest(user.clone());
-        assert!(!env.storage().temporary().has(&key));
-        assert!(!env.storage().persistent().has(&key));
-    });
-}
-
-/// Legacy persistent pending markers are still recognized without refreshing TTL.
-#[test]
-fn test_legacy_persistent_verification_request_cleared_without_ttl_bump() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "legacy_vrfy"),
-        &UserRole::Artisan,
-    );
-
-    // Simulate a pre-#702 persistent pending marker + queue slot.
-    env.as_contract(&client.address, || {
-        let pending_key = DataKey::VerificationRequest(user.clone());
-        env.storage()
-            .persistent()
-            .set(&pending_key, &env.ledger().timestamp());
-        // Intentionally do not extend_ttl — mirrors the #702 policy.
-        env.storage()
-            .persistent()
-            .set(&DataKey::VerificationQueueIndex(0), &user);
-        env.storage()
-            .persistent()
-            .set(&DataKey::VerificationQueueTail, &1u64);
-    });
-
-    assert!(client.is_verification_pending(&user));
-    assert!(client.admin_clear_verification_request(&user));
-    assert!(!client.is_verification_pending(&user));
-    assert_eq!(client.get_verification_queue().len(), 0);
-}
-
-/// Read helpers refresh TTL on the entries they return without a second probe.
-#[test]
-fn test_read_paths_refresh_ttl_on_touched_entries() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "ttlreader"),
-        &UserRole::Artisan,
-    );
-    client.set_username_change_fee(&42);
-
-    // Drive the read API.
-    let _ = client.get_user(&user);
-    let _ = client.get_user_metrics(&user);
-    let _ = client.get_username_change_fee();
-    assert!(client.is_onboarded(&user));
-
-    env.as_contract(&client.address, || {
-        for key in [
-            DataKey::UserProfile(user.clone()),
-            DataKey::UsernameChangeFee,
-        ] {
-            assert!(env.storage().persistent().has(&key));
+        // Enforce cooldown between username changes for the same user.
+        let cooldown_key = DataKey::LastUsernameChange(user.clone());
+        if let Some(last_change) = Self::read_persistent::<_, u64>(&env, &cooldown_key) {
+            let current_time = env.ledger().timestamp();
             assert!(
-                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
-                "read path should have refreshed the entry TTL"
+                current_time > last_change.saturating_add(USERNAME_CHANGE_COOLDOWN),
+                "Username change cooldown active"
             );
         }
-    });
-}
 
-/// Absent optional entries must not be resurrected or charged for by the
-/// read helpers; they simply return the caller-supplied default.
-#[test]
-fn test_read_helpers_do_not_create_absent_entries() {
-    let env = Env::default();
-    env.mock_all_auths();
+        // Check if new username is already taken
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::Username(normalized_new.clone())),
+            "Username already taken"
+        );
 
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "nodefaults"),
-        &UserRole::Artisan,
-    );
+        // Atomically remove old username mapping and add new one
+        let old_username = profile.username.clone();
+        let old_string = String::from_str(&env, old_username.to_string().as_ref());
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Username(old_string));
 
-    let metrics = client.get_user_metrics(&user);
-    assert_eq!(metrics.total_escrow_count, 0);
-    assert_eq!(metrics.total_volume, 0);
-    assert_eq!(client.get_username_change_fee(), 0);
-    assert_eq!(client.get_active_contract_count(&user), 0);
-    assert!(client.get_username_fee_token().is_none());
+        // Store new username → address mapping
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(normalized_new.clone()), &user);
+        Self::extend_persistent(&env, &DataKey::Username(normalized_new.clone()));
 
-    env.as_contract(&client.address, || {
-        for key in [
-            DataKey::UserMetrics(user.clone()),
-            DataKey::UsernameChangeFee,
-            DataKey::ActiveContractCount(user.clone()),
-            DataKey::UsernameChangeFeeToken,
-            DataKey::UserPortfolio(user.clone()),
-        ] {
-            assert!(
-                !env.storage().persistent().has(&key),
-                "reading a default must not materialize a storage entry"
-            );
+        // Update profile with new username
+        let new_username_len = core::cmp::min(normalized_new.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized_new.copy_into_slice(&mut user_buf[..new_username_len]);
+        let rust_str = core::str::from_utf8(&user_buf[..new_username_len]).unwrap();
+        let optimized_new_username = Symbol::new(&env, rust_str);
+        profile.username = optimized_new_username;
+        profile.is_verified = false;
+
+        // Store updated profile
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+
+        // Record timestamp of username change
+        env.storage().persistent().set(
+            &DataKey::LastUsernameChange(user.clone()),
+            &env.ledger().timestamp(),
+        );
+        Self::extend_persistent(&env, &DataKey::LastUsernameChange(user.clone()));
+
+        // Add history entry for revocation
+        let hist_key = DataKey::VerificationHistory(user.clone());
+        let mut history: Vec<VerificationEntry> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or(Vec::new(&env));
+        history.push_back(VerificationEntry {
+            timestamp: env.ledger().timestamp(),
+            action: Symbol::new(&env, "username_revoked"),
+            by: Some(user.clone()),
+        });
+        if history.len() > 10 {
+            history.remove(0);
         }
-    });
-}
+        env.storage().persistent().set(&hist_key, &history);
+        Self::extend_persistent(&env, &hist_key);
 
-/// Budget smoke test for the hot profile read path (issue #447 action item 3).
-/// `get_user` is the most frequently invoked entrypoint; running it against the
-/// default ledger budget guards the read path against regressions that would
-/// reintroduce redundant storage probes.
-#[test]
-fn test_profile_read_budget_smoke() {
-    let env = Env::default();
-    env.mock_all_auths();
+        // Emit event
+        env.events()
+            .publish((Symbol::new(&env, "UsernameChanged"),), &user);
 
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "budgetread"),
-        &UserRole::Artisan,
-    );
+        // Interaction (CEI pattern: external transfer is the last step)
+        Self::collect_username_change_fee(&env, &user, &config, snapshotted_fee_token);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalUserChangeCount);
 
-    env.budget().reset_default();
-    let _ = client.get_user(&user);
-    let _ = client.get_user_reputation(&user);
-    let _ = client.get_user_metrics(&user);
-}
+        profile
+    }
 
-// ── Issue #940: Anti-Sybil Onboarding & Identity Abuse Tests ─────────────────
+    /// Set the username change fee (admin only) — Issue #114.
+    ///
+    /// Sets the fee charged when a user calls [`change_username`]. A value of
+    /// `0` disables the fee. The fee is collected in the token configured via
+    /// [`set_username_fee_token`].
+    ///
+    /// # Parameters
+    /// - `fee`: `i128` — Fee amount in the fee token's smallest unit (stroops
+    ///   for XLM-based tokens). Must be ≥ 0.
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `platform_admin`.
+    /// - `fee` must be ≥ 0.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Config`] — reads admin address, TTL extended.
+    /// - **Write** [`DataKey::UsernameChangeFee`] — stores fee, TTL extended.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    /// - Panics with [`Error::InvalidFee`] if `fee < 0`.
+    pub fn set_username_change_fee(env: Env, fee: i128) {
+        // Issue #522 — strict check-effect-interactions ordering. We
+        // load the config first (read-only), validate the caller is
+        // the configured admin, validate the `fee` argument, and only
+        // then perform any TTL extension or persistent write. This way
+        // a non-admin caller cannot wedge the Config TTL by spamming
+        // this entry point — they're rejected by `require_auth` before
+        // we touch storage at all. Same pattern is applied to the
+        // sibling setters below for consistency.
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
 
-#[test]
-fn test_sybil_config_management() {
-    let env = Env::default();
-    env.mock_all_auths();
+        config.platform_admin.require_auth();
+        if fee < 0 {
+            env.panic_with_error(Error::InvalidFee);
+        }
 
-    let (client, _admin) = setup_test(&env);
+        Self::extend_persistent(&env, &DataKey::Config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsernameChangeFee, &fee);
+        Self::extend_persistent(&env, &DataKey::UsernameChangeFee);
+    }
 
-    client.set_sybil_config(&1800u64, &5u32, &43200u64, &true, &None);
+    /// Set the token used to collect username change fees (admin only).
+    ///
+    /// Must be called before [`set_username_change_fee`] sets a non-zero fee,
+    /// otherwise [`change_username`] will panic when trying to collect.
+    ///
+    /// # Parameters
+    /// - `token`: `Address` — The token contract address for fee collection.
+    ///
+    /// # Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `platform_admin`.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::Config`] — reads admin address, TTL extended.
+    /// - **Write** [`DataKey::UsernameChangeFeeToken`] — stores token address, TTL extended.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// - Panics with [`Error::NotInitialized`] if config is missing.
+    pub fn set_username_fee_token(env: Env, token: Address) {
+        // Issue #526 — strict check-effect-interactions ordering.
+        // Load config (read-only) → require_auth(admin) → only then
+        // touch any persistent storage. The previous implementation
+        // called `extend_persistent` on the Config key before the auth
+        // check, so a non-admin caller could spam-extend Config TTL
+        // before being rejected. Matched layout applied to
+        // `set_username_fee_wallet` below.
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
 
-    assert_eq!(client.get_rate_limit_window(), 1800);
-    assert_eq!(client.get_max_onboard_attempts(), 5);
-    assert_eq!(client.get_verification_cooldown(), 43200);
-    assert!(client.is_poh_required_for_auto_verify());
-    assert!(client.get_poh_verifier().is_none());
-}
+        Self::extend_persistent(&env, &DataKey::Config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsernameChangeFeeToken, &token);
+        Self::extend_persistent(&env, &DataKey::UsernameChangeFeeToken);
+    }
 
-// ── Issue #1084: Onboarding and verification attempt windows ────────────────
+    /// Set the wallet that receives username change fees (admin only).
+    ///
+    /// # Integration notes — issue #465 / component #64
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - Caller must be `OnboardingConfig::platform_admin`
+    ///   (`require_auth` runs before any storage write or TTL extension).
+    ///
+    /// ## Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Writes and extends TTL on `DataKey::UserChangeFeeWallet`.
+    /// - Does not modify profile shapes or `CURRENT_USER_PROFILE_VERSION`.
+    ///
+    /// ## Emitted events
+    /// - None.
+    ///
+    /// ## Off-chain consumers
+    /// - Pair with `get_username_fee_wallet`, `get_username_change_fee`, and
+    ///   `get_username_fee_token` to display the full fee configuration before
+    ///   a user invokes `change_username`.
+    /// - When no wallet is configured, `get_username_fee_wallet` falls back
+    ///   to `platform_admin` via the internal `read_username_fee_wallet` helper.
+    /// - This function performs no token transfers (check-effect-interactions
+    ///   safe: auth check and storage write only).
+    ///
+    /// # Arguments
+    /// * `wallet` - Stellar address that receives username-change fee transfers
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not platform admin
+    pub fn set_username_fee_wallet(env: Env, wallet: Address) {
+        // Issue #526 — same ordering as `set_username_fee_token`
+        // above: require_auth runs before any TTL extension or write.
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
 
-#[test]
-fn test_attempt_rate_policy_revision_advances() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
+        Self::extend_persistent(&env, &DataKey::Config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserChangeFeeWallet, &wallet);
+        Self::extend_persistent(&env, &DataKey::UserChangeFeeWallet);
+    }
 
-    assert_eq!(client.get_attempt_rate_policy().revision, 1);
-    let updated = client.set_attempt_rate_policy(&60u64, &2u32, &10u32, &120u64, &3u32, &20u32);
-    assert_eq!(updated.revision, 2);
-    assert_eq!(client.get_attempt_rate_policy(), updated);
-}
+    /// Get the current username change fee — Issue #114.
+    ///
+    /// Returns `0` if no fee has been configured.
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UsernameChangeFee`] — no TTL extension.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None.
+    pub fn get_username_change_fee(env: Env) -> i128 {
+        Self::read_persistent(&env, &DataKey::UsernameChangeFee).unwrap_or(0)
+    }
 
-#[test]
-fn test_global_onboarding_limit_resets_after_window() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 1_000);
-    let (client, _) = setup_test(&env);
-    client.set_attempt_rate_policy(&60u64, &3u32, &1u32, &60u64, &3u32, &10u32);
+    /// Get the configured token used for username change fees.
+    ///
+    /// Returns `None` if no fee token has been set via [`set_username_fee_token`].
+    ///
+    /// # Storage Side-Effects
+    /// - **Read** [`DataKey::UsernameChangeFeeToken`] — TTL extended if key exists.
+    ///
+    /// # Emitted Events
+    /// None.
+    ///
+    /// # Errors
+    /// None.
+    pub fn get_username_fee_token(env: Env) -> Option<Address> {
+        Self::read_username_fee_token(&env)
+    }
 
-    let first = Address::generate(&env);
-    let second = Address::generate(&env);
-    client.onboard_user(
-        &first,
-        &String::from_str(&env, "rate_first"),
-        &UserRole::Buyer,
-    );
+    /// Get the configured wallet used for username change fees.
+    ///
+    /// # Integration notes — issue #465 / component #64
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - No auth required; safe for simulation and read-only client previews.
+    ///
+    /// ## Storage side-effects
+    /// - Reads `DataKey::UserChangeFeeWallet` via `read_username_fee_wallet`.
+    /// - When the key exists, extends its persistent TTL by `TTL_EXTENSION`
+    ///   ledgers (~30 days).
+    /// - When unset, returns `OnboardingConfig::platform_admin` without writing
+    ///   storage.
+    ///
+    /// ## Emitted events
+    /// - None.
+    ///
+    /// ## Off-chain consumers
+    /// - Clients preparing a `change_username` transaction should display this
+    ///   address as the fee recipient alongside `get_username_change_fee` and
+    ///   `get_username_fee_token`.
+    /// - The actual fee transfer in `change_username` uses this resolved wallet
+    ///   as the token transfer destination (external call is the final action
+    ///   in that execution path per check-effect-interactions).
+    ///
+    /// # Returns
+    /// Configured fee wallet, or `platform_admin` when no override is set.
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    pub fn get_username_fee_wallet(env: Env) -> Address {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::read_username_fee_wallet(&env, &config)
+    }
 
-    let limited = client.try_onboard_user(
-        &second,
-        &String::from_str(&env, "rate_second"),
-        &UserRole::Artisan,
-    );
-    assert!(limited.is_err());
-    assert!(!client.is_onboarded(&second));
+    // -----------------------------------------------------------------------
+    // Issue #112 – Artisan Portfolio Verification
+    // -----------------------------------------------------------------------
 
-    env.ledger().with_mut(|li| li.timestamp = 1_061);
-    let profile = client.onboard_user(
-        &second,
-        &String::from_str(&env, "rate_second"),
-        &UserRole::Artisan,
-    );
-    assert_eq!(profile.address, second);
-}
+    /// Update an artisan's portfolio CID (Issue #112).
+    ///
+    /// Allows artisans to attach, replace, or remove an IPFS content
+    /// identifier that points to their off-chain portfolio showcase.
+    ///
+    /// # Integration notes — issue #513 / component #112
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - `user` must sign the transaction (`user.require_auth()`).
+    /// - `user` must be onboarded with `UserRole::Artisan`. Buyers and
+    ///   other roles cannot update a portfolio.
+    /// - When `portfolio_cid` is `Some(cid)`, `cid` must pass
+    ///   `validate_ipfs_cid` (shared with escrow metadata validation):
+    ///   - **CIDv0:** exactly 46 chars, Base58btc, prefix `Qm`
+    ///   - **CIDv1:** multibase prefix `b` (base32lower), `f`
+    ///     (base16lower), or `z` (base58btc) with version byte `0x01`
+    /// - Pass `None` to clear an existing portfolio link.
+    ///
+    /// ## Storage side-effects
+    /// - Reads and extends TTL on `DataKey::UserProfile(user)` to validate the
+    ///   caller and preserve the core profile.
+    /// - Writes/removes `DataKey::UserPortfolio(user)` for the CID payload.
+    ///   All other profile fields — including `version`
+    ///   (`CURRENT_USER_PROFILE_VERSION`), role, verification status, and
+    ///   reputation counters — are preserved without rewriting the main
+    ///   profile entry.
+    /// - No username-index or config keys are touched. Storage rent for the
+    ///   core profile stays flat; only the dedicated portfolio key grows when
+    ///   a non-empty CID is present.
+    ///
+    /// ## Emitted event — `PortfolioUpdated`
+    /// - **Topics:** `(Symbol::new("PortfolioUpdated"),)`
+    /// - **Data:** `Address` — the `user` whose portfolio changed
+    /// - The event does **not** include the CID itself; indexers should
+    ///   call `get_user(user)` or `get_user_by_username` after observing
+    ///   the event to fetch the updated `portfolio_cid` value.
+    ///
+    /// ## Off-chain consumers
+    /// - Portfolio CIDs are also returned by read-only accessors
+    ///   `get_user` and `get_user_by_username` as part of `UserProfile`.
+    /// - This function performs no token transfers (check-effect-
+    ///   interactions safe: checks and storage writes only).
+    /// - Clients should resolve the CID against IPFS gateways or pinning
+    ///   services off-chain; the contract stores only the identifier.
+    ///
+    /// # Arguments
+    /// * `user` - Artisan's wallet address (must sign)
+    /// * `portfolio_cid` - IPFS CID to set, or `None` to remove
+    ///
+    /// # Returns
+    /// Updated `UserProfile` reflecting the new `portfolio_cid` value.
+    ///
+    /// # Reverts if
+    /// - User not onboarded (`Error::UserNotFound`)
+    /// - User is not an artisan
+    /// - Invalid CID format when `portfolio_cid` is `Some`
+    pub fn update_portfolio(env: Env, user: Address, portfolio_cid: Option<String>) -> UserProfile {
+        user.require_auth();
 
-#[test]
-fn test_verification_limits_do_not_duplicate_queue_records() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 2_000);
-    let (client, _) = setup_test(&env);
-    client.set_sybil_config(&3_600u64, &10u32, &0u64, &false, &None);
-    client.set_attempt_rate_policy(&60u64, &10u32, &10u32, &60u64, &1u32, &1u32);
+        // Get current user profile
+        let mut profile = Self::get_user_profile(&env, user.clone());
 
-    let first = Address::generate(&env);
-    let second = Address::generate(&env);
-    client.onboard_user(
-        &first,
-        &String::from_str(&env, "verify_one"),
-        &UserRole::Artisan,
-    );
-    client.onboard_user(
-        &second,
-        &String::from_str(&env, "verify_two"),
-        &UserRole::Artisan,
-    );
+        // Only artisans can update their portfolio
+        assert!(
+            profile.role == UserRole::Artisan,
+            "Only artisans can update portfolio"
+        );
 
-    client.request_verification(&first);
-    // A repeated pending request is an idempotent no-op and does not add a slot.
-    client.request_verification(&first);
-    assert_eq!(client.get_verification_queue().len(), 1);
+        // Validate CID format if provided
+        if let Some(ref cid) = portfolio_cid {
+            assert!(validate_ipfs_cid(cid), "Invalid portfolio CID format");
+        }
+        let optimized_cid = portfolio_cid.map(|cid_str| Self::string_to_bytes(&env, &cid_str));
 
-    let limited = client.try_request_verification(&second);
-    assert!(limited.is_err());
-    assert!(!client.is_verification_pending(&second));
-    assert_eq!(client.get_verification_queue().len(), 1);
+        // Update portfolio CID
+        Self::write_portfolio_cid(&env, &user, optimized_cid.clone());
+        profile.portfolio_cid = optimized_cid;
 
-    env.ledger().with_mut(|li| li.timestamp = 2_061);
-    client.request_verification(&second);
-    assert!(client.is_verification_pending(&second));
-    assert_eq!(client.get_verification_queue().len(), 2);
-}
+        // Emit event
+        env.events()
+            .publish((Symbol::new(&env, "PortfolioUpdated"),), &user);
 
-#[test]
-#[should_panic(expected = "Error(Contract, #27)")]
-fn test_attempt_rate_policy_rejects_zero_active_window() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    client.set_attempt_rate_policy(&0u64, &1u32, &1u32, &60u64, &1u32, &1u32);
-}
+        profile
+    }
 
-#[test]
-fn test_proof_of_humanity_credential_registration_and_validation() {
-    let env = Env::default();
-    env.mock_all_auths();
+    /// Read onboarding rate limit window length in seconds (#940).
+    pub fn get_rate_limit_window(env: Env) -> u64 {
+        Self::read_persistent(&env, &DataKey::OnboardRateLimitWindow).unwrap_or(3600)
+    }
 
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
+    /// Read maximum onboarding attempts per window (#940).
+    pub fn get_max_onboard_attempts(env: Env) -> u32 {
+        Self::read_persistent(&env, &DataKey::MaxOnboardAttempts).unwrap_or(3)
+    }
 
-    client.onboard_user(&user, &String::from_str(&env, "pohuser"), &UserRole::Buyer);
+    /// Read verification cooldown period in seconds (#940).
+    pub fn get_verification_cooldown(env: Env) -> u64 {
+        Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400)
+    }
 
-    let provider = soroban_sdk::Symbol::new(&env, "WorldID");
-    let mut cred_buf = [0u8; 32];
-    cred_buf[0] = 0xAA;
-    let cred_hash = soroban_sdk::Bytes::from_slice(&env, &cred_buf);
-    let expires = env.ledger().timestamp() + 10_000;
+    /// Read the active versioned onboarding/verification attempt policy (#1084).
+    pub fn get_attempt_rate_policy(env: Env) -> AttemptRatePolicy {
+        Self::get_attempt_rate_policy_internal(&env)
+    }
 
-    let cred = client.register_poh_credential(&user, &provider, &cred_hash, &expires);
-    assert_eq!(cred.provider_id, provider);
-    assert_eq!(cred.credential_hash, cred_hash);
+    /// Replace attempt limits and advance the policy revision (admin only, #1084).
+    pub fn set_attempt_rate_policy(
+        env: Env,
+        onboarding_window_secs: u64,
+        max_onboarding_per_account: u32,
+        max_onboarding_global: u32,
+        verification_window_secs: u64,
+        max_verification_per_account: u32,
+        max_verification_global: u32,
+    ) -> AttemptRatePolicy {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
 
-    assert!(client.is_poh_valid(&user));
+        if (onboarding_window_secs == 0
+            && (max_onboarding_per_account > 0 || max_onboarding_global > 0))
+            || (verification_window_secs == 0
+                && (max_verification_per_account > 0 || max_verification_global > 0))
+        {
+            env.panic_with_error(Error::InvalidRateLimitPolicy);
+        }
 
-    let fetched = client
-        .get_poh_credential(&user)
-        .expect("PoH credential present");
-    assert_eq!(fetched.provider_id, provider);
-}
+        let revision = Self::get_attempt_rate_policy_internal(&env)
+            .revision
+            .saturating_add(1);
+        let policy = AttemptRatePolicy {
+            revision,
+            onboarding_window_secs,
+            max_onboarding_per_account,
+            max_onboarding_global,
+            verification_window_secs,
+            max_verification_per_account,
+            max_verification_global,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttemptRatePolicy, &policy);
+        Self::extend_persistent(&env, &DataKey::AttemptRatePolicy);
+        policy
+    }
 
-#[test]
-#[should_panic]
-fn test_poh_credential_duplicate_prevention() {
-    let env = Env::default();
-    env.mock_all_auths();
+    /// Read whether Proof-of-Humanity is required for auto/manual verification (#940).
+    pub fn is_poh_required_for_auto_verify(env: Env) -> bool {
+        Self::read_persistent(&env, &DataKey::PohReqForAutoVerify).unwrap_or(false)
+    }
 
-    let (client, _admin) = setup_test(&env);
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
+    /// Read optional Proof-of-Humanity verifier address (#940).
+    pub fn get_poh_verifier(env: Env) -> Option<Address> {
+        Self::read_persistent(&env, &DataKey::PohVerifier)
+    }
 
-    client.onboard_user(&user1, &String::from_str(&env, "userone"), &UserRole::Buyer);
-    client.onboard_user(&user2, &String::from_str(&env, "usertwo"), &UserRole::Buyer);
+    /// Update anti-Sybil, rate-limiting, and Proof-of-Humanity configuration (admin only) (#940).
+    pub fn set_sybil_config(
+        env: Env,
+        rate_limit_window: u64,
+        max_onboard_attempts: u32,
+        verification_cooldown: u64,
+        poh_required_for_auto_verify: bool,
+        poh_verifier: Option<Address>,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
 
-    let provider = soroban_sdk::Symbol::new(&env, "Gitcoin");
-    let mut cred_buf = [0u8; 32];
-    cred_buf[0] = 0xBB;
-    let cred_hash = soroban_sdk::Bytes::from_slice(&env, &cred_buf);
-    let expires = env.ledger().timestamp() + 10_000;
+        config.platform_admin.require_auth();
 
-    // Register for user1
-    client.register_poh_credential(&user1, &provider, &cred_hash, &expires);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OnboardRateLimitWindow, &rate_limit_window);
+        Self::extend_persistent(&env, &DataKey::OnboardRateLimitWindow);
 
-    // Registering the exact same credential hash for user2 must panic (DuplicateIdentityCredential)
-    client.register_poh_credential(&user2, &provider, &cred_hash, &expires);
-}
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxOnboardAttempts, &max_onboard_attempts);
+        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
+        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
 
-#[test]
-fn test_identity_correlation_onboarding() {
-    let env = Env::default();
-    env.mock_all_auths();
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationCooldown, &verification_cooldown);
+        Self::extend_persistent(&env, &DataKey::VerificationCooldown);
 
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
+        env.storage().persistent().set(
+            &DataKey::PohReqForAutoVerify,
+            &poh_required_for_auto_verify,
+        );
+        Self::extend_persistent(&env, &DataKey::PohReqForAutoVerify);
 
-    let mut id_buf = [0u8; 32];
-    id_buf[0] = 0xCC;
-    let id_hash = soroban_sdk::Bytes::from_slice(&env, &id_buf);
+        if let Some(ref verifier) = poh_verifier {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PohVerifier, verifier);
+            Self::extend_persistent(&env, &DataKey::PohVerifier);
+        } else {
+            env.storage().persistent().remove(&DataKey::PohVerifier);
+        }
 
-    let profile = client.onboard_user_with_identity(
-        &user,
-        &String::from_str(&env, "correlated"),
-        &UserRole::Artisan,
-        &id_hash,
-    );
+        env.events().publish(
+            (
+                Symbol::new(&env, "ConfigUpdated"),
+                Symbol::new(&env, "sybil_config"),
+            ),
+            &config.platform_admin,
+        );
+    }
 
-    assert_eq!(profile.address, user);
-    assert_eq!(profile.status, ProfileStatus::Active);
-}
+    /// Attach a Proof-of-Humanity credential to a user profile (#940).
+    ///
+    /// Checks that the credential hash has not already been claimed by another address
+    /// (preventing proof duplication across Sybil accounts).
+    pub fn register_poh_credential(
+        env: Env,
+        user: Address,
+        provider_id: Symbol,
+        credential_hash: Bytes,
+        expires_at: u64,
+    ) -> PohCredential {
+        user.require_auth();
 
-#[test]
-#[should_panic]
-fn test_duplicate_identity_correlation_rejection() {
-    let env = Env::default();
-    env.mock_all_auths();
+        let _config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
 
-    let (client, _admin) = setup_test(&env);
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
+        let verifier: Option<Address> = Self::read_persistent(&env, &DataKey::PohVerifier);
+        if let Some(ref v) = verifier {
+            v.require_auth();
+        }
 
-    let mut id_buf = [0u8; 32];
-    id_buf[0] = 0xDD;
-    let id_hash = soroban_sdk::Bytes::from_slice(&env, &id_buf);
+        let _profile = Self::get_user_profile(&env, user.clone());
 
-    client.onboard_user_with_identity(
-        &user1,
-        &String::from_str(&env, "sybil1"),
-        &UserRole::Artisan,
-        &id_hash,
-    );
+        let poh_hash_key = DataKey::PohCredentialHash(credential_hash.clone());
+        if let Some(existing_owner) = Self::read_persistent::<_, Address>(&env, &poh_hash_key) {
+            if existing_owner != user {
+                env.panic_with_error(Error::DuplicateIdentityCredential);
+            }
+        }
 
-    // Attempting to onboard user2 with the same identity hash must panic (DuplicateIdentityCorrelation)
-    client.onboard_user_with_identity(
-        &user2,
-        &String::from_str(&env, "sybil2"),
-        &UserRole::Artisan,
-        &id_hash,
-    );
-}
+        let cred = PohCredential {
+            provider_id: provider_id.clone(),
+            credential_hash: credential_hash.clone(),
+            verified_at: env.ledger().timestamp(),
+            expires_at,
+        };
 
-#[test]
-fn test_suspicious_profile_flagging_and_review_queue_workflow() {
-    let env = Env::default();
-    env.mock_all_auths();
+        let poh_user_key = DataKey::UserPohCredential(user.clone());
+        env.storage().persistent().set(&poh_user_key, &cred);
+        Self::extend_persistent(&env, &poh_user_key);
 
-    let (client, _admin) = setup_test(&env);
-    let user = Address::generate(&env);
+        env.storage().persistent().set(&poh_hash_key, &user);
+        Self::extend_persistent(&env, &poh_hash_key);
 
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "suspect"),
-        &UserRole::Artisan,
-    );
+        env.events().publish(
+            (Symbol::new(&env, "PohCredentialRegistered"),),
+            PohCredentialRegisteredEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                provider_id,
+                credential_hash,
+            },
+        );
 
-    // Flag profile for review
-    client.flag_suspicious_profile(&user, &101u32, &86400u64);
+        cred
+    }
 
-    let profile = client.get_user(&user);
-    assert_eq!(profile.status, ProfileStatus::UnderReview);
+    /// Read the Proof-of-Humanity credential for a user address (#940).
+    pub fn get_poh_credential(env: Env, user: Address) -> Option<PohCredential> {
+        Self::read_persistent(&env, &DataKey::UserPohCredential(user))
+    }
 
-    let flag = client.get_suspicious_flag(&user).expect("Flag present");
-    assert_eq!(flag.reason_code, 101);
+    /// Check if a user holds a valid (unexpired) Proof-of-Humanity credential (#940).
+    pub fn is_poh_valid(env: Env, user: Address) -> bool {
+        if let Some(cred) =
+            Self::read_persistent::<_, PohCredential>(&env, &DataKey::UserPohCredential(user))
+        {
+            cred.expires_at > env.ledger().timestamp()
+        } else {
+            false
+        }
+    }
 
-    let queue = client.get_review_queue();
-    assert!(queue.contains(&user));
+    fn require_sybil_reviewer(env: &Env, config: &OnboardingConfig, reviewer: &Address) {
+        reviewer.require_auth();
+        let authorized = *reviewer == config.platform_admin
+            || Self::read_persistent::<_, bool>(env, &DataKey::SybilReviewer(reviewer.clone()))
+                .unwrap_or(false);
+        if !authorized {
+            env.panic_with_error(Error::UnauthorizedReviewer);
+        }
+    }
 
-    // Admin approves review -> clears flag and restores Active status
-    client.process_review(&user, &true);
+    fn apply_sybil_review_decision(
+        env: &Env,
+        reviewer: &Address,
+        user: &Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(env, &DataKey::Config);
+        Self::require_sybil_reviewer(env, &config, reviewer);
 
-    let restored_profile = client.get_user(&user);
-    assert_eq!(restored_profile.status, ProfileStatus::Active);
-    assert!(client.get_suspicious_flag(&user).is_none());
-}
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
 
-#[test]
-fn test_revision_bound_sybil_review_restricts_then_restores_access() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 1_000);
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let reviewer = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "review_bound"),
-        &UserRole::Buyer,
-    );
-    client.set_sybil_reviewer(&reviewer, &true);
-    client.flag_suspicious_profile(&user, &701u32, &600u64);
+        let mut profile = Self::get_user_profile(env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        let now = env.ledger().timestamp();
+        if now >= case.expires_at {
+            env.panic_with_error(Error::ReviewExpired);
+        }
 
-    let review = client.get_sybil_review(&user).expect("review case");
-    assert_eq!(review.status, SybilReviewStatus::ReviewRequired);
-    assert_eq!(
-        review.profile_revision,
-        client.get_user(&user).state_version
-    );
-    assert!(client
-        .try_update_user_role(&user, &UserRole::Artisan)
-        .is_err());
+        let (outcome, action) = if approve {
+            profile.status = ProfileStatus::Active;
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SuspiciousActivityFlag(user.clone()));
+            (SybilReviewStatus::Approved, "approved")
+        } else {
+            profile.status = ProfileStatus::Flagged;
+            (SybilReviewStatus::Rejected, "rejected")
+        };
+        Self::persist_public_user_profile(env, user, &profile);
+        Self::bump_state_version(env, user);
 
-    client.decide_sybil_review(&reviewer, &user, &review.profile_revision, &true);
-    assert_eq!(client.get_user(&user).status, ProfileStatus::Active);
-    assert_eq!(
-        client.get_sybil_review(&user).unwrap().status,
-        SybilReviewStatus::Approved
-    );
-    assert_eq!(
-        client.update_user_role(&user, &UserRole::Artisan).role,
-        UserRole::Artisan
-    );
-}
+        case.status = outcome;
+        case.decided_at = now;
+        case.decided_by = Some(reviewer.clone());
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(env, &case_key);
+        Self::advance_review_head(env);
 
-#[test]
-fn test_sybil_review_rejects_unauthorized_and_stale_decisions() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 2_000);
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    let unauthorized = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "review_stale"),
-        &UserRole::Artisan,
-    );
-    client.flag_suspicious_profile(&user, &702u32, &600u64);
-    let review = client.get_sybil_review(&user).unwrap();
+        env.events().publish(
+            (Symbol::new(env, "SybilReviewDecision"),),
+            SybilReviewDecisionEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                reviewer: reviewer.clone(),
+                profile_revision: expected_profile_revision,
+                outcome,
+                timestamp: now,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "ReviewCompleted"),),
+            ReviewCompletedEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                action: Symbol::new(env, action),
+                timestamp: now,
+            },
+        );
+    }
 
-    assert!(client
-        .try_decide_sybil_review(&unauthorized, &user, &review.profile_revision, &true,)
-        .is_err());
-    assert!(client.try_process_review(&user, &true).is_ok());
-    assert_eq!(client.get_user(&user).status, ProfileStatus::Active);
+    /// Grant or revoke authority to decide Sybil review cases (#1086).
+    pub fn set_sybil_reviewer(env: Env, reviewer: Address, authorized: bool) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+        let key = DataKey::SybilReviewer(reviewer);
+        if authorized {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_persistent(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
 
-    client.flag_suspicious_profile(&user, &703u32, &600u64);
-    let current = client.get_sybil_review(&user).unwrap();
-    assert!(client
-        .try_decide_sybil_review(
-            &client.get_config().platform_admin,
+    /// Flag a user profile for suspicious anti-Sybil behavior and enqueue for review (admin only) (#940).
+    pub fn flag_suspicious_profile(
+        env: Env,
+        target_user: Address,
+        reason_code: u32,
+        delay_seconds: u64,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        config.platform_admin.require_auth();
+
+        let mut profile = Self::get_user_profile(&env, target_user.clone());
+        profile.status = ProfileStatus::UnderReview;
+        Self::persist_public_user_profile(&env, &target_user, &profile);
+        let profile_revision = Self::bump_state_version(&env, &target_user);
+
+        let now = env.ledger().timestamp();
+        let flag = SuspiciousActivityFlag {
+            reason_code,
+            flagged_at: now,
+            flagged_by: config.platform_admin.clone(),
+            delay_until: now + delay_seconds,
+        };
+
+        let flag_key = DataKey::SuspiciousActivityFlag(target_user.clone());
+        env.storage().persistent().set(&flag_key, &flag);
+        Self::extend_persistent(&env, &flag_key);
+
+        let case_key = DataKey::SybilReviewCase(target_user.clone());
+        let review_case = SybilReviewCase {
+            profile_revision,
+            reason_code,
+            status: SybilReviewStatus::ReviewRequired,
+            opened_at: now,
+            expires_at: now.saturating_add(delay_seconds),
+            decided_at: 0,
+            decided_by: None,
+            appeal_count: 0,
+        };
+        env.storage().persistent().set(&case_key, &review_case);
+        Self::extend_persistent(&env, &case_key);
+
+        Self::enqueue_review_request(&env, &target_user);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProfileFlagged"),),
+            ProfileFlaggedEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: target_user.clone(),
+                reason_code,
+                timestamp: now,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "SybilPatternDetected"),),
+            SybilPatternDetectedEvent {
+                schema_version: crate::LIFECYCLE_EVENT_SCHEMA_VERSION,
+                user: target_user,
+                reason: Symbol::new(&env, "FlaggedByAdmin"),
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Read the active suspicious activity flag for a user (#940).
+    pub fn get_suspicious_flag(env: Env, user: Address) -> Option<SuspiciousActivityFlag> {
+        Self::read_persistent(&env, &DataKey::SuspiciousActivityFlag(user))
+    }
+
+    /// Read the revision-bound Sybil review case for a profile (#1086).
+    pub fn get_sybil_review(env: Env, user: Address) -> Option<SybilReviewCase> {
+        Self::read_persistent(&env, &DataKey::SybilReviewCase(user))
+    }
+
+    /// Retrieve queue of addresses currently under administrative anti-Sybil review (admin only) (#940).
+    pub fn get_review_queue(env: Env) -> Vec<Address> {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        config.platform_admin.require_auth();
+
+        Self::advance_review_head(&env);
+
+        let head = Self::get_queue_pointer(&env, &DataKey::ReviewQueueHead);
+        let tail = Self::get_queue_pointer(&env, &DataKey::ReviewQueueTail);
+        let mut queue = Vec::new(&env);
+
+        for index in head..tail {
+            let queue_index_key = DataKey::ReviewQueueIndex(index);
+            if let Some(user) = Self::read_persistent::<_, Address>(&env, &queue_index_key) {
+                if let Some(profile) = Self::try_get_user_profile(&env, user.clone()) {
+                    if profile.status == ProfileStatus::UnderReview {
+                        queue.push_back(user);
+                    }
+                }
+            }
+        }
+
+        queue
+    }
+
+    /// Submit a reviewer-authorized decision bound to a profile revision (#1086).
+    pub fn decide_sybil_review(
+        env: Env,
+        reviewer: Address,
+        user: Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        Self::apply_sybil_review_decision(
+            &env,
+            &reviewer,
             &user,
-            &(current.profile_revision - 1),
-            &true,
-        )
-        .is_err());
-    assert_eq!(client.get_user(&user).status, ProfileStatus::UnderReview);
-}
+            expected_profile_revision,
+            approve,
+        );
+    }
 
-#[test]
-fn test_sybil_rejection_appeal_and_expiry_remain_restricted() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| li.timestamp = 3_000);
-    let (client, admin) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "review_appeal"),
-        &UserRole::Artisan,
-    );
-    client.flag_suspicious_profile(&user, &704u32, &10u64);
-    let opened = client.get_sybil_review(&user).unwrap();
-    client.decide_sybil_review(&admin, &user, &opened.profile_revision, &false);
-    assert_eq!(client.get_user(&user).status, ProfileStatus::Flagged);
+    /// Appeal a rejected or expired review and open a new revision-bound window (#1086).
+    pub fn appeal_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::Rejected && case.status != SybilReviewStatus::Expired {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if profile.state_version != expected_profile_revision {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
 
-    let rejected_revision = client.get_user(&user).state_version;
-    client.appeal_sybil_review(&user, &rejected_revision);
-    let appealed = client.get_sybil_review(&user).unwrap();
-    assert_eq!(appealed.status, SybilReviewStatus::Appealed);
-    assert_eq!(appealed.appeal_count, 1);
-    assert!(client.try_request_verification(&user).is_err());
+        let duration = case.expires_at.saturating_sub(case.opened_at).max(1);
+        let now = env.ledger().timestamp();
+        profile.status = ProfileStatus::UnderReview;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        let next_revision = Self::bump_state_version(&env, &user);
+        case.profile_revision = next_revision;
+        case.status = SybilReviewStatus::Appealed;
+        case.opened_at = now;
+        case.expires_at = now.saturating_add(duration);
+        case.decided_at = 0;
+        case.decided_by = None;
+        case.appeal_count = case.appeal_count.saturating_add(1);
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::enqueue_review_request(&env, &user);
+    }
 
-    env.ledger()
-        .with_mut(|li| li.timestamp = appealed.expires_at);
-    client.expire_sybil_review(&user, &appealed.profile_revision);
-    assert_eq!(client.get_user(&user).status, ProfileStatus::Flagged);
-    assert_eq!(
-        client.get_sybil_review(&user).unwrap().status,
-        SybilReviewStatus::Expired
-    );
-}
+    /// Close an elapsed review window while keeping the account restricted (#1086).
+    pub fn expire_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        if env.ledger().timestamp() < case.expires_at {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        profile.status = ProfileStatus::Flagged;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+        case.status = SybilReviewStatus::Expired;
+        case.decided_at = env.ledger().timestamp();
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::advance_review_head(&env);
+    }
 
-#[test]
-fn test_normal_verified_profile_is_unaffected_by_review_state() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _) = setup_test(&env);
-    let user = Address::generate(&env);
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "normal_verified"),
-        &UserRole::Buyer,
-    );
-    let verified = client.verify_user(&user);
-
-    assert!(verified.is_verified);
-    assert_eq!(verified.status, ProfileStatus::Active);
-    assert!(client.get_sybil_review(&user).is_none());
-    assert_eq!(
-        client.update_user_role(&user, &UserRole::Artisan).role,
-        UserRole::Artisan
-    );
+    /// Backward-compatible admin decision entrypoint (#940, #1086).
+    pub fn process_review(env: Env, user: Address, approve: bool) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        let review: SybilReviewCase =
+            Self::read_persistent(&env, &DataKey::SybilReviewCase(user.clone()))
+                .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        Self::apply_sybil_review_decision(
+            &env,
+            &config.platform_admin,
+            &user,
+            review.profile_revision,
+            approve,
+        );
+    }
 }
