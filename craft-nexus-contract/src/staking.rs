@@ -6,6 +6,16 @@ use soroban_sdk::{
 };
 
 // ============================================================================
+// 0. ERROR TYPES
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeNotFound = 1,
+}
+
+// ============================================================================
 // 1. DATA STRUCTURES & KEYS
 // ============================================================================
 
@@ -16,12 +26,6 @@ const COOLDOWN_PERIOD: u64 = 86400 * 7; // 7 days in seconds
 pub struct StakeEntry {
     pub amount: i128,
     pub unlock_time: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Error {
-    StakeNotFound = 1,
 }
 
 #[contracttype]
@@ -102,25 +106,18 @@ impl StakeContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Read-only function to fetch a single stake record for an artisan.
+    /// Read-only function to fetch a user's stake record.
     ///
-    /// Returns `Err(Error::StakeNotFound)` when the storage key is absent
-    /// (e.g. after archival, partial migration, or a missing key) instead of
-    /// panicking. Uses `extend_persistent_read` on the hot key so callers do
-    /// not trigger an unbounded scan or a host trap.
-    pub fn get_artisan_stake_data(
-        env: Env,
-        user: Address,
-        index: u32,
-    ) -> Result<StakeEntry, Error> {
+    /// Returns `Error::StakeNotFound` when the storage key is absent instead of
+    /// trapping the host. Uses `extend_persistent_read` on the hot persistent
+    /// key so callers do not pay for a full scan or panic on archival.
+    pub fn get_artisan_stake_data(env: Env, user: Address) -> Result<Vec<StakeEntry>, Error> {
         let key = DataKey::UserStakes(user);
         env.storage().persistent().extend_ttl(&key, 100, 1000);
-        let stakes: Vec<StakeEntry> = env
-            .storage()
+        env.storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        stakes.get(index).ok_or(Error::StakeNotFound)
+            .ok_or(Error::StakeNotFound)
     }
 }
 
@@ -244,13 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_artisan_stake_data_missing_key_does_not_trap() {
+    fn test_get_artisan_stake_data_missing_key_returns_error() {
         let (_env, user, client) = setup();
 
-        // No stake has ever been recorded for this user: the storage key is
-        // absent. The call must return the typed error, not panic.
-        let result = client.get_artisan_stake_data(&user, &0);
-        assert_eq!(result, Err(Error::StakeNotFound));
+        // No stake has been recorded yet: the key is absent.
+        let result = client.try_get_artisan_stake_data(&user);
+        assert_eq!(result, Err(Ok(Error::StakeNotFound)));
     }
 
     #[test]
@@ -258,16 +254,15 @@ mod tests {
         let (env, user, client) = setup();
 
         client.stake(&user, &1000);
-        let base_time = env.ledger().timestamp();
 
-        // Advance past the cooldown and drain the queue: terminal state.
+        // Advance past the cooldown and drain the queue to a terminal state.
         env.ledger()
-            .set_timestamp(base_time + COOLDOWN_PERIOD + 1);
+            .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
         let withdrawn = client.withdraw_matured(&user);
         assert_eq!(withdrawn, 1000);
 
-        // The record has been fully consumed; reading it must not trap.
-        let result = client.get_artisan_stake_data(&user, &0);
-        assert_eq!(result, Err(Error::StakeNotFound));
+        // Record now exists but is empty; the call must not trap.
+        let stakes = client.get_artisan_stake_data(&user).unwrap();
+        assert_eq!(stakes.len(), 0);
     }
 }

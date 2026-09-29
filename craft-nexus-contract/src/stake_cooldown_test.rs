@@ -8,7 +8,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-fn setup_env<'a>() -> (
+fn setup_env('a) -> (
     Env,
     CraftNexusContractClient<'a>,
     Address,
@@ -64,7 +64,7 @@ fn test_new_deposit_does_not_bypass_cooldown() {
     // 4. Attempt withdrawal. Neither should be ready, so this should error out.
     let res = client.try_unstake_tokens(&artisan, &token.address);
     assert!(
-        res.is_err(),
+        res.is_error(),
         "New deposit accidentally bypassed cooldown rules"
     );
 
@@ -105,10 +105,10 @@ fn test_get_artisan_stake_data_missing_key() {
     let (_env, client, _, artisan, _token) = setup_env();
 
     // Before any stake record exists, the call must not trap.
-    let result = client.try_get_artisan_stake_data(&artisan, &token.address);
+    let result = client.try_get_artisan_stake_data(&artisan);
     assert!(
-        result.is_err(),
-        "get_artisan_stake_data should return a typed error for a missing key"
+        result.is_error(),
+        "get_artisan_stake_data should return an error when the key is absent"
     );
 }
 
@@ -116,15 +116,16 @@ fn test_get_artisan_stake_data_missing_key() {
 fn test_get_artisan_stake_data_after_terminal_state() {
     let (env, client, _, artisan, token) = setup_env();
 
-    // Create a stake record, then drive it to a terminal state via unstake.
     client.stake_tokens(&artisan, &token.address, &1000);
+
+    // Advance past the cooldown and fully unstake to reach a terminal state.
     env.ledger().set_timestamp(env.ledger().timestamp() + (86400 * 7) + 1);
     client.unstake_tokens(&artisan, &token.address);
 
-    // After the terminal state, the call must not trap and must return a typed error.
-    let result = client.try_get_artisan_stake_data(&artisan, &token.address);
+    // After the terminal state, the call must not trap and should return an error.
+    let result = client.try_get_artisan_stake_data(&artisan);
     assert!(
-        result.is_err(),
-        "get_artisan_stake_data should return a typed error after a terminal state"
+        result.is_error(),
+        "get_artisan_stake_data should return an error after the terminal state"
     );
 }
