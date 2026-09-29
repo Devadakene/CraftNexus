@@ -1,117 +1,103 @@
-use soroban_std::{address::Address, env::Env, symbol_short, into_symbol_short, Map, Symbol, SymbolSmall, Vec};
-use soroban_std::token::TokenClient;
+use soroban_std::{address, contract, contractimpl, contracttype, env::{Env, Panic as StoragePanic}, symbol_short, Address};
 
-const FAILED_TO_READ_TOTAL_FEES: u32 = 1;
+const TOTAL_FEES_KEY: symbol_short = symbol_short("TotalFees");
 
-const DATA_KEY: Symbol = symbol_short("DATA");
-const TOTAL_FEES_KEY: Symbol = symbol_short("TOTAL_FEES");
-
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100;
-
-#[derive(Clone, Debug, Eq))]
-#[represent(u32)]
+/// Error types returned by the contract.
+///
+/// The `FailedToGetTotalFeesCollected` variant is returned when the
+/// `TOTAL_FEES_KEY` entry is absent from persistent storage (e.g. after
+/// archival, a partial migration, or a missing key). Callers should not
+/// experience a host panic in this case.
+#derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrder)]
+#[contracterror]
 pub enum Error {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    InvalidAmount = 3,
-    InsufficientFunds = 4,
-    Unauthorized = 5,
-    NotFound = 6,
+    /// The contract has not been initialized yet.
+    NotInitialized = 1,
+    /// The `TOTAL_FEES_KEY` entry is missing from storage.
+    FailedToGetTotalFeesCollected = 2,
 }
 
-#[derive(Clone, Debug, Eq)
-]
-#[sorban_std::contracttype]
-pub struct FeeData {
-    public total_fees_collected: i128,
-}
-
-#[sorban_std::contract]
+#[contract]
 pub struct CraftNexusContract;
 
-#[sorban_std::contractimp]
+#[contractimpl]
 impl CraftNexusContract {
-    /// Read the total fees collected by the platform.
+    /// Returns the total fees collected by the platform.
     ///
-    /// Returns `NotFound` when the fee record has not been initialized yet,
-    /// for example after archival, a partial migration, or a missing key.
+/// Reads the `TotalFees` persistent key and returns the stored value.
+    /// If the key is absent (archival, partial migration, missing key),
+/// this returns `Error::FailedToGetTotalFeesCollected` instead of panicking.
     pub fn get_total_fees_collected(env: Env) -> Result<i128, Error> {
-        let key = TOTAL_FEES_KEY;
-        let existing = env
-            .storage()
-            .persistent()
-            .get::<Symbol, i128>(&key);
+        // Extend the TTL of the hot persistent key on every read so the
+        // entry does not expire while the contract is active.
+        env.storage().extend_ttl(
+            &TOTAL_FEES_KEY,
+            30,
+            100,
+        );
 
-        match existing {
-            Some(total) => {
-                env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, env.ledger().sequence());
-                Ok(total)
-            }
-            None => Err(Error::NotFound),
+        match env.storage().persistent().get::<i128>(&TOTAL_FEES_KEY) {
+            Some(total) => Ok(total),
+            None => Err(Error::FailedToGetTotalFeesCollected),
         }
     }
 
-    /// Record fees collected by the platform.
+    /// Records the total fees collected by the platform.
     ///
-    /// This is the write path that makes `get_total_fees_collected` succeed.
-    pub fn record_fees(env: Env, amount: i128) -> Result<i128, Error> {
-        if amount < 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        let key = TOTAL_FEES_KEY;
-        let current = env
-            .storage()
-            .persistent()
-            .get::Symbol, i128>(&key)
-            .unwrap_or_default();
-        let updated = current.saturating_add(amount);
-
-        env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            env.ledger().sequence(),
+    /// Used by the fee policy to persist the accumulated fees. This is
+    /// the complement to `get_total_fees_collected` and keeps the hot
+/// persistent key alive.
+    pub fn set_total_fees_collected(env: Env, total: &i128) {
+        env.storage().persistent().set(&TOTAL_FEES_KEY, total);
+        env.storage().extend_ttl(
+            &TOTAL_FEES_KEY,
+            30,
+            100,
         );
-
-        Ok(updated)
     }
 }
 
-#test]
+#[cfg]
+test
 mod test {
     use super::*;
-    use sorban_std::Env;
+    use soroban_std::Env;
 
     #[test]
-    fn get_total_fees_collected_missing_key_returns_not_found() {
+    fn get_total_fees_collected_returns_error_when_missing() {
         let env = Env::default();
-        let result = CraftNexusContract::get_total_fees_collected(env.clone());
-        assert_eq(!(result, Err(Error::NotFound)));
+        let client = CraftNexusContractClient::new(&env);
+
+        // No record has been written yet.
+        let result = client.try_get_total_fees_collected();
+        assert_eq(
+            result,
+            Err(Ok(Error::FailedToGetTotalFeesCollected)),
+        );
     }
 
     #[test]
-    fn get_total_fees_collected_after_record() {
+    fn get_total_fees_collected_returns_error_after_terminal_state() {
         let env = Env::default();
-        let updated = CraftNexusContract::record_fees(env.clone(), 125);
-        assert_eq=!(updated, Ok(125));
+        let client = CraftNexusContractClient::new(&env);
 
-        let result = CraftNexusContract::get_total_fees_collected(env.clone());
-        assert_eq=!(result, Ok(125));
+        // Simulate a terminal state where the key was removed/archived.
+        env.storage().persistent().remove(&TOTAL_FEES_KEY);
+
+        let result = client.try_get_total_fees_collected();
+        assert_eq(
+            result,
+            Err(Ok(Error::FailedToGetTotalFeesCollected)),
+        );
     }
 
     #[test]
-    fn get_total_fees_collected_after_terminal_state() {
+    fn get_total_fees_collected_returns_value_when_present() {
         let env = Env::default();
-        CraftNexusContract::record_fees(env.clone(), 50).unwrap();
+        let client = CraftNexusContractClient::new(&env);
 
-        // Simulate a completed/terminal lifecycle by extending the key and
-        // confirming the value remains readable and typed.
-        env.storage()
-            .persistent()
-            .extend_ttl(&TOTAL_FEES_KEY, PERSISTENT_LIFETIME_THRESHOLD, env.ledger().sequence());
-
-        let result = CraftNexusContract::get_total_fees_collected(env.clone());
-        assert_eq=!(result, Ok(50));
+        client.set_total_fees_collected(&42);
+        let result = client.try_get_total_fees_collected();
+        assert_eq(result, Ok(Ok<42));
     }
 }
