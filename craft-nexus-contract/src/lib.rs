@@ -41,6 +41,8 @@ mod min_release_window_test;
 #[cfg(test)]
 mod pagination_boundary_test;
 #[cfg(test)]
+mod issue_1347_test;
+#[cfg(test)]
 mod diagnostic_scan_test;
 #[cfg(test)]
 mod differential_upgrade_compatibility_test {
@@ -3149,7 +3151,7 @@ impl CraftNexusContract {
         env.storage()
             .instance()
             .set(&DataKey::LastAppliedAdminRevision, &expected_revision);
-        let next = current.saturating_add(1);
+        let next = current.checked_add(1).ok_or(Error::CounterOverflow)?;
         env.storage().instance().set(&DataKey::AdminRevision, &next);
         Ok(expected_revision)
     }
@@ -11943,6 +11945,10 @@ impl CraftNexusContract {
         if fee_bps > MAX_PLATFORM_FEE_BPS {
             env.panic_with_error(crate::Error::InvalidFee);
         }
+
+        // Pause is a write gate. Check it before the admin-mutation fingerprint
+        // or fee-tier storage can be changed.
+        Self::check_not_paused(&env);
 
         let mut payload = artisan.clone().to_xdr(&env);
         payload.extend_from_slice(&fee_bps.to_be_bytes());
