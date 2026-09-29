@@ -240,6 +240,9 @@ pub enum Error {
     /// would silently destroy value; rejected instead of settling for zero
     /// (#1088).
     ConversionOutputUnderflow = 110,
+    /// The platform wallet address is invalid (e.g. zero address or the
+    /// contract's own address). Storage is left unchanged.
+    InvalidPlatformWalletAddress = 111,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
