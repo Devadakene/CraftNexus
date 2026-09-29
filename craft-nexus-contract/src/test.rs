@@ -7709,6 +7709,67 @@ mod reconciliation_report_tests {
         let result = client.try_query_reconciliation_report(&token_id, &0, &50);
         assert_panic_contract_error(result, Error::CounterOverflow);
     }
+
+    #[test]
+    fn test_update_platform_fee_requires_admin_auth_without_mutating_state() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+        env.set_auths(&[]);
+
+        let before_fee = client.get_platform_fee();
+        let before_balance = token::Client::new(&env, &token_id).balance(&client.address);
+        let before_config = client.get_platform_config();
+
+        let result = client.try_update_platform_fee(&123);
+
+        assert!(result.is_err(), "missing admin authorization must be rejected");
+        assert_eq!(client.get_platform_fee(), before_fee);
+        assert_eq!(client.get_platform_config(), before_config);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&client.address),
+            before_balance
+        );
+    }
+
+    #[test]
+    fn test_update_platform_fee_rejects_paused_platform_without_mutating_state() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+        client.set_paused(&true);
+
+        let before_fee = client.get_platform_fee();
+        let before_balance = token::Client::new(&env, &token_id).balance(&client.address);
+        let before_paused = client.is_paused();
+
+        let result = client.try_update_platform_fee(&123);
+
+        assert_panic_contract_error(result, Error::ContractPaused);
+        assert_eq!(client.is_paused(), before_paused);
+        assert_eq!(client.get_platform_fee(), before_fee);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&client.address),
+            before_balance
+        );
+    }
+
+    #[test]
+    fn test_update_platform_fee_rejects_invalid_fee_without_mutating_state() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+
+        let before_fee = client.get_platform_fee();
+        let before_balance = token::Client::new(&env, &token_id).balance(&client.address);
+
+        // MAX_PLATFORM_FEE_BPS is 1000 (10%); anything above must be rejected.
+        let result = client.try_update_platform_fee(&(MAX_PLATFORM_FEE_BPS + 1));
+
+        assert_panic_contract_error(result, Error::InvalidFee);
+        assert_eq!(client.get_platform_fee(), before_fee);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&client.address),
+            before_balance
+        );
+    }
 }
 
 // ============================================================
