@@ -13,6 +13,12 @@ const COOLDOWN_PERIOD: u64 = 86400 * 7; // 7 days in seconds
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeNotFound = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StakeEntry {
     pub amount: i128,
     pub unlock_time: u64,
@@ -94,6 +100,23 @@ impl StakeContract {
             .persistent()
             .get(&DataKey::UserStakes(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Read-only function to fetch the full stake record for an artisan.
+    ///
+    /// Returns `Err(Error::StakeNotFound)` when the storage key is absent
+    /// (e.g. after archival, partial migration, or a missing key) instead of
+    /// panicking. Uses `extend_persistent_read` to keep hot keys alive.
+    pub fn get_artisan_stake_data(
+        env: Env,
+        user: Address,
+    ) -> Result<Vec<StakeEntry>, Error> {
+        let key = DataKey::UserStakes(user);
+        env.storage().persistent().extend_ttl(&key, 100, 1000);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::StakeNotFound)
     }
 }
 
@@ -213,6 +236,40 @@ mod tests {
             empty_queue.len(),
             0,
             "Queue should be empty after all stakes mature"
+        );
+    }
+
+    #[test]
+    fn test_get_artisan_stake_data_missing_key_returns_error() {
+        let (_env, user, client) = setup();
+
+        // No stake has been recorded yet: must not trap.
+        let result = client.try_get_artisan_stake_data(&user);
+        assert_eq!(
+            result,
+            Err(Ok(Error::StakeNotFound)),
+            "Missing key must return the typed StakeNotFound error"
+        );
+    }
+
+    #[test]
+    fn test_get_artisan_stake_data_after_terminal_state() {
+        let (env, user, client) = setup();
+
+        client.stake(&user, &1000);
+
+        // Advance past cooldown and fully withdraw, leaving an empty record.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
+        let withdrawn = client.withdraw_matured(&user);
+        assert_eq!(withdrawn, 1000);
+
+        // Record still exists (empty vec) so the call succeeds with an empty value.
+        let result = client.try_get_artisan_stake_data(&user);
+        assert_eq!(
+            result,
+            Ok(Ok(Vec::new(&env))),
+            "Terminal state must return an empty stake record, not trap"
         );
     }
 }
