@@ -3,7 +3,7 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger},
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryIntoVal,
 };
 
@@ -66,6 +66,47 @@ fn setup_test(
         platform_wallet,
         admin,
     )
+}
+
+#[test]
+fn get_platform_config_refreshes_instance_ttl() {
+    let env = Env::default();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = super::ttl::TTL_EXTENSION - 5_000;
+    });
+    assert_eq!(client.get_platform_config().admin, admin);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = super::ttl::TTL_EXTENSION + 1;
+    });
+    assert_eq!(client.get_platform_config().admin, admin);
+}
+
+#[test]
+fn get_stake_refreshes_active_persistent_record_ttl() {
+    let env = Env::default();
+    let (client, _, artisan, token_id, _, _, _) = setup_test(&env, true);
+    let stake_key = DataKey::ArtisanStake(artisan.clone());
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &stake_key,
+            &ArtisanStakeData {
+                amount: 500,
+                token: token_id,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set_ttl(&stake_key, super::ttl::PERSISTENT_TTL_THRESHOLD - 1);
+    });
+
+    assert_eq!(client.get_stake(&artisan), 500);
+    env.as_contract(&client.address, || {
+        assert!(env.storage().persistent().get_ttl(&stake_key) >= super::ttl::TTL_EXTENSION);
+    });
 }
 
 #[test]

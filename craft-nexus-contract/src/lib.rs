@@ -4020,10 +4020,10 @@ impl CraftNexusContract {
         // Check artisan (seller) stake requirement (Issue #99)
         let config = Self::get_platform_config_internal(&env);
         if config.min_stake_required > 0 {
-            let artisan_stake: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ArtisanStake(seller.clone()))
+            let artisan_stake: i128 = Self::read_persistent::<DataKey, ArtisanStakeData>(
+                &env,
+                &DataKey::ArtisanStake(seller.clone()),
+            )
                 .map(|stake: ArtisanStakeData| stake.amount)
                 .unwrap_or(0);
             if artisan_stake < config.min_stake_required {
@@ -8821,10 +8821,7 @@ impl CraftNexusContract {
         // Validate the requested token matches the token recorded at stake time.
         // Rejects attempts to withdraw in a cheaper/different asset (#421).
         let stake_key = DataKey::ArtisanStake(artisan.clone());
-        let current_stake: ArtisanStakeData = env
-            .storage()
-            .persistent()
-            .get(&stake_key)
+        let current_stake: ArtisanStakeData = Self::read_persistent(&env, &stake_key)
             .unwrap_or_else(|| env.panic_with_error(crate::Error::InsufficientStake));
         if current_stake.token != token {
             env.panic_with_error(crate::Error::StakeTokenMismatch);
@@ -8943,9 +8940,10 @@ impl CraftNexusContract {
 
     /// Return the current staked amount for an artisan.
     pub fn get_stake(env: Env, artisan: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
+        Self::read_persistent::<DataKey, ArtisanStakeData>(
+            &env,
+            &DataKey::ArtisanStake(artisan),
+        )
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
     }
@@ -9659,11 +9657,10 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
-                if let Some(stake) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
-                {
+                if let Some(stake) = Self::read_persistent::<DataKey, ArtisanStakeData>(
+                    &env,
+                    &DataKey::ArtisanStake(artisan),
+                ) {
                     if stake.token == token {
                         expected_staked = expected_staked.saturating_add(stake.amount);
                     }

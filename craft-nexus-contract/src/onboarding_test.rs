@@ -2820,7 +2820,7 @@ fn test_get_verification_queue_extends_ttl_for_every_slot() {
                 "queue slot {slot} should still be live"
             );
             assert!(
-                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
+                env.storage().persistent().get_ttl(&key) >= crate::ttl::TTL_EXTENSION,
                 "queue slot {slot} should have been extended on read"
             );
         }
@@ -2934,7 +2934,7 @@ fn test_read_paths_refresh_ttl_on_touched_entries() {
         ] {
             assert!(env.storage().persistent().has(&key));
             assert!(
-                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
+                env.storage().persistent().get_ttl(&key) >= crate::ttl::TTL_EXTENSION,
                 "read path should have refreshed the entry TTL"
             );
         }
