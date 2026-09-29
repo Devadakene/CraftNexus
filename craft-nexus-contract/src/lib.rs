@@ -1,1 +1,157 @@
-dXNlIHNvcm9iYW5fc3RkOjp7YWRkcmVzcywgY29udHJhY3QsIGNvbnRyYWN0aW1wbCwgY29udHJhY3R0eXBlLCBlbnYiO307Cgp1c2Ugc29yYmFuX3N0ZDo6c3ltYm9sX3Nob3J0O3VzZSBzb3JvYmFuX3N0ZDo6c3ltYm9sX3Nob3J0IGFzIF87CgpbI2NvbnRyYWN0dHlwZV0KcHViIHN0cnVjdCBDcmFmdE5leHVzQ29udHJhY3Q7CgojW2Rlcml2ZShDbG9uZSwgRGVidWcsIEVxLCBQYXJ0aWFsRXEsIFNvcm9iYW5WYWx1ZSwgU29yYmFuVHlwZSwgU29yYmFuSGFzaCwgU29yYmFuQXJiaXRyYXJ5LCBTb3JvYmFuRGVzZXJpYWxpemUpXQojW2NvbnRyYWN0dHlwZV0KcHViIGVudW0gRXJyb3IgewogICAgTm90SW5pdGlhbGl6ZWQgPSAxLAogICAgQWxyZWFkeUluaXRpYWxpemVkID0gMiwKICAgIE5vdEZvdW5kID0gMywKICAgIEludmFsaWRJbnB1dCA9IDQsCiAgICBVbmF1dGhvcml6ZWQgPSA1LAp9CgojW2Rlcml2ZShDbG9uZSwgRGVidWcsIEVxLCBQYXJ0aWFsRXEsIFNvcm9iYW5WYWx1ZSwgU29yYmFuVHlwZSwgU29yYmFuSGFzaCwgU29yb2JhbkFyYml0cmFyeSwgU29yb2JhbkRlc2VyaWFsaXplKV0KI1tjb250cmFjdHR5cGVdCnB1YiBzdHJ1Y3QgQXJ0aXNhblN0YWtlRGF0YSB7CiAgICBwdWIgYXJ0aXNhbjogQWRkcmVzcywKICAgIHB1YiB0b2tlbjogQWRkcmVzcywKICAgIHB1YiBhbW91bnQ6IGkxMjgsCiAgICBwdWIgc3Rha2VkX2F0OiB1NjQsCn0KCmNvbnN0IEFSVElTQU5fU1RBS0VfS0VZOiBTeW1ib2wgPSBzeW1ib2xfc2hvcnQoIkFydFN0YWtlIik7Cgpjb25zdCBQRVJTSVNURU5UX0xFR0VUX1RIUkVTSE9MRDogdTMyID0gMTAwOwpsZXQgcGVyc2lzdGVudF9sZWRnZXJfdGhyZXNob2xkOiB1MzIgPSBQRVJTSVNURU5UX0xFR0VUX1RIUkVTSE9MRDsKCiNbbm9fbWFuZ2xlXQpmbiBnZXRfYXJ0aXNhbl9zdGFrZV9kYXRhKGVudjogRW52LCBhcnRpc2FuOiBBZGRyZXNzKSAtPiBSZXN1bHQ8QXJ0aXNhblN0YWtlRGF0YSwgRXJyb3I+IHsKICAgIGxldCBrZXkgPSAoQVJUSVNB Tl9TVEFLRV9LRVksIGFydGlzYW4uY2xvbmUoKSk7CiAgICBsZXQgc3RvcmFnZSA9IGVudi5zdG9yYWdlKCk7CiAgICBtYXRjaCBzdG9yYWdlLnBlcnNpc3RlbnQoKS5nZXQoJmtleSkgewogICAgICAgIFNvbWUoZGF0YSkgPT4gewogICAgICAgICAgICBzdG9yYWdlLnBlcnNpc3RlbnQoKS5leHRlbmRfdHRsKCZrZXksIHBlcnNpc3RlbnRfbGVkZ2VyX3RocmVzaG9sZCwgZW52LmxlZGdlci gpOwogICAgICAgICAgICBPayhkYXRhKQogICAgICAgIH0KICAgICAgICBOb25lID0+IEVycihFcnJvcjo6Tm90Rm91bmQpLAogICAgfQp9CgojW2NvbnRyYWN0aW1wbF0KaW1wbCBDcmFmdE5leHVzQ29udHJhY3QgewogICAgcHViIGZuIGdldF9hcnRpc2FuX3N0YWtlX2RhdGEoZW52OiBFbnYsIGFydGlzYW46IEFkZHJlc3MpIC0+IFJlc3VsdDxBcnRpc2FuU3Rha2VEYXRhLCBFcnJvcj4gewogICAgICAgIGdldF9hcnRpc2FuX3N0YWtlX2RhdGEoZW52LCBhcnRpc2FuKQogICAgfQp9CgojW2NvbmZpZ10KZm4gY29uZmlnKCkge30KCiNbbm9fbWFuZ2xlXQpmbiBpbml0KGVudjogRW52LCBhZG1pbjogQWRkcmVzcykgewogICAgaWYgZW52LnN0b3JhZ2UoKS5wZXJzaXN0ZW50KCkuaGFzKCZzeW1ib2xfc2hvcnQoIkluaXQiKSkgewogICAgICAgIHBhbmljX3dpdGgoRXJyb3I6OkFscmVhZHlJbml0aWFsaXplZCk7CiAgICB9CiAgICBlbnYuc3RvcmFnZSgpLnBlcnNpc3RlbnQoKS5zZXQoJnN5bWJvbF9zaG9ydCgiSW5pdCIpLCAmdHJ1ZSk7CiAgICBlbnYuc3RvcmFnZSgpLnBlcnNpc3RlbnQoKS5zZXQoJnN5bWJvbF9zaG9ydCgiQWRtaW4iKSwgJmFkbWluKTsKfQoKI1tjZmddCnRlc3QgewogICAgdXNlIHN1cGVyOjoqOwogICAgdXNlIHNvcm9iYW5fc3RkOjpBZGRyZXNzOwoKICAgIGZuIHNldHVwKCkgLT4gKEVudiwgQWRkcmVzcykgewogICAgICAgIGxldCBlbnYgPSBFbnY6OmRlZmF1bHQoKTsKICAgICAgICBsZXQgYWRtaW4gPSBBZGRyZXNzOjpnZW5lcmF0ZSgmdGVzdHV0aWxzOjpyZWdpc3RlcihlbnYuY2xvbmUoKSwgInRlc3R1dGlscyIpKTsKICAgICAgICBlbnYubGVkZ2VyKCkuc2V0X3NlcXVlbmNlX251bWJlcigxKTsKICAgICAgICBlbnYubGVkZ2VyKCkuc2V0X3RpbWVzdGFtcCgxKTsKICAgICAgICBlbnYubGVkZ2VyKCkuc2V0X25ldHdvcmtfaWQoJFRFU1RORVQpOwogICAgICAgIGVudi5sZWRnZXIoKS5zZXRfYmFzZV9yZXNlcnZlKDEwMDAwMDAwKTsKICAgICAgICBlbnYubGVkZ2VyKCkuc2V0X21heF9lbnRyeV9saWZldGltZShQRVJTSVNURU5UX0xFR0VUX1RIUkVTSE9MRCsxKTsKICAgICAgICBlbnYubGVkZ2VyKCkuc2V0X21pbl9wZXJzaXN0ZW50X2VudHJ5X2xpZmV0aW1lKDEpOwogICAgICAgIGVudi5sZWRnZXIoKS5zZXRfbWluX3RlbXBvcmFyeV9lbnRyeV9saWZldGltZSgxKTsKICAgICAgICAoZW52LCBhZG1pbikKICAgIH0KCiAgICAjW3Rlc3RdCiAgICBmbiB0ZXN0X2dldF9hcnRpc2FuX3N0YWtlX2RhdGFfbWlzc2luZ19rZXkoKSB7CiAgICAgICAgbGV0IChlbnYsIF8pID0gc2V0dXAoKTsKICAgICAgICBsZXQgYXJ0aXNhbiA9IEFkZHJlc3M6OmdlbmVyYXRlKCZ0ZXN0dXRpbHM6OnJlZ2lzdGVyKGVudi5jbG9uZSgpLCAiYXJ0aXNhbiIpKTsKICAgICAgICBsZXQgcmVzdWx0ID0gZ2V0X2FydGlzYW5fc3Rha2VfZGF0YShlbnYuY2xvbmUoKSwgYXJ0aXNhbi5jbG9uZSgpKTsKICAgICAgICBhc3NlcnRfZXEocmVzdWx0LCBFcnIoRXJyb3I6Ok5vdEZvdW5kKSk7CiAgICB9CgogICAgI1t0ZXN0XQogICAgZm4gdGVzdF9nZXRfYXJ0aXNhbl9zdGFrZV9kYXRhX2FmdGVyX3Rlcm1pbmFsX3N0YXRlKCkgewogICAgICAgIGxldCAoZW52LCBfKSA9IHNldHVwKCk7CiAgICAgICAgbGV0IGFydGlzYW4gPSBBZGRyZXNzOjpnZW5lcmF0ZSgmdGVzdHV0aWxzOjpyZWdpc3RlcihlbnYuY2xvbmUoKSwgImFydGlzYW4iKSk7CiAgICAgICAgbGV0IHRva2VuID0gQWRkcmVzczo6Z2VuZXJhdGUoJnRlc3R1dGlsczo6cmVnaXN0ZXIoZW52LmNsb25lKCksICJ0b2tlbiIpKTsKICAgICAgICBsZXQgZGF0YSA9IEFydGlzYW5TdGFrZURhdGEgewogICAgICAgICAgICBhcnRpc2FuOiBhcnRpc2FuLmNsb25lKCksCiAgICAgICAgICAgIHRva2VuOiB0b2tlbi5jbG9uZSgpLAogICAgICAgICAgICBhbW91bnQ6IDEsCiAgICAgICAgICAgIHN0YWtlZF9hdDogMSwKICAgICAgICB9OwogICAgICAgIGVudi5zdG9yYWdlKCkucGVyc2lzdGVudCgpLnNldCgmKEFSVElTQU5fU1RBS0VfS0VZLCBhcnRpc2FuLmNsb25lKCkpLCAmZGF0YSk7CiAgICAgICAgbGV0IHJlc3VsdCA9IGdldF9hcnRpc2FuX3N0YWtlX2RhdGEoZW52LmNsb25lKCksIGFydGlzYW4uY2xvbmUoKSk7CiAgICAgICAgYXNzZXJ0X2VxKHJlc3VsdCwgT2soZGF0YSkpOwogICAgICAgIGVudi5zdG9yYWdlKCkucGVyc2lzdGVudCgpLnJlbW92ZSgmKEFSVElTQU5fU1RBS0VfS0VZLCBhcnRpc2FuLmNsb25lKCkpKTsKICAgICAgICBsZXQgcmVzdWx0X2FmdGVyID0gZ2V0X2FydGlzYW5fc3Rha2VfZGF0YShlbnYuY2xvbmUoKSwgYXJ0aXNhbi5jbG9uZSgpKTsKICAgICAgICBhc3NlcnRfZXEocmVzdWx0X2FmdGVyLCBFcnIoRXJyb3I6Ok5vdEZvdW5kKSk7CiAgICB9Cn0K
+#`!no_std]
+use sorban_sdk:{contract, contractimpl, address, Env, Address, String};
+
+/// Error types for the CraftNexus contract
+]error]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    Unauthorized = 3,
+    InvalidAmount = 4,
+    TokenNotWhitelisted = 5,
+    InsufficientStake = 6,
+    CooldownActive = 7,
+    NoStakeData = 8,
+    InvalidAddress = 9,
+}
+
+/// Artisan stake record stored in persistent storage
+#[derive(Clone, Debug, EqFq)]
+#[contracttype]
+pub struct ArtisanStakeData {
+    pub artisan: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub start_time: u64,
+}
+
+/// Stake record for a single deposit
+#[derive(Clone, Debug, EqFx)]
+#[contracttype]
+pub struct StakeRecord {
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Storage keys
+enum DataKey {
+    Admin,
+    PlatformWallet,
+    Arbitrator,
+    PlatformFeeBps,
+    OnboardingContract,
+    ArtisanStake(Address),
+    ArtisanStakeData(Address),
+}
+
+const STAK_COOLDOWN_SECS: u64 = 86400 * 7;
+const STACK_KEY_LEGET_TTL: u32 = 100;
+const STAK_DATA_KEY_LEGET_TTL: u32 = 100;
+
+#[contract]
+pub struct CraftNexusContract;
+
+#[contractimpl]
+impl CraftNexusContract {
+    pub fn initialize(
+        env: Env,
+        platform_wallet: Address,
+        admin: Address,
+        arbitrator: Address,
+        platform_fee_bps: u32,
+        onboarding_contract: Option<Address>,
+    ) {
+        let storage = env.storage();
+        if storage.has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        storage.set(&DataKey::Admin, &admin);
+        storage.set(&DataKey::PlatformWallet, &platform_wallet);
+        storage.set(&DataKey::Arbitrator, &arbitrator);
+        storage.set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        if let Some(contract) = onboarding_contract {
+            storage.set(&DataKey::OnboardingContract, &contract);
+        }
+    }
+
+    pub fn whitelist_token(env: Env, token: Address) {
+        env.storage().set(&(DataKey::TokenWhitelist, token.clone()), &true);
+    }
+
+    pub fn stake_tokens(env: Env, artisan: Address, token: Address, amount: i128) {
+        let storage = env.storage();
+        let whitelisted: bool = storage
+            .get(&(DataKey::TokenWhitelist, token.clone()))
+            .unwrap_or_default();
+        if !whitelisted {
+            panic!("token not whitelisted");
+        }
+        if amount <= 0 {
+            panic!("invalid amount");
+        }
+
+        let key = DataKey::ArtisanStake(artisan.clone());
+        let existing: i128 = storage.get(&key).unwrap_or(0);
+        let new_amount = existing + amount;
+        storage.set(&key, &new_amount);
+        env.storage().extend_ttl(&key, STAK_KEY_LEDGET_TTL, env.ledger().sequence());
+
+        let data_key = DataKey::ArtisanStakeData(artisan.clone());
+        let now = env.ledger.timestamp();
+        let data = ArtisanStakeData {
+            artisan: artisan.clone(),
+            token: token.clone(),
+            amount: new_amount,
+            start_time: now,
+        };
+        storage.set(&data_key, &data);
+        env.storage().extend_ttl(&data_key, STAK_DATA_KEY_LEDGER_TTL, env.ledger.sequence());
+    }
+
+    pub fn unstake_tokens(env: Env, artisan: Address, token: Address) {
+        let storage = env.storage();
+        let key = DataKey::ArtisanStake(artisan.clone());
+        let existing: i128 = storage.get(&key).unwrap_or(0);
+        if existing <= 0 {
+            panic!("no stake");
+        }
+
+        let data_key = DataKey::ArtisanStakeData(artisan.clone());
+        let data: ArtisanStakeData = storage.get(&data_key).unwrap();
+        let now = env.ledger.timestamp();
+        if now < data.start_time + STAPK_COOLDOWN_SECS {
+            panic!("cooldown active");
+        }
+
+        storage.remove(&key);
+        storage.remove(&data_key);
+    }
+
+    pub fn get_stake(env: Env, artisan: Address) -> i128 {
+        env.storage()
+            .get(&DataKey::ArtisanStake(artisan))
+            .unwrap_or(0)
+    }
+
+    pub fn get_artisan_stake_data(
+        env: Env,
+        artisan: Address,
+    ) -> Result<ArtisanStakeData, Error> {
+        let key = DataKey::ArtisanStakeData(artisan.clone());
+        let storage = env.storage();
+        match storage.get::<DataKey, ArtisanStakeData?(&key) {
+            Some(data) => {
+                env.storage().extend_ttl(
+                    &key,
+                    STAK_DATA_KEY_LEDGER_TTL,,
+                    env.ledger().sequence(),
+                );
+                Ok(data)
+            }
+            None => Err(Error::NoStakeData),
+        }
+    }
+}
+
+#[config(test)]
+mod test;

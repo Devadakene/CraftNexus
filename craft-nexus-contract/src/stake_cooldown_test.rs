@@ -1,9 +1,9 @@
-#![cfg(test)]
+#`!cfg(test)]
 extern crate std;
 
 use crate::{CraftNexusContract, CraftNexusContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils {Address as _, Ledger},
     token::Client as TokenClient,
     Address, Env,
 };
@@ -97,5 +97,34 @@ fn test_matured_deposits_remain_withdrawable() {
     assert_eq!(
         remaining_stake, 500,
         "Matured deposit was blocked by the new deposit"
+    );
+}
+
+#[test]
+fn test_get_artisan_stake_data_missing_key() {
+    let (_env, client, _, artisan, _token) = setup_env();
+
+    // Before any stake record exists, the call must not trap.
+    let result = client.try_get_artisan_stake_data(&artisan, &token.address);
+    assert!(
+        result.is_err(),
+        "get_artisan_stake_data should return a typed error for a missing key"
+    );
+}
+
+#[test]
+fn test_get_artisan_stake_data_after_terminal_state() {
+    let (env, client, _, artisan, token) = setup_env();
+
+    // Create a stake record, then drive it to a terminal state via unstake.
+    client.stake_tokens(&artisan, &token.address, &1000);
+    env.ledger().set_timestamp(env.ledger().timestamp() + (86400 * 7) + 1);
+    client.unstake_tokens(&artisan, &token.address);
+
+    // After the terminal state, the call must not trap and must return a typed error.
+    let result = client.try_get_artisan_stake_data(&artisan, &token.address);
+    assert!(
+        result.is_err(),
+        "get_artisan_stake_data should return a typed error after a terminal state"
     );
 }
