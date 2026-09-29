@@ -3870,6 +3870,85 @@ fn test_revision_bound_sybil_review_restricts_then_restores_access() {
 }
 
 #[test]
+fn test_canonical_onboarding_digest_acceptance_criteria() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_test(&env);
+
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+
+    client.onboard_user(
+        &user1,
+        &String::from_str(&env, "digest_user_one"),
+        &UserRole::Buyer,
+    );
+    client.onboard_user(
+        &user2,
+        &String::from_str(&env, "digest_user_two"),
+        &UserRole::Buyer,
+    );
+
+    // 1. Deterministic digest: identical state produces identical digest
+    let digest1_a = client.get_onboarding_digest(&user1);
+    let digest1_b = client.get_onboarding_digest(&user1);
+    assert_eq!(digest1_a, digest1_b);
+
+    // 2. Different account produces different digest
+    let digest2 = client.get_onboarding_digest(&user2);
+    assert_ne!(digest1_a, digest2);
+
+    // 3. Role change produces new revision and different digest
+    let rev_before = client.get_state_revision(&user1);
+    client.update_user_role(&user1, &UserRole::Artisan);
+    let rev_after_role = client.get_state_revision(&user1);
+    let digest_after_role = client.get_onboarding_digest(&user1);
+    assert_eq!(rev_after_role, rev_before + 1);
+    assert_ne!(digest1_a, digest_after_role);
+
+    // 4. Verification status change produces new revision and different digest
+    client.verify_user(&user1);
+    let rev_after_verify = client.get_state_revision(&user1);
+    let digest_after_verify = client.get_onboarding_digest(&user1);
+    assert_eq!(rev_after_verify, rev_after_role + 1);
+    assert_ne!(digest_after_role, digest_after_verify);
+
+    // 5. Activation status change (deactivation) produces new revision and different digest
+    let escrow = Address::generate(&env);
+    client.set_escrow_contract(&escrow);
+    env.mock_all_auths();
+    client.deactivate_profile(&user1);
+    let rev_after_deactivate = client.get_state_revision(&user1);
+    let digest_after_deactivate = client.get_onboarding_digest(&user1);
+    assert_eq!(rev_after_deactivate, rev_after_verify + 1);
+    assert_ne!(digest_after_verify, digest_after_deactivate);
+
+    // 6. Reactivation produces new revision and different digest
+    client.reactivate_profile(&user1);
+    let rev_after_reactivate = client.get_state_revision(&user1);
+    let digest_after_reactivate = client.get_onboarding_digest(&user1);
+    assert_eq!(rev_after_reactivate, rev_after_deactivate + 1);
+    assert_ne!(digest_after_deactivate, digest_after_reactivate);
+
+    // 7. Canonical field order and calculation verification
+    let profile = client.get_user(&user1);
+    let computed_digest = OnboardingContract::compute_canonical_onboarding_digest(
+        &env,
+        &profile.address,
+        profile.version,
+        profile.role,
+        profile.is_verified,
+        profile.status,
+        rev_after_reactivate,
+    );
+    assert_eq!(digest_after_reactivate, computed_digest);
+
+    // 8. Non-existent user query panics with UserNotFound
+    let non_existent = Address::generate(&env);
+    assert!(client.try_get_onboarding_digest(&non_existent).is_err());
+}
+
+#[test]
 fn test_sybil_review_rejects_unauthorized_and_stale_decisions() {
     let env = Env::default();
     env.mock_all_auths();
