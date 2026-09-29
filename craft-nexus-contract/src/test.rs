@@ -240,6 +240,9 @@ pub enum Error {
     /// would silently destroy value; rejected instead of settling for zero
     /// (#1088).
     ConversionOutputUnderflow = 110,
+    /// The maximum dispute duration has not been configured yet (missing
+    /// storage key after archival, partial migration, or first-run).
+    MaxDisputeDurationNotSet = 111,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
