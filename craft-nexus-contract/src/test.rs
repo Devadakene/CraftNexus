@@ -240,6 +240,11 @@ pub enum Error {
     /// would silently destroy value; rejected instead of settling for zero
     /// (#1088).
     ConversionOutputUnderflow = 110,
+    /// The deterministic fee policy version record is absent from persistent
+    /// storage. This happens after archival, a partial migration, or when the
+    /// key was never written. Callers should treat this as a recoverable
+    /// client error rather than trapping the host (#fee-policy).
+    FeePolicyVersionMissing = 111,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
