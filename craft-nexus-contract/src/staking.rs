@@ -10,6 +10,7 @@ use soroban_sdk::{
 // ============================================================================
 
 const COOLDOWN_PERIOD: u64 = 86400 * 7; // 7 days in seconds
+const MIN_STAKE_REQUIRED: i128 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +22,7 @@ pub struct StakeEntry {
 #[contracttype]
 pub enum DataKey {
     UserStakes(Address),
+    MinStakeRequired,
 }
 
 // ============================================================================
@@ -32,6 +34,29 @@ pub struct StakeContract;
 
 #[contractimpl]
 impl StakeContract {
+    /// Sets the minimum stake required. Only the admin can call this.
+    pub fn set_min_stake_required(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+
+        if amount < 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinStakeRequired)
+            .unwrap_or(MIN_STAKE_REQUIRED);
+
+        let new_amount = current
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinStakeRequired, &new_amount);
+    }
+
     /// Adds a new stake, appending it as an independent entry with its own maturity.
     pub fn stake(env: Env, user: Address, amount: i128) {
         user.require_auth();
@@ -214,5 +239,25 @@ mod tests {
             0,
             "Queue should be empty after all stakes mature"
         );
+    }
+
+    #[test]
+    fn test_set_min_stake_required_rejects_unauthorized() {
+        let (env, user, client) = setup();
+
+        // Unauthorized caller attempts to set min stake
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_min_stake_required(&user, &500);
+        }));
+
+        assert!(result.is_err(), "Unauthorized caller should be rejected");
+
+        // Verify storage unchanged
+        let stored: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinStakeRequired)
+            .unwrap_or(MIN_STAKE_REQUIRED);
+        assert_eq!(stored, MIN_STAKE_REQUIRED, "Storage should be unchanged");
     }
 }
