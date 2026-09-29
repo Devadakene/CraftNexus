@@ -19,6 +19,12 @@ pub struct StakeEntry {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeNotFound = 1,
+}
+
+#[contracttype]
 pub enum DataKey {
     UserStakes(Address),
 }
@@ -94,6 +100,28 @@ impl StakeContract {
             .persistent()
             .get(&DataKey::UserStakes(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Read-only function to inspect a user's current staked amount.
+    ///
+    /// Returns `Ok(0)` when the storage key is absent (e.g. after archival,
+    /// a partial migration, or a missing key) instead of trapping.
+    pub fn get_stake(env: Env, user: Address) -> Result<i128, Error> {
+        let key = DataKey::UserStakes(user);
+        env.storage().persistent().extend_persistent_read(&key);
+
+        let stakes: Vec<StakeEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total: i128 = 0;
+        for stake in stakes.into_iter() {
+            total += stake.amount;
+        }
+
+        Ok(total)
     }
 }
 
@@ -213,6 +241,37 @@ mod tests {
             empty_queue.len(),
             0,
             "Queue should be empty after all stakes mature"
+        );
+    }
+
+    #[test]
+    fn test_get_stake_missing_key_returns_zero() {
+        let (_env, user, client) = setup();
+
+        // No stake has ever been recorded for this user.
+        let result = client.get_stake(&user);
+        assert_eq!(
+            result, 0,
+            "get_stake must not trap when the storage key is missing"
+        );
+    }
+
+    #[test]
+    fn test_get_stake_after_terminal_state_returns_zero() {
+        let (env, user, client) = setup();
+
+        client.stake(&user, &1000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
+
+        let withdrawn = client.withdraw_matured(&user);
+        assert_eq!(withdrawn, 1000);
+
+        // After full withdrawal the queue is empty; get_stake must still be safe.
+        let result = client.get_stake(&user);
+        assert_eq!(
+            result, 0,
+            "get_stake must return an empty value after a terminal state"
         );
     }
 }
