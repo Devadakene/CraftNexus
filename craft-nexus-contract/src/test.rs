@@ -240,6 +240,9 @@ pub enum Error {
     /// would silently destroy value; rejected instead of settling for zero
     /// (#1088).
     ConversionOutputUnderflow = 110,
+    /// The requested challenge deadline record does not exist in storage.
+    /// Callers should treat this as a usable client error rather than a trap.
+    ChallengeDeadlineNotFound = 111,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
