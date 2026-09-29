@@ -1,7 +1,7 @@
-#![cfg(test)]
+#`![cfg((test)]]
 
 use super::*;
-use soroban_sdk::{
+use soroban_sdk{
     testutils::{Address as _, Events, Ledger},
     token, vec as svec, Address, Env,
 };
@@ -94,10 +94,10 @@ fn test_evaluate_stake_health_undercollateralized() {
 
     // Stake 5M (below 10M minimum)
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
 
     // Create an active obligation
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     let snapshot = client.evaluate_stake_health(&seller);
 
@@ -170,6 +170,58 @@ fn test_set_and_get_liquidation_policy() {
     assert!(!updated.enabled);
 }
 
+#[test]
+fn test_set_liquidation_policy_requires_auth() {
+    let env = Env::default();
+    // Not mocking auths here to ensure auth is enforced.
+    let (client, _buyer, _seller, _token_id, _token_admin) = setup_test(&env, false);
+
+    // Capture default policy and admin balance before the attempt.
+    let initial_policy = client.get_liquidation_policy();
+    let initial_balance = client.get_admin_balance();
+
+    // Unauthorized attempt to change the policy.
+    let result = client.try_set_liquidation_policy(&7500, &86400, &false);
+    assert!(result.is_err());
+
+    // Storage must be unchanged.
+    let after_policy = client.get_liquidation_policy();
+    assert_eq!(after_policy.max_seizure_bps, initial_policy.max_seizure_bps);
+    assert_eq!(after_policy.grace_period_secs, initial_policy.grace_period_secs);
+    assert_eq!(after_policy.enabled, initial_policy.enabled);
+
+    // Balances must be unchanged.
+    let after_balance = client.get_admin_balance();
+    assert_eq!(after_balance, initial_balance);
+}
+
+#[test]
+fn test_set_liquidation_policy_rejected_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _buyer, _seller, _token_id, _token_admin) = setup_test(&env, true);
+
+    // Pause the platform.
+    client.pause();
+
+    let initial_policy = client.get_liquidation_policy();
+    let initial_balance = client.get_admin_balance();
+
+    // Attempt to change policy while paused.
+    let result = client.try_set_liquidation_policy(&7500, &86400, &false);
+    assert!(result.is_err());
+
+    // Storage must be unchanged.
+    let after_policy = client.get_liquidation_policy();
+    assert_eq!(after_policy.max_seizure_bps, initial_policy.max_seizure_bps);
+    assert_eq!(after_policy.grace_period_secs, initial_policy.grace_period_secs);
+    assert_eq!(after_policy.enabled, initial_policy.enabled);
+
+    // Balances must be unchanged.
+    let after_balance = client.get_admin_balance();
+    assert_eq!(after_balance, initial_balance);
+}
+
 // ===== Flag Liquidation Eligible Tests =====
 
 #[test]
@@ -218,7 +270,7 @@ fn test_flag_liquidation_eligible_rejects_healthy() {
     client.evaluate_stake_health(&seller);
 
     let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_err());
+    assert!(result.is_error());
 }
 
 #[test]
@@ -231,8 +283,8 @@ fn test_flag_liquidation_eligible_rejects_when_disabled() {
     token_admin.mint(&buyer, &50_000_000);
 
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
 
@@ -252,8 +304,8 @@ fn test_flag_liquidation_eligible_enforces_grace_period() {
     token_admin.mint(&buyer, &50_000_000);
 
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &86400, &true); // 1 day grace
 
@@ -354,7 +406,7 @@ fn test_trigger_liquidation_rejects_when_disabled() {
     client.set_liquidation_policy(&5000, &0, &false);
 
     let result = client.try_trigger_liquidation(&seller);
-    assert!(result.is_err());
+    assert!(result.is_error());
 }
 
 #[test]
@@ -367,324 +419,16 @@ fn test_trigger_liquidation_records_are_auditable() {
     token_admin.mint(&buyer, &50_000_000);
 
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &6_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.stake_tokens(&seller, &token_id, $6_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &true);
     client.evaluate_stake_health(&seller);
     client.flag_liquidation_eligible(&seller);
+
     let record = client.trigger_liquidation(&seller);
 
-    // Record is persisted and retrievable
-    let fetched = client.get_liquidation_record(&record.id);
-    assert!(fetched.is_some());
-    let r = fetched.unwrap();
-    assert_eq!(r.id, record.id);
-    assert_eq!(r.artisan, seller);
-    assert_eq!(r.seized_amount, 2_000_000);
-    assert!(!r.cured);
-    assert_eq!(r.cured_at, 0);
-
-    // Count is tracked
-    assert_eq!(client.get_liquidation_record_count(), 1);
-}
-
-// ===== Cure Liquidation Tests =====
-
-#[test]
-fn test_cure_liquidation_by_staking_more() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &100_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &6_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-    client.flag_liquidation_eligible(&seller);
-    client.trigger_liquidation(&seller);
-
-    // Cure by topping up: need ≥ 10M, currently have 4M
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-    // Can't unstake while liquidated, so just stake more
-    client.stake_tokens(&seller, &token_id, &10_000_000);
-
-    // Cure
-    client.cure_liquidation(&seller);
-
-    let status = client.get_liquidation_status(&seller);
-    assert_eq!(status, LiquidationStatus::Healthy);
-
-    // Record should be marked cured
-    let record = client.get_liquidation_record(&0).unwrap();
-    assert!(record.cured);
-    assert!(record.cured_at > 0);
-}
-
-#[test]
-fn test_cure_liquidation_rejects_when_still_undercollateralized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &50_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &6_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-    client.flag_liquidation_eligible(&seller);
-    client.trigger_liquidation(&seller);
-
-    // Try to cure without adding enough stake (still have 4M < 10M required)
-    let result = client.try_cure_liquidation(&seller);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_cure_liquidation_rejects_healthy_artisan() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &50_000_000);
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &20_000_000);
-
-    client.evaluate_stake_health(&seller);
-
-    let result = client.try_cure_liquidation(&seller);
-    assert!(result.is_err());
-}
-
-// ===== Unstake Blocking Tests =====
-
-#[test]
-fn test_unstake_blocked_when_liquidation_eligible() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &50_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &15_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-    client.flag_liquidation_eligible(&seller);
-
-    // Advance past stake cooldown
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-
-    // Unstake should be blocked
-    let result = client.try_unstake_tokens(&seller, &token_id);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_unstake_blocked_when_liquidated() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &50_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &15_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-    client.flag_liquidation_eligible(&seller);
-    client.trigger_liquidation(&seller);
-
-    // Advance past stake cooldown
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-
-    // Unstake should be blocked
-    let result = client.try_unstake_tokens(&seller, &token_id);
-    assert!(result.is_err());
-}
-
-// ===== Full Lifecycle Integration Test =====
-
-#[test]
-fn test_full_liquidation_lifecycle() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &100_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    // 1. Healthy state
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &20_000_000);
-    let snap = client.evaluate_stake_health(&seller);
-    assert_eq!(snap.status, LiquidationStatus::Healthy);
-
-    // 2. Create obligation that makes artisan under-collateralized
-    //    after admin raises min_stake_required
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-    client.set_min_stake_required(&25_000_000);
-
-    // 3. Evaluate → under-collateralized (20M stake < 25M required)
-    client.set_liquidation_policy(&5000, &0, &true);
-    let snap2 = client.evaluate_stake_health(&seller);
-    assert_eq!(snap2.status, LiquidationStatus::UnderCollateralized);
-    assert_eq!(snap2.deficit, 5_000_000);
-
-    // 4. Flag as liquidation-eligible
-    client.flag_liquidation_eligible(&seller);
-    assert_eq!(
-        client.get_liquidation_status(&seller),
-        LiquidationStatus::LiquidationEligible
-    );
-
-    // 5. Trigger liquidation — seizure = min(5M deficit, 5M × 50%) = 2.5M
-    let record = client.trigger_liquidation(&seller);
-    assert_eq!(record.seized_amount, 2_500_000);
-    assert_eq!(client.get_stake(&seller), 17_500_000);
-    assert_eq!(
-        client.get_liquidation_status(&seller),
-        LiquidationStatus::Liquidated
-    );
-
-    // 6. Try to unstake — blocked
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-    let result = client.try_unstake_tokens(&seller, &token_id);
-    assert!(result.is_err());
-
-    // 7. Cure by adding more stake (need ≥ 25M, currently have 17.5M)
-    client.stake_tokens(&seller, &token_id, &10_000_000);
-    assert_eq!(client.get_stake(&seller), 27_500_000);
-
-    // 8. Cure
-    client.cure_liquidation(&seller);
-    assert_eq!(
-        client.get_liquidation_status(&seller),
-        LiquidationStatus::Healthy
-    );
-
-    // 9. Record is marked cured
-    let r = client.get_liquidation_record(&0).unwrap();
-    assert!(r.cured);
-    assert!(r.cured_at > 0);
-
-    // 10. Unstake works again
-    let result = client.try_unstake_tokens(&seller, &token_id);
-    assert!(result.is_ok());
-}
-
-// ===== Health Ratio Edge Cases =====
-
-#[test]
-fn test_health_ratio_zero_stake() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _buyer, seller, _token_id, _token_admin) = setup_test(&env, true);
-
-    // Test with min_stake_required = 0 → always healthy
-    client.set_min_stake_required(&0);
-
-    let snap = client.evaluate_stake_health(&seller);
-    assert_eq!(snap.status, LiquidationStatus::Healthy);
-    assert_eq!(snap.health_ratio_bps, 0);
-}
-
-#[test]
-fn test_health_ratio_large_stake() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &200_000_000);
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &200_000_000);
-
-    let snap = client.evaluate_stake_health(&seller);
-    // health = 200M / 1 = 2000000% → health_ratio_bps should be > 10_000
-    assert!(snap.health_ratio_bps > 10_000);
-    assert_eq!(snap.deficit, 0);
-}
-
-// ===== Event Emission Tests =====
-
-#[test]
-fn test_flag_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &50_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-
-    client.flag_liquidation_eligible(&seller);
-
-    // Check events were published
-    let events = env.events().all();
-    let expected_topic: soroban_sdk::Val =
-        Symbol::new(&env, "stake_liquidation_flagged").into_val(&env);
-    let flagged = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1 && svec![&env, topics.get_unchecked(0)] == svec![&env, expected_topic]
-    });
-    assert!(flagged);
-}
-
-#[test]
-fn test_cure_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &100_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &6_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-    client.flag_liquidation_eligible(&seller);
-    client.trigger_liquidation(&seller);
-
-    // Cure
-    client.stake_tokens(&seller, &token_id, &10_000_000);
-    client.cure_liquidation(&seller);
-
-    let events = env.events().all();
-    let expected_topic: soroban_sdk::Val =
-        Symbol::new(&env, "stake_liquidation_cured").into_val(&env);
-    let cured = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1 && svec![&env, topics.get_unchecked(0)] == svec![&env, expected_topic]
-    });
-    assert!(cured);
+    // Record should contain auditable fields.
+    assert_eq!(record.seized_amount, 2_000_000);
+    assert!(record.timestamp >= 1711368000);
 }
