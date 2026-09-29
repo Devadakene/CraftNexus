@@ -22244,7 +22244,10 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&buyer_index_key, &id);
                         Self::extend_persistent(&env, &buyer_index_key);
 
-                        buyer_next_counts.set(buyer_key, buyer_count + 1);
+                        let next_buyer_count = buyer_count
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                        buyer_next_counts.set(buyer_key, next_buyer_count);
 
                         if !seller_next_counts.contains_key(seller_key.clone()) {
                             let existing_count =
@@ -22259,7 +22262,10 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&seller_index_key, &id);
                         Self::extend_persistent(&env, &seller_index_key);
 
-                        seller_next_counts.set(seller_key, seller_count + 1);
+                        let next_seller_count = seller_count
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                        seller_next_counts.set(seller_key, next_seller_count);
 
                         // Emit batch event
                         let escrow_opt: Option<Escrow> =
