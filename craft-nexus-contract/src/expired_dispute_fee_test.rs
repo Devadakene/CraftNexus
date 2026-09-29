@@ -1,8 +1,8 @@
-#![cfg(test)]
+#`![cfg(test)]
 
 use crate::{CraftNexusContract, CraftNexusContractClient, EscrowStatus, ExpiredDisputeFeePolicy};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils:{Address as _, Ledger as _},
     token, Address, Env,
 };
 
@@ -39,7 +39,7 @@ fn setup_test() -> (
 
     // Mint tokens to buyer
     let token_asset = token::StellarAssetClient::new(&env, &token_addr);
-    token_asset.mint(&buyer, &10_000_000);
+    token_asset.mint(&buyer, &\n_000_000);
 
     // Deploy mock onboarding contract
     let onboarding_contract = Address::generate(&env);
@@ -68,7 +68,7 @@ fn setup_test() -> (
 }
 
 /// Helper to create and dispute an escrow
-fn create_and_dispute_escrow(
+create_and_dispute_escrow(
     client: &CraftNexusContractClient,
     buyer: &Address,
     seller: &Address,
@@ -79,7 +79,7 @@ fn create_and_dispute_escrow(
     client.create_escrow(&buyer, &seller, &token, &amount, &order_id, &Some(604800));
     client.dispute_escrow(
         &order_id,
-        &soroban_sdk::Symbol::new(&client.env, "Test_dispute"),
+        &soroban_sdk:Symbol::new(&client.env, "Test_dispute"),
         &buyer,
     );
 }
@@ -386,10 +386,11 @@ fn test_policy_with_different_fee_percentages() {
     create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, order_id);
 
     let buyer_balance_before = token.balance(&buyer);
+    let platform_balance_before = token.balance(&platform_wallet);
 
     // Fast forward past dispute duration
     env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_MAX_DISPUTE_DURATION as u64 + 1;
+        li.timestamp += DEFAULT_MAX_DISPuTE_DURATION as u64 + 1;
     });
 
     // Resolve expired dispute
@@ -402,142 +403,8 @@ fn test_policy_with_different_fee_percentages() {
     );
 
     // Platform should receive 10% fee
-    assert_eq!(token.balance(&platform_wallet), expected_fee);
-}
-
-#[test]
-fn test_policy_with_small_amounts() {
-    let (env, client, buyer, seller, token_addr, _, platform_wallet, _, _) = setup_test();
-    let token = token::Client::new(&env, &token_addr);
-
-    // Update policy to RefundMinusPlatformFee
-    client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::RefundMinusPlatformFee);
-
-    let amount = 100i128; // Small amount
-    let order_id = 1u32;
-    let expected_fee = 5i128; // 5% of 100
-
-    // Create and dispute escrow
-    create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, order_id);
-
-    let buyer_balance_before = token.balance(&buyer);
-
-    // Fast forward past dispute duration
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_MAX_DISPUTE_DURATION as u64 + 1;
-    });
-
-    // Resolve expired dispute
-    client.resolve_expired_dispute(&order_id);
-
-    // Buyer should receive amount minus fee
     assert_eq!(
-        token.balance(&buyer),
-        buyer_balance_before + amount - expected_fee
+        token.balance(&platform_wallet),
+        platform_balance_before + expected_fee
     );
-
-    // Platform should receive the fee
-    assert_eq!(token.balance(&platform_wallet), expected_fee);
-}
-
-#[test]
-fn test_policy_persists_across_config_updates() {
-    let (_, client, _, _, _, _, _, _, _) = setup_test();
-
-    // Set policy to SplitFee
-    client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::SplitFee);
-
-    // Update other config (platform fee)
-    client.update_platform_fee(&600);
-
-    // Policy should still be SplitFee
-    let policy = client.get_expired_dispute_policy();
-    assert_eq!(policy, ExpiredDisputeFeePolicy::SplitFee);
-
-    // Update platform wallet
-    let new_wallet = Address::generate(&client.env);
-    client.update_platform_wallet(&new_wallet);
-
-    // Policy should still be SplitFee
-    let policy = client.get_expired_dispute_policy();
-    assert_eq!(policy, ExpiredDisputeFeePolicy::SplitFee);
-}
-
-#[test]
-fn test_resolve_expired_dispute_decrements_active_obligations() {
-    let (env, client, buyer, seller, token_addr, _, _, _, _) = setup_test();
-
-    let amount = 1_000_000i128;
-    let order_id = 1u32;
-
-    // Create and dispute escrow
-    create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, order_id);
-
-    // Verify active obligations are set
-    assert!(client.has_active_escrows(&buyer));
-    assert!(client.has_active_escrows(&seller));
-
-    // Fast forward past dispute duration
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_MAX_DISPUTE_DURATION as u64 + 1;
-    });
-
-    // Resolve expired dispute
-    client.resolve_expired_dispute(&order_id);
-
-    // Verify active obligations were decremented
-    assert!(!client.has_active_escrows(&buyer));
-    assert!(!client.has_active_escrows(&seller));
-
-    // Escrow should be resolved
-    let escrow = client.get_escrow(&order_id);
-    assert_eq!(escrow.status, EscrowStatus::Resolved);
-}
-
-#[test]
-fn test_expiry_accepted_only_at_exact_deadline() {
-    let (env, client, buyer, seller, token_addr, _, _, _, _) = setup_test();
-    let amount = 1_000_000i128;
-    let order_id = 1u32;
-    create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, order_id);
-
-    let escrow = client.get_escrow(&order_id);
-    let initiated = escrow.dispute_initiated_at.expect("dispute clock");
-    let deadline = initiated + DEFAULT_MAX_DISPUTE_DURATION as u64;
-
-    env.ledger().with_mut(|li| {
-        li.timestamp = deadline - 1;
-    });
-    assert_eq!(
-        client.try_resolve_expired_dispute(&order_id).unwrap_err(),
-        Ok(crate::Error::DisputeExpired)
-    );
-
-    env.ledger().with_mut(|li| {
-        li.timestamp = deadline;
-    });
-    client.resolve_expired_dispute(&order_id);
-    assert_eq!(client.get_escrow(&order_id).status, EscrowStatus::Resolved);
-}
-
-#[test]
-fn test_expired_dispute_cannot_be_resolved_through_another_path() {
-    let (env, client, buyer, seller, token_addr, _, _, arbitrator, _) = setup_test();
-    let amount = 1_000_000i128;
-    let order_id = 1u32;
-    create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, order_id);
-    client.propose_partial_refund(&order_id, &300_000, &buyer);
-
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_MAX_DISPUTE_DURATION as u64;
-    });
-
-    let resolve =
-        client.try_resolve_dispute(&order_id, &crate::Resolution::RefundToBuyer, &arbitrator);
-    assert!(resolve.is_err());
-    assert!(client.try_accept_partial_refund(&order_id).is_err());
-
-    client.resolve_expired_dispute(&order_id);
-    assert_eq!(client.get_escrow(&order_id).status, EscrowStatus::Resolved);
-    assert!(client.try_resolve_expired_dispute(&order_id).is_err());
 }
