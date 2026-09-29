@@ -19,6 +19,12 @@ pub struct StakeEntry {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeHealthSnapshotNotFound = 1,
+}
+
+#[contracttype]
 pub enum DataKey {
     UserStakes(Address),
 }
@@ -94,6 +100,14 @@ impl StakeContract {
             .persistent()
             .get(&DataKey::UserStakes(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Read-only function to inspect a user's persisted stake health snapshot.
+    /// Returns `None` if `evaluate_stake_health` has never been called for the user.
+    pub fn get_stake_health_snapshot(env: Env, user: Address) -> Option<StakeEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserStakes(user))
     }
 }
 
@@ -214,5 +228,23 @@ mod tests {
             0,
             "Queue should be empty after all stakes mature"
         );
+    }
+
+    #[test]
+    fn test_get_stake_health_snapshot_missing_key_returns_none() {
+        let (env, user, client) = setup();
+
+        // No record exists yet: must not trap, must return None.
+        let snapshot = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot, None, "Missing snapshot should return None");
+
+        // After a terminal state (all stakes withdrawn), still safe.
+        client.stake(&user, &1000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
+        client.withdraw_matured(&user);
+
+        let snapshot_after = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot_after, None, "Snapshot should remain None");
     }
 }
