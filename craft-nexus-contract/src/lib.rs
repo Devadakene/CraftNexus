@@ -4815,6 +4815,24 @@ impl CraftNexusContract {
         0
     }
 
+    /// Read an artisan stake without performing the lazy legacy migration.
+    ///
+    /// Reconciliation queries are intentionally read-only, so they must not
+    /// call `migrate_legacy_artisan_stake`, which writes the converted record
+    /// and removes the legacy token key.
+    fn get_artisan_stake_read_only(env: &Env, artisan: Address) -> Option<ArtisanStakeData> {
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let token_key = DataKey::ArtisanStakeToken(artisan);
+
+        if env.storage().persistent().has(&token_key) {
+            let amount = env.storage().persistent().get(&stake_key)?;
+            let token = env.storage().persistent().get(&token_key)?;
+            return Some(ArtisanStakeData { amount, token });
+        }
+
+        env.storage().persistent().get(&stake_key)
+    }
+
     /// Get the count of stake deposits in an artisan's queue.
     ///
     /// Returns 0 if no deposits exist. This is more efficient than loading
@@ -14050,6 +14068,10 @@ impl CraftNexusContract {
         page: u32,
         page_size: u32,
     ) -> Result<ReconciliationReport, Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+        Self::check_not_paused(&env);
+
         // Validate pagination inputs
         let page_size =
             pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
@@ -14061,7 +14083,10 @@ impl CraftNexusContract {
         let total_escrows: u32 = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
 
         // Calculate page bounds
-        let end = page.saturating_add(page_size).min(total_escrows);
+        let end = page
+            .checked_add(page_size)
+            .ok_or(Error::CounterOverflow)?
+            .min(total_escrows);
 
         // Sum active escrow amounts for this page
         let mut expected_locked = 0i128;
@@ -14092,9 +14117,11 @@ impl CraftNexusContract {
                             | EscrowStatus::SettlementPending
                     )
                 {
-                    expected_locked = expected_locked.saturating_add(escrow.amount);
+                    expected_locked = expected_locked
+                        .checked_add(escrow.amount)
+                        .ok_or(Error::CounterOverflow)?;
                 }
-                scanned = scanned.saturating_add(1);
+                scanned = scanned.checked_add(1).ok_or(Error::CounterOverflow)?;
             }
         }
 
@@ -14113,11 +14140,13 @@ impl CraftNexusContract {
                     .get::<DataKey, RecurringEscrow>(&DataKey::RecurringEscrow(id))
                 {
                     if recurring.token == token && recurring.is_active {
-                        expected_locked = expected_locked.saturating_add(
-                            recurring
-                                .total_amount
-                                .saturating_sub(recurring.released_amount),
-                        );
+                        let remaining = recurring
+                            .total_amount
+                            .checked_sub(recurring.released_amount)
+                            .ok_or(Error::CounterUnderflow)?;
+                        expected_locked = expected_locked
+                            .checked_add(remaining)
+                            .ok_or(Error::CounterOverflow)?;
                     }
                 }
             }
@@ -14137,14 +14166,11 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
-                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
-                if let Some(stake) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
-                {
+                if let Some(stake) = Self::get_artisan_stake_read_only(&env, artisan) {
                     if stake.token == token {
-                        expected_staked = expected_staked.saturating_add(stake.amount);
+                        expected_staked = expected_staked
+                            .checked_add(stake.amount)
+                            .ok_or(Error::CounterOverflow)?;
                     }
                 }
             }
@@ -14169,9 +14195,12 @@ impl CraftNexusContract {
         // Check for discrepancies only when complete
         let mut unresolved = false;
         if complete {
+            let obligations = expected_locked
+                .checked_add(expected_staked)
+                .ok_or(Error::CounterOverflow)?;
             unresolved = expected_locked != tracked_locked
                 || expected_staked != tracked_staked
-                || balance < expected_locked.saturating_add(expected_staked);
+                || balance < obligations;
         }
 
         Ok(ReconciliationReport {

@@ -8230,6 +8230,118 @@ mod reconciliation_report_tests {
         assert_eq!(report.complete, true, "should be complete");
         assert_eq!(report.unresolved, false, "should not be unresolved");
     }
+
+    #[test]
+    fn test_query_requires_admin_auth_without_mutating_state() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+        env.set_auths(&[]);
+
+        let before_balance = token::Client::new(&env, &token_id).balance(&client.address);
+        let before_progress = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, i128>(&DataKey::ReconciliationProgress(token_id.clone()))
+        });
+
+        let result = client.try_query_reconciliation_report(&token_id, &0, &50);
+
+        assert!(result.is_err(), "missing admin authorization must be rejected");
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&client.address),
+            before_balance
+        );
+        assert_eq!(
+            env.as_contract(&client.address, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::ReconciliationProgress(token_id.clone()))
+            }),
+            before_progress
+        );
+    }
+
+    #[test]
+    fn test_query_rejects_paused_platform_without_mutating_state() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+        client.set_paused(&true);
+
+        let before_balance = token::Client::new(&env, &token_id).balance(&client.address);
+        let before_paused = client.is_paused();
+        let result = client.try_query_reconciliation_report(&token_id, &0, &50);
+
+        assert_panic_contract_error(result, Error::ContractPaused);
+        assert_eq!(client.is_paused(), before_paused);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&client.address),
+            before_balance
+        );
+    }
+
+    #[test]
+    fn test_query_rejects_recurring_amount_underflow() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RecurringEscrowCount, &1u64);
+            env.storage().persistent().set(
+                &DataKey::RecurringEscrow(1),
+                &RecurringEscrow {
+                    id: 1,
+                    buyer: Address::generate(&env),
+                    artisan: Address::generate(&env),
+                    token: token_id.clone(),
+                    total_amount: 0,
+                    released_amount: 1,
+                    frequency: 1,
+                    duration: 1,
+                    current_cycle: 0,
+                    last_release_time: 0,
+                    is_active: true,
+                },
+            );
+        });
+
+        let result = client.try_query_reconciliation_report(&token_id, &0, &50);
+        assert_panic_contract_error(result, Error::CounterUnderflow);
+    }
+
+    #[test]
+    fn test_query_rejects_recurring_amount_overflow() {
+        let env = Env::default();
+        let (client, _, _, _, _, token_id, _) = setup_test(&env, true);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RecurringEscrowCount, &2u64);
+            for (id, amount) in [(1u64, i128::MAX), (2u64, 1i128)] {
+                env.storage().persistent().set(
+                    &DataKey::RecurringEscrow(id),
+                    &RecurringEscrow {
+                        id,
+                        buyer: Address::generate(&env),
+                        artisan: Address::generate(&env),
+                        token: token_id.clone(),
+                        total_amount: amount,
+                        released_amount: 0,
+                        frequency: 1,
+                        duration: 1,
+                        current_cycle: 0,
+                        last_release_time: 0,
+                        is_active: true,
+                    },
+                );
+            }
+        });
+
+        let result = client.try_query_reconciliation_report(&token_id, &0, &50);
+        assert_panic_contract_error(result, Error::CounterOverflow);
+    }
 }
 
 // ============================================================
@@ -8376,4 +8488,41 @@ fn test_recurring_escrow_cancellation_refunds_unreleased_amount() {
 // ============================================================
 
 
+    let after = capture_differential_snapshot(
+        &env,
+        &client,
+        &token_client,
+        &token_id,
+        &buyer,
+        &seller,
+        &platform_wallet,
+        1,
+        2,
+        3,
+    );
 
+    assert_eq!(before, after);
+
+    // Error paths remain identical after migration.
+    let missing_before = client.try_refund(&9999).unwrap_err();
+    let missing_after = client.try_refund(&9999).unwrap_err();
+    assert_eq!(missing_before, missing_after);
+
+    let duplicate_before = client
+        .try_create_escrow(&buyer, &seller, &token_id, &1, &1, &None)
+        .unwrap_err();
+    let duplicate_after = client
+        .try_create_escrow(&buyer, &seller, &token_id, &1, &1, &None)
+        .unwrap_err();
+    assert_eq!(duplicate_before, duplicate_after);
+
+    // Invariant: every minted token is either in user wallets, the platform
+    // wallet, or the contract's own balance.
+    assert_eq!(
+        token_client.balance(&buyer)
+            + token_client.balance(&seller)
+            + token_client.balance(&platform_wallet)
+            + token_client.balance(&client.address),
+        total_supply
+    );
+}
