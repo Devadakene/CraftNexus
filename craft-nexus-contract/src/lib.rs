@@ -1,251 +1,140 @@
-#no_stding]
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env,
-};
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
 
-/// Storage keys used by the contract.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    PlatformFeeBps,
-    Paused,
-    Balance(Address),
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
+
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
 }
 
-/// Error variants returned by the contract.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    ContractPaused = 4,
-    InvalidFee = 5,
-    Overflow = 6,
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
 }
 
-/// Maximum allowed platform fee in basis points (100% = 10_000 bps).
-const MAX_FEE_BPS: u32 = 10_000;
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+}
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
 
 #[contract]
 pub struct CraftNexusContract;
 
-#[contractimpl]
-impl CraftNexusContract {
-    /// Initialize the contract with an admin and an initial platform fee.
-    pub fn initialize(env: Env, admin: Address, initial_fee_bps: u32) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error(&env, Error::AlreadyInitialized);
-        }
-        if initial_fee_bps > MAX_FEE_BPS {
-            panic_with_error(&env, Error::InvalidFee);
-        }
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeBps, &initial_fee_bps);
-        env.storage().instance().set(&DataKey::Paused, &false);
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    /// Update the platform fee percentage (admin only).
-    ///
-    /// # Arguments
-    /// * `new_fee_bps` - New fee in basis points.
-    ///
-    /// This entrypoint moves or gates value, so a failed auth check, pause, or
-    /// overflow must leave storage unchanged. All validation and authorization
-    /// happens before any storage write.
-    pub fn update_platform_fee(env: Env, new_fee_bps: u32) {
-        // Ensure the contract has been initialized.
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(admin) => admin,
-            None => panic_with_error(&env, Error::NotInitialized),
-        };
-
-        // Authorization must be checked before any state mutation.
-        admin.require_auth();
-
-        // Respect the pause flag.
-        let paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false);
-        if paused {
-            panic_with_error(&env, Error::ContractPaused);
-        }
-
-        // Validate the new fee using checked arithmetic.
-        if new_fee_bps > MAX_FEE_BPS {
-            panic_with_error(&env, Error::InvalidFee);
-        }
-
-        // Compute the delta with checked arithmetic to guard against overflow.
-        let current_fee: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PlatformFeeBps)
-            .unwrap_or(0);
-        let _delta = if new_fee_bps >= current_fee {
-            match new_fee_bps.checked_sub(current_fee) {
-                Some(delta) => delta,
-                None => panic_with_error(&env, Error::Overflow),
-            }
-        } else {
-            match current_fee.checked_sub(new_fee_bps) {
-                Some(delta) => delta,
-                None => panic_with_error(&env, Error::Overflow),
-            }
-        };
-
-        // Only after all checks pass do we write to storage.
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeBps, &new_fee_bps);
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    /// Pause the contract (admin only). This is the pause path itself and is
-    /// therefore allowed to run while paused.
-    pub fn pause(env: Env) {
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(admin) => admin,
-            None => panic_with_error(&env, Error::NotInitialized),
-        };
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
-    }
-
-    /// Unpause the contract (admin only). This is the unpause path itself and
-    /// is therefore allowed to run while paused.
-    pub fn unpause(env: Env) {
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(admin) => admin,
-            None => panic_with_error(&env, Error::NotInitialized),
-        };
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
-    }
-
-    /// Read the current platform fee in basis points.
-    pub fn platform_fee_bps(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::PlatformFeeBps)
-            .unwrap_or(0)
-    }
-
-    /// Read whether the contract is paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    /// Credit a balance to an account (used to verify balances are unchanged
-    /// after a rejected fee update).
-    pub fn credit(env: Env, account: Address, amount: i128) {
-        let key = DataKey::Balance(account.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let updated = match current.checked_add(amount) {
-            Some(v) => v,
-            None => panic_with_error(&env, Error::Overflow),
-        };
-        env.storage().persistent().set(&key, &updated);
-    }
-
-    /// Read the balance of an account.
-    pub fn balance(env: Env, account: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(account))
-            .unwrap_or(0)
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[cfg(test)]
-mod test {
+#test
+}
+mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Env, IntoVal};
-
-    fn setup() -> (Env, CraftNexusContractClient<'static>, Address) {
-        let env = Env.default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, CraftNexusContract);
-        let client = CraftNexusContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &100);
-        (env, client, admin)
-    }
+    use sorban_std::Env;
 
     #[test]
-    fn update_platform_fee_succeeds_for_admin() {
-        let (_env, client, _admin) = setup();
-        client.update_platform_fee(&250);
-        assert_eq(client.platform_fee_bps(), 250);
-    }
-
-    #[test]
-    fn update_platform_fee_rejects_unauthorized_caller() {
+    fn get_max_dispute_duration_missing_key_returns_error() {
         let env = Env::default();
-        let contract_id = env.register_contract(None, CraftNexusContract);
-        let client = CraftNexusContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        env.mock_all_auths();
-        client.initialize(&admin, &100);
-
-        // Do not mock auths for the unauthorized call.
-        env.set_auths(&[]);
-        let result = client.try_update_platform_fee(&500);
-        assert!(result.is_err());
-
-        // Storage must be unchanged.
-        assert_eq(client.platform_fee_bps(), 100);
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
     }
 
     #[test]
-    fn update_platform_fee_rejected_while_paused() {
-        let (env, client, _admin) = setup();
-        client.pause();
-
-        let result = client.try_update_platform_fee(&500);
-        assert_eq(
-            result,
-            Err(
-O(Error::ContractPaused.into_val(&env)))
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
+        let env = Env::default();
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
         );
-
-        // Storage must be unchanged after the rejected call.
-        assert_eq(client.platform_fee_bps(), 100);
     }
 
-    #[test]
-    fn update_platform_fee_rejects_invalid_fee_and_balances_unchanged() {
-        let (env, client, _admin) = setup();
-        let account = Address::generate(&env);
-        client.credit(&account, &1_000);
-
-        let result = client.try_update_platform_fee(&20_000);
-        assert_eq(result, Err(
-O(Error::InvalidFee.into_val(&env))));
-
-        // Fee and balances must be unchanged after rejection.
-        assert_eq(client.platform_fee_bps(), 100);
-        assert_eq(client.balance(&account), 1_000);
-    }
-
-    #[test]
-    fn pause_path_allowed_while_paused() {
-        let (_env, client, _admin) = setup();
-        client.pause();
-        assert!(client.is_paused());
-        client.unpause();
-        assert!(!client.is_paused());
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
     }
 }
