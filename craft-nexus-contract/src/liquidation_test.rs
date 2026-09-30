@@ -1,4 +1,4 @@
-#`![cfg((test)]]
+#`![config(-test)]]
 
 use super::*;
 use soroban_sdk::{
@@ -68,11 +68,11 @@ fn test_evaluate_stake_health_healthy_no_obligations() {
     env.mock_all_auths();
     let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
 
     // Stake above minimum
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &20_000_000);
 
     let snapshot = client.evaluate_stake_health(&seller);
 
@@ -80,7 +80,7 @@ fn test_evaluate_stake_health_healthy_no_obligations() {
     assert_eq(snapshot.current_stake, 20_000_000);
     assert_eq(snapshot.active_obligations, 0);
     assert_eq(snapshot.deficit, 0);
-    assert!(snapshot.health_ratio_bps >= 10_000);
+    assert(snapshot.health_ratio_bps >= 10_000);
 }
 
 #[test]
@@ -89,12 +89,12 @@ fn test_evaluate_stake_health_undercollateralized() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    // Stake 5M (below 10M minimum)
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    // Stake 5M (5000000) - below 10M (10000000) minimum
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
 
     // Create an active obligation
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
@@ -116,14 +116,14 @@ fn test_evaluate_stake_health_returns_persisted_snapshot() {
     env.mock_all_auths();
     let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &20_000_000);
 
     client.evaluate_stake_health(&seller);
 
     let persisted = client.get_stake_health_snapshot(&seller);
-    assert!(persisted.is_some());
+    assert(persisted.is_some());
     let snap = persisted.unwrap();
     assert_eq(snap.status, LiquidationStatus::Healthy);
     assert_eq(snap.current_stake, 20_000_000);
@@ -135,9 +135,9 @@ fn test_evaluate_stake_health_deterministic() {
     env.mock_all_auths();
     let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
 
     // Two evaluations at the same timestamp should return identical results.
     let snap1 = client.evaluate_stake_health(&seller);
@@ -158,7 +158,7 @@ fn test_set_and_get_liquidation_policy() {
 
     // Default policy
     let policy = client.get_liquidation_policy();
-    assert!(policy.enabled);
+    assert(policy.enabled);
     assert_eq(policy.max_seizure_bps, 5000);
     assert_eq(policy.grace_period_secs, 2 * 24 * 60 * 60);
 
@@ -167,7 +167,7 @@ fn test_set_and_get_liquidation_policy() {
     let updated = client.get_liquidation_policy();
     assert_eq(updated.max_seizure_bps, 7500);
     assert_eq(updated.grace_period_secs, 86400);
-    assert!(!updated.enabled);
+    assert(!updated.enabled);
 }
 
 // ===== Flag Liquidation Eligible Tests =====
@@ -178,11 +178,11 @@ fn test_flag_liquidation_eligible_requires_admin() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     // Evaluate health to establish under-collateralized state
@@ -211,14 +211,14 @@ fn test_flag_liquidation_eligible_rejects_healthy() {
     env.mock_all_auths();
     let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &token_id, &50_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &20_000_000);
 
     client.evaluate_stake_health(&seller);
 
     let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_err());
+    assert(result.is_err());
 }
 
 #[test]
@@ -227,11 +227,11 @@ fn test_flag_liquidation_eligible_rejects_when_disabled() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
@@ -239,7 +239,7 @@ fn test_flag_liquidation_eligible_rejects_when_disabled() {
     client.evaluate_stake_health(&seller);
 
     let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_error());
+    assert(result.is_err());
 }
 
 #[test]
@@ -248,11 +248,11 @@ fn test_flag_liquidation_eligible_enforces_grace_period() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &86400, &true); // 1 day grace
@@ -262,7 +262,7 @@ fn test_flag_liquidation_eligible_enforces_grace_period() {
 
     // Try immediately — should fail (grace period not elapsed)
     let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_error());
+    assert(result.is_error());
 
     // Advance past grace period
     env.ledger().with_mut(|li| {
@@ -287,11 +287,11 @@ fn test_trigger_liquidation_capped_at_deficit() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &6_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     // Set grace period to 0 so we can flag immediately
@@ -323,14 +323,14 @@ fn test_trigger_liquidation_rejects_healthy() {
     env.mock_all_auths();
     let (client, _buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &20_000_000);
 
     client.evaluate_stake_health(&seller);
 
     let result = client.try_trigger_liquidation(&seller);
-    assert!(result.is_error());
+    assert(result.is_err());
 }
 
 #[test]
@@ -339,11 +339,11 @@ fn test_trigger_liquidation_rejects_when_disabled() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
@@ -354,7 +354,7 @@ fn test_trigger_liquidation_rejects_when_disabled() {
     client.set_liquidation_policy(&5000, &0, &false);
 
     let result = client.try_trigger_liquidation(&seller);
-    assert!(result.is_err());
+    assert(result.is_err());
 }
 
 #[test]
@@ -363,65 +363,73 @@ fn test_trigger_liquidation_records_are_auditable() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &6_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &true);
     client.evaluate_stake_health(&seller);
     client.flag_liquidation_eligible(&seller);
 
-    // Before trigger, count should be 0
-    let count_before = client.get_liquidation_record_count();
-    assert_eq(count_before, 0);
+    let record = client.trigger_liquidation(&seller);
 
-    // Trigger liquidation
-    client.trigger_liquidation(&seller);
-
-    // After trigger, count should be 1
-    let count_after = client.get_liquidation_record_count();
-    assert_eq(count_after, 1);
-
-    // Record should be retrievable
-    let record = client.get_liquidation_record(&0);
-    assert!(record.is_some());
-    let rec = record.unwrap();
-    assert_eq(rec.seized_amount, 2_000_000);
+    // Record should be retrievable by ID
+    let fetched = client.get_liquidation_record(&record.id);
+    assert_eq(fetched.id, record.id);
+    assert_eq(fetched.seized_amount, record.seized_amount);
+    assert_eq(fetched.artisan, record.artisan);
+    assert_eq(fetched.status, LiquidationStatus::Liquidated);
 }
 
+// ===== get_liquidation_record Missing-Key Tests =====
+
 #[test]
-fn test_get_liquidation_record_count_missing_key() {
+fn test_get_liquidation_record_missing_key_returns_error() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _buyer, _seller, _token_id, _token_admin) = setup_test(&env, true);
+    let (client, _buyer, seller, _token_id, _token_admin) = setup_test(&env, true);
 
-    // Before any liquidation record exists, count should be 0 and not trap.
-    let count = client.get_liquidation_record_count();
-    assert_eq(count, 0);
+    // No liquidation has occurred for this artisan, so the record key is absent.
+    // The getter must not trap; it should return the typed Error variant.
+    let result = client.try_get_liquidation_record(&seller);
+    assert(result.is_err());
+    match result.unwrap_error() {
+        Ok(err) => assert_eq(err, Error::NotFound),
+        Err(_) => panic!("expected typed Error, got host trap"),
+    }
 }
 
 #[test]
-fn test_get_liquidation_record_count_after_terminal_state() {
+fn test_get_liquidation_record_after_terminal_state() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
 
-    token_admin.mint(&seller, &token::StellarAssetClient::new(&env, &token_id));
-    token_admin.mint(&buyer, &token::StellarAssetClient::new(&env, &token_id));
+    token_admin.mint(&seller, &token_id, &50_000_000);
+    token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &token::StellarAssetClient::new(&env, &token_id));
-    client.create_escrow(&buyer, &seller, &token_id, &token::StellarAssetClient::new(&env, &token_id), &2_000_000, &1, &None);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &6_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &true);
     client.evaluate_stake_health(&seller);
     client.flag_liquidation_eligible(&seller);
-    client.trigger_liquidation(&seller);
 
-    // After terminal state (liquidated), count should be 1.
-    let count = client.get_liquidation_record_count();
-    assert_eq(count, 1);
+    // Before trigger: no record exists yet.
+    let before = client.try_get_liquidation_record(&seller);
+    assert(before.is_error());
+
+    // Trigger liquidation to reach the terminal Liquidated state.
+    let record = client.trigger_liquidation(&seller);
+    assert_eq(client.get_liquidation_status(&seller), LiquidationStatus::Liquidated);
+
+    // After terminal state: record is retrievable and matches.
+    let after = client.get_liquidation_record(&record.id);
+    assert_eq(after.id, record.id);
+    assert_eq(after.seized_amount, record.seized_amount);
+    assert_eq(after.status, LiquidationStatus::Liquidated);
 }
