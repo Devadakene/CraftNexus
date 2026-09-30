@@ -193,6 +193,7 @@ pub impl CraftNexusContract {
         }
         env.storage().instance().set(&DataKey::Paused, &true);
     }
+}
 
     /// Unpause the contract. Only the admin may call this.
     pub fn unpause(env: Env, admin: Address) {
