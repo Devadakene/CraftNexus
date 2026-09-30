@@ -408,3 +408,14 @@ fn test_policy_with_different_fee_percentages() {
         platform_balance_before + expected_fee
     );
 }
+
+#[test]
+fn test_total_fees_for_missing_token_storage_returns_zero() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let token = Address::generate(&env);
+
+    let result = client.try_get_total_fees_for_token(&token);
+    assert!(matches!(result, Ok(Ok(0))));
+}
