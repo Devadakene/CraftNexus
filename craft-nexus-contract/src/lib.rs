@@ -1,107 +1,139 @@
-use soroban_std::{address, contract, contractimpl, contracttype, env";};
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-#[contracttype]
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
+
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
+
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
+}
+
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
+}
+
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
+#[contract]
 pub struct CraftNexusContract;
 
-/// Error types returned by the contract.
-#[contracterror]
-#[repr(u32)]
-pub enum Error {
-    /// The requested challenge deadline key is not present in storage.
-    ChallengeDeadlineNotFound = 1,
-    /// The challenge has already reached a terminal state.
-    ChallengeTerminal = 2,
-    /// The challenge deadline has not been initialized.
-    ChallengeDeaadlineNotInitialized = 3,
-}
-
-/// Storage key for the challenge deadline.
-const CHALLENGE_DEADLINE_KEY: symbol = symbol_SHORT("chal_dl");
-
-/// Storage key for the challenge terminal flag.
-const CHALLENGE_TERMINAL_KEY: symbol = symbol_SHORT("chal_term");
-
-#[contractimpl]
-imp CraftNexusContract {
-    /// Returns the stored challenge deadline, if any.
-    ///
-    /// This is safe to call after archival, a partial migration, or when the
-    /// key is simply missing. It returns the typed [`Error`] instead of panicking.
-    pub fn get_challenge_deadline(env: Env) -> Result<u64, Error> {
-        // If the challenge has reached a terminal state, the deadline is no
-        // longer available for clients.
-        if env
-            .storage()
-            .persistent()
-            .has(&CHALLENGE_TERMINAL_KEY)
-        {
-            return Err::ChallengeTerminal;
-        }
-
-        match env
-            .storage()
-            .persistent()
-            .get::<u64>(&CHALLENGE_DEADLINE_KEY)
-        {
-            Some(deadline) => {
-                // Extend the read TTL on this hot persistent key so it is cheaper
-                // to read on subsequent calls.
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&CHALLENGE_DEADLINE_KEY, 100, 1000);
-                Ok(deadline)
-            }
-            None => Err::ChallengeDeadlineNotFound,
-        }
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    /// Sets the challenge deadline in persistent storage.
-    pub fn set_challenge_deadline(env: Env, deadline: u64) {
-        env.storage()
-            .persistent()
-            .set(&CHALLENGE_DEADLINE_KEY, &deadline);
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    /// Marks the challenge as terminal and clears the deadline.
-    pub fn mark_challenge_terminal(env: Env) {
-        env.storage()
-            .persistent()
-            .set(&CHALLENGE_TERMINAL_KEY, &true);
-        env.storage()
-            .persistent()
-            .remove(&ChALLENGE_DEADLINE_KEY);
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[cfg]
-test module {
+#test
+}
+mod tests {
     use super::*;
-    use soroban_sdd::Env;
+    use sorban_std::Env;
 
-    /// Calling get_challenge_deadline before the record exists must not trap.
     #[test]
-    fn get_challenge_deadline_missing_key_returns_error() {
+    fn get_max_dispute_duration_missing_key_returns_error() {
         let env = Env::default();
-        let result = CraftNexusContract::get_challenge_deadline(env.clone());
-        assert_eq!(result, Err::ChallengeDeadlineNotFound);
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
     }
 
-    /// After a terminal state the deadline is no longer available.
     #[test]
-    fn get_challenge_deadline_after_terminal_returns_error() {
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
         let env = Env::default();
-        CraftNexusContract::set_challenge_deadline(env.clone(), 12345);
-        CraftNexusContract::mark_challenge_terminal(env.clone());
-        let result = CraftNexusContract::get_challenge_deadline(env.clone());
-        assert_eq!(result, Err::ChallengeTerminal);
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
+        );
     }
 
-    /// When the deadline is stored, it is returned and the TWL is extended.
-    #[test]
-    fn get_challenge_deadline_returns_stored_value() {
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
         let env = Env::default();
-        CraftNexusContract::set_challenge_deadline(env.clone(), 9999);
-        let result = CraftNexusContract::get_challenge_deadline(env.clone());
-        assert_eq!(result, Ok(9999));
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
     }
 }
