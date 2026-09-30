@@ -9,6 +9,7 @@ use soroban_sdk::{
     Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 extern crate alloc;
+use alloc::string::ToString;
 
 /// Centralised time-boundary policy for the contract.
 pub mod time_policy;
@@ -27,6 +28,8 @@ mod admin_idempotency_test;
 #[cfg(test)]
 mod arbitration_escalation_test;
 #[cfg(test)]
+mod diagnostic_scan_test;
+#[cfg(test)]
 mod dispute_escalation_timeout_test;
 #[cfg(test)]
 mod enhanced_features_test;
@@ -34,6 +37,8 @@ mod enhanced_features_test;
 mod event_snapshot_test;
 #[cfg(test)]
 mod expired_dispute_fee_test;
+#[cfg(test)]
+mod issue_1347_test;
 #[cfg(test)]
 mod liquidation_test;
 #[cfg(test)]
@@ -966,6 +971,14 @@ pub enum DataKey {
     ArchivalSummaryIndexed(u32),
     /// Next cursor for bounded/resumable archival compaction.
     ArchivalCompactionCursor,
+    /// Number of findings produced by the current or last diagnostic scan.
+    DiagnosticFindingCount,
+    /// Finding indexed by position in the current or last diagnostic scan.
+    DiagnosticFindingIndexed(u32),
+    /// Number of canonical records scanned so far in the active diagnostic pass.
+    DiagnosticScannedProgress,
+    /// Latest completed diagnostic scan report.
+    DiagnosticReport,
 }
 
 /// Emergency operation kinds: the four types of critical control operations
@@ -1325,6 +1338,29 @@ pub struct EscrowStateDiagnostic {
     pub status: EscrowStatus,
     pub is_consistent: bool,
     pub issue: EscrowStateIssue,
+}
+
+/// A single consistency finding from a bounded diagnostic scan.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DiagnosticFinding {
+    pub order_id: u32,
+    pub category: Address,
+    pub issue: EscrowStateIssue,
+}
+
+/// Result of a bounded, resumable pass over the canonical escrow index.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ContractDiagnosticReport {
+    pub scanned: u32,
+    pub findings_count: u32,
+    pub next_cursor: u32,
+    pub complete: bool,
+    pub ledger_sequence: u32,
+    pub report_digest: BytesN<32>,
 }
 
 /// Choice of resolution for a disputed escrow.
@@ -3147,7 +3183,7 @@ impl CraftNexusContract {
         env.storage()
             .instance()
             .set(&DataKey::LastAppliedAdminRevision, &expected_revision);
-        let next = current.saturating_add(1);
+        let next = current.checked_add(1).ok_or(Error::CounterOverflow)?;
         env.storage().instance().set(&DataKey::AdminRevision, &next);
         Ok(expected_revision)
     }
@@ -4813,6 +4849,24 @@ impl CraftNexusContract {
         }
 
         0
+    }
+
+    /// Read an artisan stake without performing the lazy legacy migration.
+    ///
+    /// Reconciliation queries are intentionally read-only, so they must not
+    /// call `migrate_legacy_artisan_stake`, which writes the converted record
+    /// and removes the legacy token key.
+    fn get_artisan_stake_read_only(env: &Env, artisan: Address) -> Option<ArtisanStakeData> {
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let token_key = DataKey::ArtisanStakeToken(artisan);
+
+        if env.storage().persistent().has(&token_key) {
+            let amount = env.storage().persistent().get(&stake_key)?;
+            let token = env.storage().persistent().get(&token_key)?;
+            return Some(ArtisanStakeData { amount, token });
+        }
+
+        env.storage().persistent().get(&stake_key)
     }
 
     /// Get the count of stake deposits in an artisan's queue.
@@ -9174,6 +9228,183 @@ impl CraftNexusContract {
         Self::inspect_escrow_state(&env, order_id)
     }
 
+    /// Scan the canonical escrow index in bounded, resumable pages.
+    ///
+    /// Starting at cursor 0 resets findings from any prior scan. Continue by
+    /// passing each report's `next_cursor` until `complete` is true. The scan
+    /// records diagnostic findings only; it never changes escrow or accounting
+    /// state and does not authorize repairs.
+    pub fn run_diagnostic_scan(
+        env: Env,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<ContractDiagnosticReport, Error> {
+        pagination_validation::validate_strict_limit(
+            limit,
+            pagination_validation::MAX_RECONCILE_LIMIT,
+        )?;
+        let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
+        let end = cursor.saturating_add(limit).min(total);
+
+        if cursor == 0 {
+            let stale_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DiagnosticFindingCount)
+                .unwrap_or(0);
+            for index in 0..stale_count {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::DiagnosticFindingIndexed(index));
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::DiagnosticFindingCount, &0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::DiagnosticScannedProgress, &0u32);
+        }
+
+        let mut findings_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DiagnosticFindingCount)
+            .unwrap_or(0);
+        let mut scanned: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DiagnosticScannedProgress)
+            .unwrap_or(0);
+
+        for index in cursor..end {
+            let Some(order_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::GlobalEscrowIdIndexed(index))
+            else {
+                continue;
+            };
+            let diagnostic = Self::inspect_escrow_state(&env, order_id);
+            scanned = scanned.saturating_add(1);
+            if !diagnostic.is_consistent {
+                let category = env
+                    .storage()
+                    .persistent()
+                    .get::<(Symbol, u32), Escrow>(&(ESCROW, order_id))
+                    .map(|escrow| escrow.token)
+                    .unwrap_or_else(|| env.current_contract_address());
+                let finding_key = DataKey::DiagnosticFindingIndexed(findings_count);
+                env.storage().persistent().set(
+                    &finding_key,
+                    &DiagnosticFinding {
+                        order_id,
+                        category,
+                        issue: diagnostic.issue,
+                    },
+                );
+                Self::extend_persistent(&env, &finding_key);
+                findings_count = findings_count.saturating_add(1);
+            }
+        }
+
+        let complete = end >= total;
+        env.storage()
+            .persistent()
+            .set(&DataKey::DiagnosticFindingCount, &findings_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DiagnosticScannedProgress, &scanned);
+        Self::extend_persistent(&env, &DataKey::DiagnosticFindingCount);
+        Self::extend_persistent(&env, &DataKey::DiagnosticScannedProgress);
+
+        let ledger_sequence = env.ledger().sequence();
+        let report_digest = Self::diagnostic_report_digest(
+            &env,
+            scanned,
+            findings_count,
+            end,
+            complete,
+            ledger_sequence,
+        );
+        let report = ContractDiagnosticReport {
+            scanned,
+            findings_count,
+            next_cursor: end,
+            complete,
+            ledger_sequence,
+            report_digest,
+        };
+
+        if complete {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DiagnosticReport, &report);
+            Self::extend_persistent(&env, &DataKey::DiagnosticReport);
+        }
+
+        Ok(report)
+    }
+
+    fn diagnostic_report_digest(
+        env: &Env,
+        scanned: u32,
+        findings_count: u32,
+        next_cursor: u32,
+        complete: bool,
+        ledger_sequence: u32,
+    ) -> BytesN<32> {
+        let mut payload = Bytes::from_slice(env, b"CRAFTNEXUS_DIAGNOSTIC_SCAN_V1");
+        let contract_string = env.current_contract_address().to_string();
+        let mut contract_bytes = [0u8; 64];
+        let contract_len = contract_string.len() as usize;
+        payload.extend_from_slice(&(contract_len as u32).to_be_bytes());
+        contract_string.copy_into_slice(&mut contract_bytes[..contract_len]);
+        payload.extend_from_slice(&contract_bytes[..contract_len]);
+        payload.extend_from_slice(&scanned.to_be_bytes());
+        payload.extend_from_slice(&findings_count.to_be_bytes());
+        payload.extend_from_slice(&next_cursor.to_be_bytes());
+        payload.push_back(if complete { 1 } else { 0 });
+        payload.extend_from_slice(&ledger_sequence.to_be_bytes());
+        env.crypto().sha256(&payload).into()
+    }
+
+    /// Read the most recently completed diagnostic scan report, if any.
+    pub fn get_diagnostic_report(env: Env) -> Option<ContractDiagnosticReport> {
+        env.storage().persistent().get(&DataKey::DiagnosticReport)
+    }
+
+    /// Return a bounded page of findings from the current or last scan.
+    pub fn get_diagnostic_findings(
+        env: Env,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<Vec<DiagnosticFinding>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ADMIN_PAGE_SIZE,
+        )?;
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DiagnosticFindingCount)
+            .unwrap_or(0);
+        if start_index >= count {
+            return Ok(Vec::new(&env));
+        }
+        let end_index = start_index.saturating_add(limit).min(count);
+        let mut findings = Vec::new(&env);
+        for index in start_index..end_index {
+            if let Some(finding) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DiagnosticFinding>(&DataKey::DiagnosticFindingIndexed(index))
+            {
+                findings.push_back(finding);
+            }
+        }
+        Ok(findings)
+    }
+
     /// Read the immutable fund-movement audit history for an account.
     pub fn get_fund_audit_history(env: Env, actor: Address) -> Vec<FundMovementAuditEntry> {
         let count_key = DataKey::FundAuditCount(actor.clone());
@@ -10366,10 +10597,19 @@ impl CraftNexusContract {
         Self::timeout_outcome(config.expired_dispute_fee_policy)
     }
 
-    /// Read the configured escalation checkpoint schedule (#1080).
-    pub fn get_escalation_checkpoints(env: Env) -> EscalationCheckpoints {
-        let config = Self::get_platform_config_internal(&env);
-        Self::escalation_checkpoints(&env, &config)
+    /// Read the explicitly configured escalation checkpoint schedule (#1080).
+    ///
+    /// Returns `None` when no schedule is stored. Dispute processing continues
+    /// to use the platform defaults in that case.
+    pub fn get_escalation_checkpoints(env: Env) -> Option<EscalationCheckpoints> {
+        let key = DataKey::EscalationCheckpoints;
+        match env.storage().persistent().get(&key) {
+            Some(checkpoints) => {
+                Self::extend_persistent_read(&env, &key);
+                Some(checkpoints)
+            }
+            None => None,
+        }
     }
 
     /// Configure the escalation checkpoint schedule (admin only) (#1080).
@@ -10476,7 +10716,12 @@ impl CraftNexusContract {
         let mut config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
         Self::check_not_paused(&env);
-        Self::check_not_paused(&env);
+
+        // Match the escalation-checkpoint policy: a party checkpoint must be
+        // positive and strictly before the final dispute deadline.
+        if window == 0 || window >= config.max_dispute_duration {
+            env.panic_with_error(Error::InvalidEscalationPolicy);
+        }
 
         let mut checkpoints = Self::escalation_checkpoints(&env, &config);
         checkpoints.party_checkpoint = window;
@@ -11277,32 +11522,30 @@ impl CraftNexusContract {
         env: Env,
         params: soroban_sdk::Vec<EscrowCreateParams>,
     ) -> Result<soroban_sdk::Vec<u64>, Error> {
-        let _guard = ReentryGuardScope::new(&env);
         Self::check_not_paused(&env);
-
-        let mut authorized_buyers: Map<Address, u32> = Map::new(&env);
-        for i in 0..params.len() {
-            if let Some(p) = params.get(i) {
-                let buyer_key = p.buyer.clone();
-                if !authorized_buyers.contains_key(buyer_key.clone()) {
-                    buyer_key.require_auth();
-                    authorized_buyers.set(buyer_key, 1u32);
-                }
-            }
-        }
 
         let batch_id = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "next_batch_id"))
             .unwrap_or(1u64);
-        let next_batch_id = batch_id.checked_add(1).unwrap_or_else(|| {
-            soroban_sdk::panic_with_error!(&env, Error::CounterOverflow)
-        });
+
+        // Let the shared helper handle pause checks, buyer authorization, and
+        // the reentrancy guard. Empty batches are successful no-ops and do not
+        // consume an ID.
+        if params.is_empty() {
+            return Self::create_batch_escrow(env, batch_id, params);
+        }
+
+        // Compute the next ID before any escrow or balance changes, but persist
+        // it only after the helper has succeeded. A rejected batch must not
+        // consume an ID.
+        let next_batch_id = batch_id.checked_add(1).ok_or(Error::CounterOverflow)?;
+        let results = Self::create_batch_escrow(env.clone(), batch_id, params)?;
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "next_batch_id"), &next_batch_id);
-        Self::create_batch_escrow(env.clone(), batch_id, params)
+        Ok(results)
     }
 
     pub fn create_batch_escrow(
@@ -11377,6 +11620,122 @@ impl CraftNexusContract {
                         env.storage().persistent().get(&count_key).unwrap_or(0u32);
                     seller_count_state.set(seller_key.clone(), existing_count);
                 }
+            }
+        }
+
+        // Every counter failure must be detected before the first escrow write
+        // or token transfer. Later writes in the batch use the same additions,
+        // so all checked increments below are guaranteed to fit.
+        Self::get_persistent_u32(&env, &DataKey::EscrowCount)
+            .checked_add(escrows.len())
+            .ok_or(Error::CounterOverflow)?;
+
+        let mut buyer_additions: Map<Address, u32> = Map::new(&env);
+        let mut seller_additions: Map<Address, u32> = Map::new(&env);
+        let mut obligation_additions: Map<Address, u32> = Map::new(&env);
+        let mut audit_additions: Map<Address, u32> = Map::new(&env);
+        let mut locked_additions: Map<Address, i128> = Map::new(&env);
+
+        for i in 0..escrows.len() {
+            if let Some(params) = escrows.get(i) {
+                let buyer_count = buyer_additions
+                    .get(params.buyer.clone())
+                    .unwrap_or(0u32)
+                    .checked_add(1)
+                    .ok_or(Error::CounterOverflow)?;
+                buyer_additions.set(params.buyer.clone(), buyer_count);
+
+                let seller_count = seller_additions
+                    .get(params.seller.clone())
+                    .unwrap_or(0u32)
+                    .checked_add(1)
+                    .ok_or(Error::CounterOverflow)?;
+                seller_additions.set(params.seller.clone(), seller_count);
+
+                for account in [params.buyer.clone(), params.seller.clone()] {
+                    let count = obligation_additions
+                        .get(account.clone())
+                        .unwrap_or(0u32)
+                        .checked_add(1)
+                        .ok_or(Error::CounterOverflow)?;
+                    obligation_additions.set(account, count);
+                }
+
+                let audit_count = audit_additions
+                    .get(params.buyer.clone())
+                    .unwrap_or(0u32)
+                    .checked_add(1)
+                    .ok_or(Error::CounterOverflow)?;
+                audit_additions.set(params.buyer.clone(), audit_count);
+
+                let locked_amount = locked_additions
+                    .get(params.token.clone())
+                    .unwrap_or(0i128)
+                    .checked_add(params.amount)
+                    .ok_or(Error::CounterOverflow)?;
+                locked_additions.set(params.token.clone(), locked_amount);
+            }
+        }
+
+        for i in 0..buyer_additions.len() {
+            if let Some(buyer) = buyer_additions.keys().get(i) {
+                let current = buyer_count_state.get(buyer.clone()).unwrap_or(0u32);
+                let additions = buyer_additions.get(buyer).unwrap_or(0u32);
+                current
+                    .checked_add(additions)
+                    .ok_or(Error::CounterOverflow)?;
+            }
+        }
+
+        for i in 0..seller_additions.len() {
+            if let Some(seller) = seller_additions.keys().get(i) {
+                let current = seller_count_state.get(seller.clone()).unwrap_or(0u32);
+                let additions = seller_additions.get(seller).unwrap_or(0u32);
+                current
+                    .checked_add(additions)
+                    .ok_or(Error::CounterOverflow)?;
+            }
+        }
+
+        for i in 0..obligation_additions.len() {
+            if let Some(account) = obligation_additions.keys().get(i) {
+                let current: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::ActiveObligations(account.clone()))
+                    .unwrap_or(0u32);
+                let additions = obligation_additions.get(account).unwrap_or(0u32);
+                current
+                    .checked_add(additions)
+                    .ok_or(Error::CounterOverflow)?;
+            }
+        }
+
+        for i in 0..audit_additions.len() {
+            if let Some(actor) = audit_additions.keys().get(i) {
+                let current: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FundAuditCount(actor.clone()))
+                    .unwrap_or(0u32);
+                let additions = audit_additions.get(actor).unwrap_or(0u32);
+                current
+                    .checked_add(additions)
+                    .ok_or(Error::CounterOverflow)?;
+            }
+        }
+
+        for i in 0..locked_additions.len() {
+            if let Some(token) = locked_additions.keys().get(i) {
+                let current: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TotalLocked(token.clone()))
+                    .unwrap_or(0i128);
+                let additions = locked_additions.get(token).unwrap_or(0i128);
+                current
+                    .checked_add(additions)
+                    .ok_or(Error::CounterOverflow)?;
             }
         }
 
@@ -11943,6 +12302,10 @@ impl CraftNexusContract {
         if fee_bps > MAX_PLATFORM_FEE_BPS {
             env.panic_with_error(crate::Error::InvalidFee);
         }
+
+        // Pause is a write gate. Check it before the admin-mutation fingerprint
+        // or fee-tier storage can be changed.
+        Self::check_not_paused(&env);
 
         let mut payload = artisan.clone().to_xdr(&env);
         payload.extend_from_slice(&fee_bps.to_be_bytes());
@@ -13261,13 +13624,18 @@ impl CraftNexusContract {
         Self::migrate_legacy_all_escrow_ids(&env);
 
         let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
-        let start = page * limit;
+        let Some(start) = page.checked_mul(limit) else {
+            // A page offset beyond the representable range is necessarily past
+            // every addressable escrow index. Treat it like any other
+            // out-of-range page rather than allowing multiplication to wrap.
+            return Ok(soroban_sdk::Vec::new(&env));
+        };
 
         if start >= total {
             return Ok(soroban_sdk::Vec::new(&env));
         }
 
-        let end = (start + limit).min(total);
+        let end = start.saturating_add(limit).min(total);
         let mut result = soroban_sdk::Vec::new(&env);
 
         for index in start..end {
@@ -14009,9 +14377,12 @@ impl CraftNexusContract {
     }
 
     pub fn get_reconciliation_report(env: Env, token: Address) -> Option<ReconciliationReport> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ReconciliationReport(token))
+        let key = DataKey::ReconciliationReport(token);
+        let report = env.storage().persistent().get(&key);
+        if report.is_some() {
+            Self::extend_persistent_read(&env, &key);
+        }
+        report
     }
 
     /// Pure read-only query to compute a reconciliation report on demand.
@@ -14050,6 +14421,10 @@ impl CraftNexusContract {
         page: u32,
         page_size: u32,
     ) -> Result<ReconciliationReport, Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+        Self::check_not_paused(&env);
+
         // Validate pagination inputs
         let page_size =
             pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
@@ -14061,7 +14436,10 @@ impl CraftNexusContract {
         let total_escrows: u32 = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
 
         // Calculate page bounds
-        let end = page.saturating_add(page_size).min(total_escrows);
+        let end = page
+            .checked_add(page_size)
+            .ok_or(Error::CounterOverflow)?
+            .min(total_escrows);
 
         // Sum active escrow amounts for this page
         let mut expected_locked = 0i128;
@@ -14092,9 +14470,11 @@ impl CraftNexusContract {
                             | EscrowStatus::SettlementPending
                     )
                 {
-                    expected_locked = expected_locked.saturating_add(escrow.amount);
+                    expected_locked = expected_locked
+                        .checked_add(escrow.amount)
+                        .ok_or(Error::CounterOverflow)?;
                 }
-                scanned = scanned.saturating_add(1);
+                scanned = scanned.checked_add(1).ok_or(Error::CounterOverflow)?;
             }
         }
 
@@ -14113,11 +14493,19 @@ impl CraftNexusContract {
                     .get::<DataKey, RecurringEscrow>(&DataKey::RecurringEscrow(id))
                 {
                     if recurring.token == token && recurring.is_active {
-                        expected_locked = expected_locked.saturating_add(
-                            recurring
-                                .total_amount
-                                .saturating_sub(recurring.released_amount),
-                        );
+                        if recurring.total_amount < 0
+                            || recurring.released_amount < 0
+                            || recurring.released_amount > recurring.total_amount
+                        {
+                            return Err(Error::CounterUnderflow);
+                        }
+                        let remaining = recurring
+                            .total_amount
+                            .checked_sub(recurring.released_amount)
+                            .ok_or(Error::CounterUnderflow)?;
+                        expected_locked = expected_locked
+                            .checked_add(remaining)
+                            .ok_or(Error::CounterOverflow)?;
                     }
                 }
             }
@@ -14137,14 +14525,11 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
-                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
-                if let Some(stake) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
-                {
+                if let Some(stake) = Self::get_artisan_stake_read_only(&env, artisan) {
                     if stake.token == token {
-                        expected_staked = expected_staked.saturating_add(stake.amount);
+                        expected_staked = expected_staked
+                            .checked_add(stake.amount)
+                            .ok_or(Error::CounterOverflow)?;
                     }
                 }
             }
@@ -14169,9 +14554,12 @@ impl CraftNexusContract {
         // Check for discrepancies only when complete
         let mut unresolved = false;
         if complete {
+            let obligations = expected_locked
+                .checked_add(expected_staked)
+                .ok_or(Error::CounterOverflow)?;
             unresolved = expected_locked != tracked_locked
                 || expected_staked != tracked_staked
-                || balance < expected_locked.saturating_add(expected_staked);
+                || balance < obligations;
         }
 
         Ok(ReconciliationReport {
@@ -14229,6 +14617,7 @@ impl CraftNexusContract {
     ) -> Result<ReconciliationRepairPlan, Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        Self::check_not_paused(&env);
         let report: ReconciliationReport = env
             .storage()
             .persistent()
@@ -14237,20 +14626,28 @@ impl CraftNexusContract {
         if !report.complete || !report.unresolved {
             return Err(Error::ReconciliationRequired);
         }
-        if report.balance < report.expected_locked + report.expected_staked {
+        let expected_total = report
+            .expected_locked
+            .checked_add(report.expected_staked)
+            .unwrap_or_else(|| env.panic_with_error(Error::EmergencyAccountingInvariant));
+        if report.balance < expected_total {
             return Err(Error::EmergencyAccountingInvariant);
         }
 
-        let residual_balance = report.balance - (report.expected_locked + report.expected_staked);
+        let residual_balance = report
+            .balance
+            .checked_sub(expected_total)
+            .unwrap_or_else(|| env.panic_with_error(Error::EmergencyAccountingInvariant));
         let currently_allocated: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::AllocatedResidualBalance(token.clone()))
             .unwrap_or(0);
+        let new_allocated = currently_allocated
+            .checked_add(allocated_amount)
+            .unwrap_or_else(|| env.panic_with_error(Error::EmergencyAccountingInvariant));
 
-        if allocated_amount < 0
-            || currently_allocated.saturating_add(allocated_amount) > residual_balance
-        {
+        if allocated_amount < 0 || new_allocated > residual_balance {
             return Err(Error::EmergencyAccountingInvariant);
         }
 
@@ -14269,6 +14666,9 @@ impl CraftNexusContract {
             .persistent()
             .get(&DataKey::NextReconciliationRepairPlanId)
             .unwrap_or(1);
+        let next_id = id
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
 
         let mut approvals = Vec::new(&env);
         approvals.push_back(admin);
@@ -14294,14 +14694,14 @@ impl CraftNexusContract {
 
         env.storage().persistent().set(
             &DataKey::AllocatedResidualBalance(token.clone()),
-            &(currently_allocated.saturating_add(allocated_amount)),
+            &new_allocated,
         );
         env.storage()
             .persistent()
             .set(&DataKey::ReconciliationRepairPlan(id), &plan);
         env.storage()
             .persistent()
-            .set(&DataKey::NextReconciliationRepairPlanId, &(id + 1));
+            .set(&DataKey::NextReconciliationRepairPlanId, &next_id);
         Self::extend_persistent(&env, &DataKey::ReconciliationRepairPlan(id));
         Self::extend_persistent(&env, &DataKey::NextReconciliationRepairPlanId);
         Ok(plan)

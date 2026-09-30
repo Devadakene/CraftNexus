@@ -35,6 +35,7 @@
 //!    adds a pre-flight gating step; it never changes chunking semantics.
 
 use crate::{EscrowCreateParams, Error};
+#[cfg(test)]
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Env, Vec};
 
