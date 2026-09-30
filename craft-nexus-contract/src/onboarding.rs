@@ -241,6 +241,22 @@ impl OnboardingContract {
             .get(&DataKey::SettlementSnapshot(revision))
             .expect("settlement snapshot not found")
     }
+
+    /// Returns the current moderator address, if one has been set.
+    ///
+    /// Returns `None` when the moderator key is absent (e.g. after archival,
+    /// a partial migration, or before the first moderator is configured)
+    /// instead of trapping the host.
+    pub fn get_moderator(env: Env) -> Option<Address> {
+        let key = DataKey::Moderator;
+        let value: Option<Address> = env.storage().persistent().get(&key);
+        if value.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+        }
+        value
+    }
 }
 
 /// Shared authorization adapter for privileged entry points.
