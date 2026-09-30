@@ -1,230 +1,139 @@
-use soroban_std::{address, address_payload, contract, contracterror, contractimpl, panic_with_error, panic_with_error_code};
-use sorban_std::token::token;
-use sorban_std::{panic_with};
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-/// Error codes for the craft-nexus escrow contract.
-#[contracterror]
-pub enum Error {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    Unauthorized = 3,
-    Paused = 4,
-    NotFound = 5,
-    InvalidAmount = 6,
-    Overflow = 7,
-    InvalidState = 8,
-    NoPartialRefundProposal = 9,
-    NotDisputed = 10,
-    NothingToRefund = 11,
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
+
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
+
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
 }
 
-const DATA_KEY: symbol_short!["PARTIAL_REFUND"] = symbol_short!["PARTIAL_REFUND"];
-const PAUSED_KEY: symbol_short!["PAUSED"] = symbol_short!["PAUSED"];
-const TOTAL_REFUNDED_KEY: symbol_short!["TOTAL_REFUNDED"] = symbol_short!["TOTAL_REFUNDED"];
+pub struct NotInitialized;
 
-#[contracttype]
-pub struct PartialRefundProposal {
-    pub escrow_id: u64,
-    pub payee: Address,
-    pub amount: i128,
-    pub approved: bool,
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
 }
 
-#[no_std]
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
+#[contract]
 pub struct CraftNexusContract;
 
-#[no_std]
-impl CraftNexusContract {
-    /// Initialize the contract and set the admin.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().has(&DATA_KEY) {
-            panic_with_error(env, &Error::AlreadyInitialized);
-        }
-        env.storage().set(&DATA_KEY, &admin);
-        env.storage().set(&PAUSED_KEY, &false);
-        env.storage().set(&TOTAL_REFUNDED_KEY, &iL128_const(0));
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    /// Pause the contract. Only the admin can call this.
-    pub fn pause(env: Env, operator: Address) {
-        operator.require_auth();
-        let admin: Address = env.storage().get(&DATA_KEY).unwrap_or_else_with(
-);
-        if operator != admin {
-            panic_with_error(env, &Error::Unauthorized);
-        }
-        env.storage().set(&PAUSED_KEY, &true);
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    /// Unpause the contract. Only the admin can call this.
-    pub fn unpause(env: Env, operator: Address) {
-        operator.require_auth();
-        let admin: Address = env.storage().get(&DATA_KEY).unwrap_or_else_with(
-        );
-        if operator != admin {
-            panic_with_error(env, &Error::Unauthorized);
-        }
-        env.storage().set(&PAUSED_KEY, &false);
-    }
-
-    /// Propose a partial refund for a disputed escrow.
-    pub fn propose_partial_refund(env: Env, proposer: Address, escrow_id: u64, payee: Address, amount: i128) {
-        proposer.require_auth();
-        if env.storage().get(&PAUSED_KEY).unwrap_or_else(|| false) {
-            panic_with_error(env, &Error::Paused);
-        }
-        if amount <= 0 {
-            panic_with_error(env, &Error::InvalidAmount);
-        }
-        let proposal = PartialRefundProposal {
-            escrow_id,
-            payee,
-            amount,
-            approved: false,
-        };
-        env.storage().set(&DATA_KEY, &proposal);
-    }
-
-    /// Accept the outstanding partial refund proposal for a disputed escrow.
-    ///
-    /// This entrypoint moves or gates value, so a failed auth check, pause, or
-    /// overflow must leave storage unchanged. All checks are performed before any
-    /// storage write or token transfer.
-    pub fn accept_partial_refund(env: Env, acceptor: Address) {
-        // 1. Authenticate the intended role before any state mutation.
-        acceptor.require_auth();
-
-        // 2. Respect the pause gate.
-        if env.storage().get(&PAUSED_KEY).unwrap_or_else(|| false) {
-            panic_with_error(env, &Error::Paused);
-        }
-
-        // 3. Load the outstanding proposal.
-        let mut proposal: PartialRefundProposal = env
-            .storage()
-            .get(&DATA_KEY)
-            .unwrap_or_else_with(
-                || panic_with_error(env, &Error::NoPartialRefundProposal),
-            );
-
-        // 4. Only the payee may accept the proposal.
-        if acceptor != proposal.payee {
-            panic_with_error(env, &Error::Unauthorized);
-        }
-
-        // 5. Reject double-acceptance.
-        if proposal.approved {
-            panic_with_error(env, &Error::InvalidState);
-        }
-
-        // 6. Validate the amount before any accounting change.
-        if proposal.amount <= 0 {
-            panic_with_error(env, &Error::InvalidAmount);
-        }
-
-        // 7. Update the running total with overflow protection.
-        let total: i128 = env
-            .storage()
-            .get(&TOTAL_REFUNDED_KEY)
-            .unwrap_or_else(|| i128_const(0));
-        let new_total = total.checked_add(proposal.amount).unwrap_or_else_with(
-
-        );
-        if new_total < total {
-            panic_with_error(env, &Error::Overflow);
-        }
-
-        // 8. Mark the proposal as approved and persist accounting.
-        proposal.approved = true;
-        env.storage().set(&DATA_KEY, &proposal);
-        env.storage().set(&TOTAL_REFUNDED_KEY, &new_total);
-
-        // 9. Transfer the refund to the payee.
-        token::Client::new(&env, &Address::from_string("CRAFT-NEXUS-TOKEN"))
-            .transfer(&env.current_contract(), &proposal.payee, &proposal.amount);
-    }
-
-    /// Read the current partial refund proposal, if any.
-    pub fn get_partial_refund(env: Env) -> Option<PartialRefundProposal> {
-        env.storage().get(&DATA_KEY)
-    }
-
-    /// Read the total amount refunded so far.
-    pub fn get_total_refunded(env: Env) -> i128 {
-        env.storage()
-            .get(&TOTAL_REFUNDED_KEY)
-            .unwrap_or_else(|| i128_const(0))
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[no_std]
-mod test {
+#test
+}
+mod tests {
     use super::*;
-    use sorban_sdd::address;
     use sorban_std::Env;
 
-    fn setup() -> (Env, Address, Address) {
+    #[test]
+    fn get_max_dispute_duration_missing_key_returns_error() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let payee = Address::generate(&env);
-        env.mock_all_auth();
-        CraftNexusContract::initialize(env.clone(), admin.clone());
-        env.mock_all_auth();
-        CraftNexusContract::propose_partial_refund(
-            env.clone(),
-            admin.clone(),
-            1,
-            payee.clone(),
-            100,
-        );
-        (env, admin, payee)
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
     }
 
     #[test]
-    fn unauthorized_caller_cannot_change_storage() {
-        let (env, _admin, payee) = setup();
-        let attacker = Address::generate(&env);
-        env.mock_all_auth();
-        let result = env.as_contract(
-            &CraftNexusContract,
-            |contract| contract.accept_partial_refund(attacker.clone()),
-        );
-        assert!(result.is_err());
-        let proposal = CraftNexusContract::get_partial_refund(env.clone()).unwrap();
-        assert!proposal.approved == false);
-        assert_eq!(CraftNexusContract::get_total_refunded(env.clone()), 0);
-        let _ = payee;
-    }
-
-    #[test]
-    fn accept_rejected_while_paused() {
-        let (env, admin, _payee) = setup();
-        env.mock_all_auth();
-        CraftNexusContract::pause(env.clone(), admin.clone());
-        let result = env.as_contract(
-            &CraftNexusContract,
-            |contract| contract.accept_partial_refund(admin.clone()),
-        );
-        assert!(result.is_err());
-        let proposal = CraftNexusContract::get_partial_refund(env.clone()).unwrap();
-        assert!proposal.approved == false);
-        assert_eq!(CraftNexusContract::get_total_refunded(env.clone()), 0);
-    }
-
-    #[test]
-    fn accept_rejected_with_no_proposal_returns_error_and_keeps_balances() {
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let payee = Address::generate(&env);
-        env.mock_all_auth();
-        CraftNexusContract::initialize(env.clone(), admin.clone());
-        env.mock_all_auth();
-        let result = env.as_contract(
-            &CraftNexusContract,
-            |contract| contract.accept_partial_refund(payee.clone()),
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
         );
-        assert!(result.is_error());
-        assert_eq!(CraftNexusContract::get_total_refunded(env.clone()), 0);
-        assert!(CraftNexusContract::get_partial_refund(env.clone()).is_none());
+    }
+
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
     }
 }
