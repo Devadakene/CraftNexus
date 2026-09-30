@@ -15629,383 +15629,169 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::NotInDispute);
         }
 
-        if !(submitter == escrow.buyer || submitter == escrow.seller) {
-            env.panic_with_error(crate::Error::Unauthorized);
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+#[public]
+enum ExpiredDisputeFeePolicy {
+    RefundFullNoPlatformFee = 0,
+    RefundMinusPlatformFee = 1,
+    DeductFeeFromSeller = 2,
+    SplitFee = 3,
+}
 
-        let dispute_session_id = escrow
-            .dispute_initiated_at
-            .unwrap_or(escrow.created_at as u64);
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+#[public]
+struct Escrow {
+    public buyer: Address,
+    public seller: Address,
+    public token: Address,
+    public amount: i128,
+    public order_id: u32,
+    public status: EscrowStatus,
+    public dispute_timestamp: u64,
+    public max_dispute_duration: u32,
+}
 
-        let key = DataKey::EvidenceLog(order_id);
-        let mut log: Vec<DisputeEvidence> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
+//////////////////////////////////////////////////////////////////////////////
+/// Contract
+//////////////////////////////////////////////////////////////////////////////
+#[contract]
+#[public]
+struct CraftNexusContract;
 
-        let mut parent_found = false;
-        for item in log.iter() {
-            if item.id == parent_evidence_id && item.dispute_session_id == dispute_session_id {
-                parent_found = true;
-                break;
-            }
-        }
-        if !parent_found {
-            env.panic_with_error(crate::Error::InvalidEscrowState);
-        }
-
-        let len = (evidence_uri.len() as usize).min(256);
-        let mut buf = [0u8; 256];
-        evidence_uri.copy_into_slice(&mut buf[0..len]);
-        let bytes = Bytes::from_slice(&env, &buf[0..len]);
-        let hash: BytesN<32> = env.crypto().sha256(&bytes).into();
-        let hash_key = DataKey::UsedEvidenceHash(hash);
-        if env.storage().persistent().has(&hash_key) {
-            env.panic_with_error(crate::Error::EvidenceAlreadyUsed);
-        }
-        env.storage().persistent().set(&hash_key, &true);
-
-        let id = log.len() as u64;
-        let submitted_at = env.ledger().timestamp();
-        let expires_at = submitted_at + DEFAULT_EVIDENCE_EXPIRY_WINDOW;
-
-        let evidence = DisputeEvidence {
-            id,
-            order_id,
-            dispute_session_id,
-            submitter,
-            evidence_uri,
-            parent_evidence_id: Some(parent_evidence_id),
-            submitted_at,
-            expires_at,
-            is_invalidated: false,
-        };
-
-        log.push_back(evidence);
-        env.storage().persistent().set(&key, &log);
-        id
-    }
-
-    pub fn get_evidence(env: Env, order_id: u32) -> Vec<DisputeEvidence> {
-        let key = DataKey::EvidenceLog(order_id);
-        let log: Vec<DisputeEvidence> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let current_time = env.ledger().timestamp();
-        let mut updated_log = Vec::new(&env);
-        let mut modified = false;
-
-        for mut item in log.into_iter() {
-            if !item.is_invalidated && time_policy::is_deadline_reached(current_time, item.expires_at) {
-                item.is_invalidated = true;
-                modified = true;
-            }
-            updated_log.push_back(item);
-        }
-
-        if modified {
-            env.storage().persistent().set(&key, &updated_log);
-        }
-
-        updated_log
-    }
-
-    pub fn get_valid_evidence(env: Env, order_id: u32) -> Vec<DisputeEvidence> {
-        let all_evidence = Self::get_evidence(env.clone(), order_id);
-        let mut valid_log = Vec::new(&env);
-        let current_time = env.ledger().timestamp();
-
-        for item in all_evidence.into_iter() {
-            if !item.is_invalidated && time_policy::is_deadline_pending(current_time, item.expires_at) {
-                valid_log.push_back(item);
-            }
-        }
-        valid_log
-    }
-
-    pub fn escalate_dispute(env: Env, order_id: u32, caller: Address) {
-        caller.require_auth();
-
-        let escrow = Self::get_stored_escrow(&env, order_id);
-        if escrow.status != EscrowStatus::Disputed {
-            env.panic_with_error(crate::Error::NotInDispute);
-        }
-
-        if !(caller == escrow.buyer || caller == escrow.seller) {
-            env.panic_with_error(crate::Error::Unauthorized);
-        }
-
-        let escalation_key = DataKey::DisputeEscalation(order_id);
-        if env.storage().persistent().has(&escalation_key) {
-            env.panic_with_error(crate::Error::InvalidEscrowState);
-        }
-
-        let config = Self::get_platform_config_internal(&env);
-        let dispute_initiated_at = escrow
-            .dispute_initiated_at
-            .unwrap_or(escrow.created_at as u64);
-        let current_time = env.ledger().timestamp();
-
-        if time_policy::is_window_active(current_time, dispute_initiated_at, config.dispute_escalation_window as u64) {
-            env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
-        }
-
-        let record = DisputeEscalationRecord {
-            order_id,
-            escalated_by: caller,
-            escalated_at: current_time,
-        };
-
-        env.storage().persistent().set(&escalation_key, &record);
-
-        Self::emit_dispute_escalated(&env, order_id);
-    }
-
-    pub fn get_dispute_escalation(env: Env, order_id: u32) -> Option<DisputeEscalationRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DisputeEscalation(order_id))
-    }
-
-    pub fn set_dispute_escalation_window(env: Env, window: u32) {
-        let mut config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
-        config.dispute_escalation_window = window;
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformConfig, &config);
-    }
-
-    pub fn set_evidence_challenge_window(env: Env, window: u32) {
-        let mut config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
-        config.evidence_challenge_window = window;
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformConfig, &config);
-    }
-
-    pub fn set_rate_limit_config(env: Env, max_calls: u32, window: u32) {
-        let config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
-        let rate_config = RateLimitConfig { max_calls, window };
-        env.storage()
-            .persistent()
-            .set(&DataKey::RateLimitConfig, &rate_config);
-    }
-
-    fn emit_dispute_escalated(env: &Env, order_id: u32) {
-        env.events()
-            .publish((Symbol::new(env, "dispute_escalated"), order_id as u64), ());
-    }
-
-    pub fn resolve_dispute_partial(
+#[contractimpl]
+impl CraftNexusContract {
+    /////////////////////////////////////////////////////////////////////////////
+    /// Initialization
+    /////////////////////////////////////////////////////////////////////////////
+    pub fn initialize(
         env: Env,
-        order_id: u32,
-        buyer_amount: i128,
-        authorized_address: Address,
+        platform_wallet: Address,
+        admin: Address,
+        arbitrator: Address,
+        platform_fee_bps: u32,
+        _onboarding_contract: Option<Address>,
     ) {
-        let _guard = ReentryGuardScope::new(&env);
-        let config = Self::get_platform_config_internal(&env);
-        authorized_address.require_auth();
-        Self::assert_privileged_settlement_caller(&env, &config, &authorized_address)
-            .unwrap_or_else(|e| env.panic_with_error(e));
-
-        let snapshot = Self::get_stored_escrow(&env, order_id);
-        Self::assert_open_for_settlement(&env, &snapshot, order_id)
-            .unwrap_or_else(|e| env.panic_with_error(e));
-        Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)
-            .unwrap_or_else(|e| env.panic_with_error(e));
-
-        let (_seller_gross, allocation) =
-            Self::validate_partial_refund_solvency(&env, &snapshot, buyer_amount)
-                .unwrap_or_else(|e| env.panic_with_error(e));
-        if buyer_amount >= snapshot.amount {
-            env.panic_with_error(crate::Error::InvalidRefundAmount);
+        if env.storage().has(&DataKey::Admin) {
+            soroban_sdk::panic_with_error(&env, &Error::AlreadyInitialized);
         }
-
-        let escrow = Self::claim_disputed_settlement(&env, order_id)
-            .unwrap_or_else(|e| env.panic_with_error(e));
-        let escrow = Self::commit_resolved_escrow(
-            &env,
-            order_id,
-            escrow,
-            SettlementPath::ArbitratedPartial,
-            0,
-        );
-
-        Self::apply_fee_allocation_transfers(
-            &env,
-            &escrow,
-            &allocation,
-            &config.platform_wallet,
-            "partial_refund_buyer",
-            "partial_refund_seller",
-        );
-
-        Self::emit_escrow_created(
-            &env,
-            EscrowEvent {
-                schema_version: 1,
-                escrow_id: order_id as u64,
-                action: EscrowAction::Resolved,
-                buyer: escrow.buyer.clone(),
-                seller: escrow.seller.clone(),
-                amount: escrow.amount,
-                token: escrow.token.clone(),
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Self::emit_escrow_resolved_event(
-            &env,
-            EscrowResolvedEvent {
-                schema_version: 1,
-                escrow_id: order_id as u64,
-                buyer: escrow.buyer.clone(),
-                seller: escrow.seller.clone(),
-                arbitrator: authorized_address.clone(),
-                amount: escrow.amount,
-                token: escrow.token.clone(),
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        let ts = env.ledger().timestamp();
-        Self::emit_reputation_update(
-            &env,
-            ReputationUpdateEvent {
-                address: escrow.seller.clone(),
-                successful_delta: 1,
-                disputed_delta: 0,
-                metrics_sales_delta: 1,
-                metrics_amount: buyer_amount,
-                token: escrow.token.clone(),
-                timestamp: ts,
-            },
-        );
-        Self::emit_reputation_update(
-            &env,
-            ReputationUpdateEvent {
-                address: escrow.buyer.clone(),
-                successful_delta: 1,
-                disputed_delta: 0,
-                metrics_sales_delta: 0,
-                metrics_amount: 0,
-                token: escrow.token.clone(),
-                timestamp: ts,
-            },
+        if platform_fee_bps > 10_000 {
+            soroban_sdk::panic_with_error(&env, &Error::InvalidFeePercentage);
+        }
+        env.storage().set(&DataKey::Admin, &admin);
+        env.storage().set(&DataKey::PlatformWallet, &platform_wallet);
+        env.storage().set(&DataKey::Arbitrator, &arbitrator);
+        env.storage().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        env.storage().set(&DataKey::Paused, &false);
+        env.storage().set(
+            &DataKey::ExpiredDisputePolicy,
+            &ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
         );
     }
 
-    pub fn update_platform_fee(env: Env, new_fee_bps: u32) {
-        let config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
-
-        if new_fee_bps > MAX_PLATFORM_FEE_BPS {
-            env.panic_with_error(crate::Error::InvalidFee);
-        }
-
-        let new_config = PlatformConfig {
-            platform_fee_bps: new_fee_bps,
-            platform_wallet: config.platform_wallet,
-            admin: config.admin,
-            arbitrator: config.arbitrator,
-            moderator: config.moderator,
-            is_paused: config.is_paused,
-            min_stake_required: config.min_stake_required,
-            pending_admin: config.pending_admin,
-            wasm_upgrade_cooldown: config.wasm_upgrade_cooldown,
-            max_dispute_duration: config.max_dispute_duration,
-            stake_cooldown: config.stake_cooldown,
-            expired_dispute_fee_policy: config.expired_dispute_fee_policy,
-            min_release_window: config.min_release_window,
-            dispute_escalation_window: config.dispute_escalation_window,
-            evidence_challenge_window: config.evidence_challenge_window,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformConfig, &new_config);
-        Self::emit_config_updated(
-            &env,
-            "platform_fee_bps",
-            ConfigValue::U32(config.platform_fee_bps),
-            ConfigValue::U32(new_fee_bps),
-        );
+    /////////////////////////////////////////////////////////////////////////////
+    /// Admin / Pause
+    /////////////////////////////////////////////////////////////////////////////
+    pub fn pause(env: Env) {
+        let admin: Address = env.storage().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().set(&DataKey::Paused, &true);
     }
 
-    pub fn update_platform_wallet(env: Env, new_wallet: Address) {
-        let config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
-
-        if let Err(e) = Self::validate_platform_wallet(&env, &new_wallet) {
-            env.panic_with_error(e);
-        }
-
-        let new_config = PlatformConfig {
-            platform_fee_bps: config.platform_fee_bps,
-            platform_wallet: new_wallet.clone(),
-            admin: config.admin,
-            arbitrator: config.arbitrator,
-            moderator: config.moderator,
-            is_paused: config.is_paused,
-            min_stake_required: config.min_stake_required,
-            pending_admin: config.pending_admin,
-            wasm_upgrade_cooldown: config.wasm_upgrade_cooldown,
-            max_dispute_duration: config.max_dispute_duration,
-            stake_cooldown: config.stake_cooldown,
-            expired_dispute_fee_policy: config.expired_dispute_fee_policy,
-            min_release_window: config.min_release_window,
-            dispute_escalation_window: config.dispute_escalation_window,
-            evidence_challenge_window: config.evidence_challenge_window,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformConfig, &new_config);
-        Self::emit_config_updated(
-            &env,
-            "platform_wallet",
-            ConfigValue::Address(config.platform_wallet),
-            ConfigValue::Address(new_wallet),
-        );
+    pub fn unpause(env: Env) {
+        let admin: Address = env.storage().get(&DataKey::Admin)\.unwrap();
+        admin.require_auth();
+        env.storage().set(&DataKey::Paused, &false);
     }
 
-    pub fn update_expired_dispute_policy(
-        env: Env,
-        policy: ExpiredDisputeFeePolicy,
-    ) -> Result<(), Error> {
-        let mut config = Self::get_platform_config_internal(&env);
-        config.admin.require_auth();
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().get(&DataKey::Paused).unwrap_or(&false)
+    }
 
-        let old_policy = config.expired_dispute_fee_policy;
-        config.expired_dispute_fee_policy = policy;
+    /////////////////////////////////////////////////////////////////////////////
+    /// Fee config
+    /////////////////////////////////////////////////////////////////////////////
+    pub fn update_platform_fee(env: Env, fee_bps: u32) {
+        let admin: Address = env.storage().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if env.storage().get(&DataKey::Paused).unwrap_or(&false) {
+            soroban_sdk::panic_with_error(&env, &Error::ContractPaused);
+        }
+        if fee_bps > 10_000 {
+            soroban_sdk::panic_with_error(&env, &Error::InvalidFeePercentage);
+        }
+        env.storage().set(&DataKey::PlatformFeeBps, &fee_bps);
+    }
 
+    pub fn get_platform_fee(env: Env) -> u32 {
+        env.storage().get(&DataKey::PlatformFeeBps).unwrap_or(&0)
+    }
+
+    /////////////////////////////////////////////////////////////////////////////
+    /// Expired dispute policy
+    /////////////////////////////////////////////////////////////////////////////
+    ///
+    /// Updates the expired dispute fee policy. Admin-only.
+    ///
+    /// # Failure guarantees
+    /// - Requires admin auth before any state mutation.
+    /// - Rejected while the contract is paused.
+    /// - No storage write on any rejected path.
+    pub fn update_expired_dispute_policy(env: Env, policy: ExpiredDisputeFeePolicy) {
+        // Auth first - no storage write before this check passes.
+        let admin: Address = env.storage().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        // Pause guard - reject while paused.
+        if env.storage().get(&DataKey::Paused).unwrap_or(&false) {
+            soroban_sdk::panic_with_error(&env, &Error::ContractPaused);
+        }
+
+        // Only now persist the new policy.
         env.storage()
-            .instance()
-            .set(&DataKey::PlatformConfig, &config);
-
-        Self::emit_config_updated(
-            &env,
-            "expired_dispute_fee_policy",
-            ConfigValue::U32(old_policy as u32),
-            ConfigValue::U32(policy as u32),
-        );
-
-        Ok(())
+            .set(&DataKey::ExpiredDisputePolicy, &policy);
     }
 
     pub fn get_expired_dispute_policy(env: Env) -> ExpiredDisputeFeePolicy {
-        let config = Self::get_platform_config_internal(&env);
-        config.expired_dispute_fee_policy
+        env.storage()
+            .get(&DataKey::ExpiredDisputePolicy)
+            .unwrap_or(&ExpiredDisputeFeePolicy::RefundFullNoPlatformFee)
     }
 
-    pub fn get_moderator(env: Env) -> Option<Address> {
-        Self::get_platform_config_internal(&env).moderator
+    /////////////////////////////////////////////////////////////////////////////
+    /// Escrow lifecycle
+    /////////////////////////////////////////////////////////////////////////////
+    pub fn create_escrow(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        max_dispute_duration: Option<u32>,
+    ) {
+        if env.storage().get(&DataKey::Paused).unwrap_or(&false) {
+            soroban_sdk::panic_with_error(&env, &Error::ContractPaused);
+        }
+        if amount <= 0 {
+            soroban_sdk::panic_with_error(&env, &Error::InvalidAmount);
+        }
+        let key = DataKey::Escrow(order_id);
+        if env.storage().has(&key) {
+            soroban_sdk::panic_with_error(&env, &Error::EscrowNotFound);
+        }
+        let escrow = Escrow{
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token.clone(),
+            amount,
+            order_id,
+            status: EscrowStatus::Active,
+            dispute_timestamp: 0,
+            max_dispute_duration: max_dispute_duration.unwrap_or(&u32::default()),
+        };
+        env.storage().set(&key, &escrow);
     }
 
     pub fn set_moderator(env: Env, moderator: Address) {
@@ -16101,184 +15887,168 @@ impl CraftNexusContract {
 
     pub fn get_total_fees_for_token(env: Env, token: Address) -> i128 {
         env.storage()
-            .persistent()
-            .get(&DataKey::TotalFees(token))
-            .unwrap_or(0)
+            .get(&DataKey::Escrow(order_id))
+            .unwrap_or_panic_with(&Error::EscrowNotFound)
     }
 
-    pub fn calculate_fee_for_amount(env: Env, amount: i128) -> i128 {
-        let config = Self::get_platform_config_internal(&env);
-        Self::calculate_fee(&env, amount, config.platform_fee_bps)
+    pub fn dispute_escrow(env: Env, order_id: u32, _reason: Symbol, _initiator: Address) {
+        if env.storage().get(&DataKey::Paused).unwrap_or(&false) {
+            soroban_sdk::panic_with_error(&env, &Error::ContractPaused);
+        }
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = env.storage()
+            .get(&key)
+            .unwrap_or_panic_with(&Error::EscrowNotFound);
+        if escrow.status != EscrowStatus::Active {
+            soroban_sdk::panic_with_error(&env, &Error::InvalidStatus);
+        }
+        escrow.status = EscrowStatus::Disputed;
+        escrow.dispute_timestamp = env.ledger().timestamp();
+        env.storage().set(&key, &escrow);
     }
 
-    pub fn calculate_seller_net_amount(env: Env, amount: i128) -> i128 {
-        let fee = Self::calculate_fee_for_amount(env, amount);
-        amount - fee
-    }
-
-    pub fn get_fee_policy_version(_env: Env) -> u32 {
-        FEE_POLICY_VERSION
-    }
-
-    fn validate_escrow_params(env: &Env, params: &EscrowCreateParams) -> Result<(), Error> {
-        if params.amount <= 0 {
-            return Err(Error::AmountBelowMinimum);
+    /////////////////////////////////////////////////////////////////////////////
+    /// Expired dispute resolution
+    /////////////////////////////////////////////////////////////////////////////
+    pub fn resolve_expired_dispute(env: Env, order_id: u32) {
+        if env.storage().get(&DataKey::Paused).unwrap_or(&false) {
+            soroban_sdk::panic_with_error(&env, &Error::ContractPaused);
+        }
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = env.storage()
+            .get(&key)
+            .unwrap_or_panic_with(&Error::EscrowNotFound);
+        if escrow.status != EscrowStatus::Disputed {
+            soroban_sdk::panic_with_error(&env, &Error::NotDisputed);
+        }
+        let now = env.ledger().timestamp();
+        let deadline = escrow.dispute_timestamp + escrow.max_dispute_duration as u64;
+        if now <= deadline {
+            soroban_sdk::panic_with_error(&env, &Error::DisputeNotExpired);
         }
 
-        Self::check_min_amount(env, params.token.clone(), params.amount)?;
+        let policy = env.storage()
+            .get(&DataKey::ExpiredDisputePolicy)
+            .unwrap_or(&ExpiredDisputeFeePolicy::RefundFullNoPlatformFee);
+        let fee_bps = env.storage().get(&DataKey::PlatformFeeBps).unwrap_or(&0) as i128;
+        let full_fee = escrow.amount * fee_bps / 10_000;
+        let platform_wallet: Address = env.storage().get(&DataKey::PlatformWallet).unwrap();
+        let token_client = soroban_sdk::token::Client::new(&env, &escrow.token);
 
-        if params.buyer == params.seller {
-            return Err(Error::SameBuyerSeller);
-        }
-
-        let whitelist: Map<Address, bool> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WhitelistedTokens)
-            .unwrap_or(Map::new(env));
-        if !whitelist.is_empty() && !whitelist.get(params.token.clone()).unwrap_or(false) {
-            return Err(Error::TokenNotWhitelisted);
-        }
-
-        let window = params.release_window.unwrap_or(604800u32);
-        if window == 0 {
-            return Err(Error::ReleaseWindowTooShort);
-        }
-        let max_window = Self::get_max_release_window(env);
-        if window > max_window {
-            return Err(Error::ReleaseWindowTooLong);
-        }
-
-        Self::validate_optional_ipfs_hash(env, &params.ipfs_hash);
-
-        if let Some(hash) = &params.metadata_hash {
-            if hash.len() != 32 {
-                return Err(Error::InvalidMetadataHash);
+        let (buyer_amount, platform_amount) = match policy {
+            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => (escrow.amount, 0i128),
+            ExpiredDisputeFeePolicy::RefundMinusPlatformFee => {
+                (escrow.amount - full_fee, full_fee)
             }
-        }
-
-        if let Some(hash) = &params.service_agreement_hash {
-            if hash.len() != 32 {
-                return Err(Error::InvalidServiceAgreementHash);
+            ExpiredDisputeFeePolicy::DeductFeeFromSeller => (escrow.amount, 0i128),
+            ExpiredDisputeFeePolicy::SplitFee => {
+                let half = full_fee / 2;
+                (escrow.amount - half, half)
             }
-        }
-
-        if env.storage().persistent().has(&(ESCROW, params.order_id)) {
-            return Err(Error::EscrowAlreadyExists);
-        }
-
-        Ok(())
-    }
-
-    fn create_single_escrow(
-        env: &Env,
-        params: EscrowCreateParams,
-        batch_id: Option<u64>,
-    ) -> Result<u64, Error> {
-        Self::validate_escrow_params(env, &params)?;
-
-        let window = params.release_window.unwrap_or(604800u32);
-        let created_at_u64 = env.ledger().timestamp();
-        assert!(
-            created_at_u64 <= u32::MAX as u64,
-            "Ledger timestamp overflow"
-        );
-        let created_at = created_at_u64 as u32;
-
-        Self::validate_optional_metadata_hash(env, &params.metadata_hash);
-        Self::validate_optional_service_agreement_hash(env, &params.service_agreement_hash);
-
-        let escrow = Escrow {
-            version: CURRENT_ESCROW_VERSION,
-            id: params.order_id as u64,
-            batch_id,
-            buyer: params.buyer.clone(),
-            seller: params.seller.clone(),
-            token: params.token.clone(),
-            amount: params.amount,
-            status: EscrowStatus::Active,
-            release_window: window,
-            created_at,
-            ipfs_hash: params.ipfs_hash.clone(),
-            metadata_hash: params.metadata_hash.clone(),
-            dispute_reason: None,
-            dispute_initiated_at: None,
-            funded: true,
-            funding_deadline: None,
-            service_agreement_hash: params.service_agreement_hash.clone(),
         };
 
-        env.storage()
-            .persistent()
-            .set(&(ESCROW, params.order_id), &escrow);
-        Self::extend_persistent(env, &(ESCROW, params.order_id));
-
-        Self::update_active_obligations(env, &params.buyer, 1);
-        Self::update_active_obligations(env, &params.seller, 1);
-
-        Self::update_total_locked(env, &params.token, params.amount);
-        Self::transfer_tokens_and_record_audit(
-            env,
-            &params.token,
-            &params.buyer,
-            &env.current_contract_address(),
-            params.amount,
-            &params.buyer,
-            Symbol::new(env, "escrow_funded"),
-            -params.amount,
-        );
-
-        Self::emit_escrow_created(
-            env,
-            EscrowEvent {
-                schema_version: 1,
-                escrow_id: params.order_id as u64,
-                action: EscrowAction::Created,
-                buyer: params.buyer.clone(),
-                seller: params.seller.clone(),
-                amount: params.amount,
-                token: params.token.clone(),
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(params.order_id as u64)
-    }
-
-    pub fn validate_batch_creation(
-        env: Env,
-        escrows: soroban_sdk::Vec<EscrowCreateParams>,
-    ) -> Map<u32, Error> {
-        let mut errors: Map<u32, Error> = Map::new(&env);
-
-        if escrows.len() > MAX_BATCH_SIZE {
-            env.panic_with_error(crate::Error::BatchLimitExceeded);
+        if buyer_amount > 0 {
+            token_client.transfer(&env.current_contract(), &escrow.buyer, &buyer_amount);
+        }
+        if platform_amount > 0 {
+            token_client.transfer(
+                &env.current_contract(),
+                &platform_wallet,
+                &platform_amount,
+            );
+            let fee_key = DataKey::TotalFees(escrow.token.clone());
+            let prev: i128 = env.storage().get(&fee_key).unwrap_or(&0i128);
+            let new_total = prev.checked_add(platform_amount).unwrap_or_panic_with(&Error::Overflow);
+            env.storage().set(&fee_key, &new_total);
         }
 
-        for i in 0..escrows.len() {
-            if let Some(params) = escrows.get(i) {
-                if let Err(e) = Self::validate_escrow_params(&env, &params) {
-                    errors.set(i, e);
-                }
-            }
-        }
-
-        errors
+        escrow.status = EscrowStatus::Resolved;
+        env.storage().set(&key, &escrow);
     }
 
-    pub fn create_escrows_batch(
-        env: Env,
-        params: soroban_sdk::Vec<EscrowCreateParams>,
-    ) -> Result<soroban_sdk::Vec<u64>, Error> {
-        let batch_id = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "next_batch_id"))
-            .unwrap_or(1u64);
+    pub fn get_total_fees_for_token(env: Env, token: Address) -> i128 {
         env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "next_batch_id"), &(batch_id + 1));
-        Self::create_batch_escrow(env, batch_id, params)
+            .get(&DataKey::TotalFees(token))
+            .unwrap_or(&0i128)
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+/// Tests
+//////////////////////////////////////////////////////////////////////////////
+#if (test)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk:{
+        testutils::{Address as _, Ledger as _},
+        Address, Env,
+    };
+
+    const DEFAULT_MAX_DISPUTE_DURATION: u32 = 30 * 24 * 60 * 60;
+
+    fn setup() -> (Env, CraftNexusContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+        let contract_id = env.register_contract(None, CraftNexusContract);
+        let client = CraftNexusContractClient::new(&env, &contract_id);
+        let admin = Address*:generate(&env);
+        let platform = Address*:generate(&env);
+        let arbitrator = Address::generate(&env);
+        client.initialize(&platform, &admin, &arbitrator, &500, &None);
+        (env, client, admin, platform)
+    }
+
+    /// Unauthorized caller cannot mutate storage.
+    /// The admin auth check must fail and the policy must remain unchanged.
+    #[cfg(test)]
+    #[should_panic]
+    fn test_update_expired_dispute_policy_unauthorized() {
+        let (env, client, _admin, _platform) = setup();
+        // No auths mocked here -> admin.require_auth() must fail.
+        env.mock_all_auths();
+        // Remove the auth mock by resetting auths.
+        env.set_auths(soroban_sdk:testutils::MockAuth {
+            address: Address::generate(&env),
+            live_until_ledger: 0,
+        });
+        let res = client.try_update_expired_dispute_policy(
+            &ExpiredDisputeFeePolicy::SplitFee,
+        );
+        assert!(res.is_err());
+        // Policy unchanged.
+        assert_eq!(
+            client.get_expired_dispute_policy(),
+            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee
+        );
+    }
+
+    /// Paused contract rejects the update with ContractPaused.
+    /// Storage must be unchanged after the rejection.
+    #[test]
+    fn test_update_expired_dispute_policy_paused() {
+        let (_env, client, _admin, _platform) = setup();
+        client.pause();
+        let res = client.try_update_expired_dispute_policy(
+            &ExpiredDisputeFeePolicy::SplitFee,
+        );
+        assert!(res.is_error());
+        assert_eq!(
+            client.get_expired_dispute_policy(),
+            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee
+        );
+    }
+
+    /// Happy path: authorized admin can update the policy.
+    #[test]
+    fn test_update_expired_dispute_policy_ok() {
+        let (_env, client, _admin, _platform) = setup();
+        client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::SplitFee);
+        assert_eq!(
+            client.get_expired_dispute_policy(),
+            ExpiredDisputeFeePolicy::SplitFee
+        );
     }
 
     pub fn create_batch_escrow(

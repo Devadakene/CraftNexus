@@ -89,7 +89,7 @@ fn test_default_policy_is_refund_full_no_fee() {
     let (_, client, _, _, _, _, _, _, _) = setup_test();
 
     let policy = client.get_expired_dispute_policy();
-    assert_eq!(policy, ExpiredDisputeFeePolicy::RefundFullNoPlatformFee);
+    assert_eq(policy, ExpiredDisputeFeePolicy::RefundFullNoPlatformFee);
 }
 
 #[test]
@@ -100,13 +100,49 @@ fn test_update_expired_dispute_policy() {
     client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::RefundMinusPlatformFee);
 
     let policy = client.get_expired_dispute_policy();
-    assert_eq!(policy, ExpiredDisputeFeePolicy::RefundMinusPlatformFee);
+    assert_eq(policy, ExpiredDisputeFeePolicy::RefundMinusPlatformFee);
 
     // Update to SplitFee
     client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::SplitFee);
 
     let policy = client.get_expired_dispute_policy();
-    assert_eq!(policy, ExpiredDisputeFeePolicy::SplitFee);
+    assert_eq(policy, ExpiredDisputeFeePolicy::SplitFee);
+}
+
+#[test]
+fn test_update_expired_dispute_policy_unauthorized_fails_and_storage_unchanged() {
+    let (env, client, _, _, _, _, _, _, _) = setup_test();
+
+    // Record the initial policy
+    let initial_policy = client.get_expired_dispute_policy();
+
+    // Disable auth mocking so the auth check fails
+    env.set_auths(Vec::new(fenv));
+
+    // Attempt to update the policy without authorization
+    let result = client.try_update_expired_dispute_policy(&ExpiredDisputeFeePolicy::SplitFee);
+    assert_eq(result, Err(try_update_expired_dispute_policy().error()));
+
+    // Ensure the policy was not modified
+    assert_eq(client.get_expired_dispute_policy(), initial_policy);
+}
+
+#[test]
+fn test_update_expired_dispute_policy_while_paused_fails_and_storage_unchanged() {
+    let (env, client, _, _, _, _, _, _, _) = setup_test();
+
+    // Pause the contract
+    client.pause();
+
+    // Record the initial policy
+    let initial_policy = client.get_expired_dispute_policy();
+
+    // Attempt to update the policy while paused
+    let result = client.try_update_expired_dispute_policy(&ExpiredDisputeFeePolicy::SplitFee);
+    assert_eq(result, Err(try_update_expired_dispute_policy().error()));
+
+    // Ensure the policy was not modified
+    assert_eq(client.get_expired_dispute_policy(), initial_policy);
 }
 
 #[test]
@@ -114,7 +150,7 @@ fn test_policy_refund_full_no_platform_fee() {
     let (env, client, buyer, seller, token_addr, _, platform_wallet, _, _) = setup_test();
     let token = token::Client::new(&env, &token_addr);
 
-    let amount = 1_000_000i128;
+    let amount = 1_000_000ii128;
     let order_id = 1u32;
 
     // Create and dispute escrow
@@ -132,14 +168,14 @@ fn test_policy_refund_full_no_platform_fee() {
     client.resolve_expired_dispute(&order_id);
 
     // Buyer should receive full amount
-    assert_eq!(token.balance(&buyer), buyer_balance_before + amount);
+    assert_eq(token.balance(&buyer), buyer_balance_before + amount);
 
     // Platform should receive no fee
-    assert_eq!(token.balance(&platform_wallet), platform_balance_before);
+    assert_eq(token.balance(&platform_wallet), platform_balance_before);
 
     // Escrow should be resolved
     let escrow = client.get_escrow(&order_id);
-    assert_eq!(escrow.status, EscrowStatus::Resolved);
+    assert_eq(escrow.status, EscrowStatus::Resolved);
 }
 
 #[test]
@@ -169,19 +205,19 @@ fn test_policy_refund_minus_platform_fee() {
     client.resolve_expired_dispute(&order_id);
 
     // Buyer should receive amount minus platform fee
-    assert_eq!(
+    assert_eq(
         token.balance(&buyer),
         buyer_balance_before + amount - expected_fee
     );
 
     // Platform should receive the fee
-    assert_eq!(
+    assert_eq(
         token.balance(&platform_wallet),
         platform_balance_before + expected_fee
     );
 
     // Total fees should be tracked
-    assert_eq!(client.get_total_fees_for_token(&token_addr), expected_fee);
+    assert_eq(client.get_total_fees_for_token(&token_addr), expected_fee);
 }
 
 #[test]
@@ -210,13 +246,13 @@ fn test_policy_deduct_fee_from_seller() {
     client.resolve_expired_dispute(&order_id);
 
     // Buyer should receive full amount
-    assert_eq!(token.balance(&buyer), buyer_balance_before + amount);
+    assert_eq(token.balance(&buyer), buyer_balance_before + amount);
 
     // Platform should NOT receive fee (conceptually deducted from seller)
-    assert_eq!(token.balance(&platform_wallet), platform_balance_before);
+    assert_eq(token.balance(&platform_wallet), platform_balance_before);
 
     // No fees tracked (platform doesn't collect in this policy)
-    assert_eq!(client.get_total_fees_for_token(&token_addr), 0);
+    assert_eq(client.get_total_fees_for_token(&token_addr), 0);
 }
 
 #[test]
@@ -224,9 +260,9 @@ fn test_policy_split_fee() {
     let (env, client, buyer, seller, token_addr, _, platform_wallet, _, _) = setup_test();
     let token = token::Client::new(&env, &token_addr);
 
-    let amount = 1_000_000i128;
+    let amount = 1_000_000ii128;
     let order_id = 1u32;
-    let full_fee = 50_000i128; // 5% of 1,000,000
+    let full_fee = 50_000ii128; // 5% of 1,000,000
     let half_fee = full_fee / 2; // 25,000
 
     // Update policy
@@ -247,19 +283,19 @@ fn test_policy_split_fee() {
     client.resolve_expired_dispute(&order_id);
 
     // Buyer should receive amount minus half the fee
-    assert_eq!(
+    assert_eq(
         token.balance(&buyer),
         buyer_balance_before + amount - half_fee
     );
 
     // Platform should receive half the fee
-    assert_eq!(
+    assert_eq(
         token.balance(&platform_wallet),
         platform_balance_before + half_fee
     );
 
     // Only half fee should be tracked
-    assert_eq!(client.get_total_fees_for_token(&token_addr), half_fee);
+    assert_eq(client.get_total_fees_for_token(&token_addr), half_fee);
 }
 
 #[test]
@@ -268,7 +304,7 @@ fn test_multiple_expired_disputes_with_different_policies() {
     let token = token::Client::new(&env, &token_addr);
 
     let amount = 1_000_000i128;
-    let expected_fee = 50_000i128;
+    let expected_fee = 50_000ii128;
 
     // Create first escrow with default policy (RefundFullNoPlatformFee)
     create_and_dispute_escrow(&client, &buyer, &seller, &token_addr, amount, 1);
@@ -306,11 +342,11 @@ fn test_multiple_expired_disputes_with_different_policies() {
     let total_buyer_refund = 3 * (amount - half_fee);
     let total_platform_fee = 3 * half_fee;
 
-    assert_eq!(
+    assert_eq(
         token.balance(&buyer),
         buyer_balance_before + total_buyer_refund
     );
-    assert_eq!(
+    assert_eq(
         token.balance(&platform_wallet),
         platform_balance_before + total_platform_fee
     );
@@ -378,7 +414,7 @@ fn test_policy_with_different_fee_percentages() {
     // Update policy to RefundMinusPlatformFee
     client.update_expired_dispute_policy(&ExpiredDisputeFeePolicy::RefundMinusPlatformFee);
 
-    let amount = 1_000_000i128;
+    let amount = 1_000_000ii128;
     let order_id = 1u32;
     let expected_fee = 100_000i128; // 10% of 1,000,000
 
