@@ -8,7 +8,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-fn setup_env<'a>() -> (
+fn setup_env('a) -> (
     Env,
     CraftNexusContractClient<'a>,
     Address,
@@ -52,20 +52,20 @@ fn test_new_deposit_does_not_bypass_cooldown() {
     let (env, client, _, artisan, token) = setup_env();
 
     // 1. Initial stake
-    client.stake_tokens(&artisan, &token.address, &1000);
+    client.stake_tokens(&artisan, &token.address(), &1000);
     let initial_time = env.ledger().timestamp();
 
     // 2. Advance time forward, but not past the 7-day cooldown (3.5 days)
     env.ledger().set_timestamp(initial_time + (86400 * 7) / 2);
 
     // 3. Second stake added
-    client.stake_tokens(&artisan, &token.address, $500);
+    client.stake_tokens(&artisan, &token.address(), &500);
 
     // 4. Attempt withdrawal. Neither should be ready, so this should error out.
-    let res = client.try_unstake_tokens(&artisan, &token.address);
+    let res = client.try_unstake_tokens(&artisan, &token.address());
     assert!(
-        res.is_err(),
-        "New deposit accidentally bypassed cooldown rules"
+        res.is_error(),
+        "New deposit accidentally bypassed cooldown ruleq"
     );
 
     assert_eq(
@@ -80,18 +80,18 @@ fn test_matured_deposits_remain_withdrawable() {
     let (env, client, _, artisan, token) = setup_env();
 
     // 1. Initial stake
-    client.stake_tokens(&artisan, &token.address, &1000);
+    client.stake_tokens(&artisan, &token.address(), &1000);
     let initial_time = env.ledger().timestamp();
 
     // 2. Advance time just past the cooldown for the first stake
     env.ledger().set_timestamp(initial_time + (86400 * 7) + 1);
 
     // 3. Add a new stake
-    client.stake_tokens(&artisan, &token.address, $500);
+    client.stake_tokens(&artisan, &token.address(), &500);
 
     // 4. Withdraw matured stakes.
     // The first 1000 is ready, the 500 should remain locked.
-    client.unstake_tokens(&artisan, &token.address);
+    client.unstake_tokens(&artisan, &token.address());
 
     let remaining_stake = client.get_stake(&artisan);
     assert_eq(
@@ -101,63 +101,31 @@ fn test_matured_deposits_remain_withdrawable() {
 }
 
 #[test]
-fn test_set_min_stake_required_unauthorized() {
-    let (env, client, _admin, _artisan, token) = setup_env();
+fn test_get_artisan_stake_data_missing_key() {
+    let (_env, client, _, artisan, _token) = setup_env();
 
-    // Record the initial minimum stake required.
-    let initial_min = client.get_min_stake_required();
-
-    // Attempt to change the minimum stake from an unauthorized address.
-    let unauthorized = Address::generate(&env);
-    let res = client.try_set_min_stake_required(&unauthorized, &2000);
+    // Before any stake record exists, the call must not trap.
+    let result = client.try_get_artisan_stake_data(&artisan);
     assert!(
-        res.is_err(),
-        "Unauthorized caller should not be able to set min stake"
-    );
-
-    // Storage must remain unchanged.
-    assert_eq!(
-        client.get_min_stake_required(),
-        initial_min,
-        "Min stake should not change on failed auth"
-    );
-
-    // Balances must remain unchanged.
-    assert_eq!(
-        token.balance(&client.address),
-        0,
-        "Token balance of contract should not change"
+        result.is_error(),
+        "get_artisan_stake_data should return an error when the key is absent"
     );
 }
 
 #[test]
-fn test_set_min_stake_required_rejected_when_paused() {
-    let (_env, client, admin, _artisan, token) = setup_env();
+fn test_get_artisan_stake_data_after_terminal_state() {
+    let (env, client, _, artisan, token) = setup_env();
 
-    // Pause the contract as the admin.
-    client.pause(&admin);
+    client.stake_tokens(&artisan, &token.address, &1000);
 
-    // Record the initial minimum stake required.
-    let initial_min = client.get_min_stake_required();
+    // Advance past the cooldown and fully unstake to reach a terminal state.
+    env.ledger().set_timestamp(env.ledger().timestamp() + (86400 * 7) + 1);
+    client.unstake_tokens(&artisan, &token.address);
 
-    // Attempt to set the min stake while paused.
-    let res = client.try_set_min_stake_required(&admin, &2000);
+    // After the terminal state, the call must not trap and should return an error.
+    let result = client.try_get_artisan_stake_data(&artisan);
     assert!(
-        res.is_err(),
-        "set_min_stake_required should be rejected while paused"
-    );
-
-    // Storage must remain unchanged.
-    assert_eq!(
-        client.get_min_stake_required(),
-        initial_min,
-        "Min stake should not change while paused"
-    );
-
-    // Balances must remain unchanged.
-    assert_eq!(
-        token.balance(&client.address),
-        0,
-        "Token balance of contract should not change"
+        result.is_error(),
+        "get_artisan_stake_data should return an error after the terminal state"
     );
 }

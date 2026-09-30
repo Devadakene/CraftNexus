@@ -1,147 +1,140 @@
-#`!no_std]
-use sorban_sdk;
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-use soroban_sdk;
-use soroban_sdk::token;
-use soroban_sdk::token::TokenClient;
-use soroban_sdk:{address::Address, contract, contracttype, Env, Error, Into"Val;
-use soroban_sdk:{address::Address, contract, contracttype, Env, Error, Into"Val;
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
 
-const STAKING_COOLDOWN_SECONDS: u64 = 86400 * 7;
-const MIN_STAKE_KEY: Symbol = symbol_short("min_stake");
-const PAUSED_KEY: Symbol = symbol_short("paused");
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
 
-#[soroban_sdk.contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Error {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    ContractPaused = 4,
-    InvalidAmount = 5,
-    InsufficientStake = 6,
-    CooldownNotMet = 7,
-    Overflow = 8,
-    TokenNotWhitelisted = 9,
-    NoStake = 10,
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
 }
 
-#[soroban_sdk.contract]
-#[soroban_sdk.contractimpl(CraftNexusContract)]
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
+}
+
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+}
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
+#[contract]
 pub struct CraftNexusContract;
 
-#[soroban_sdk.contractimpl]
-impl CraftNexusContract {
-    pub fn initialize(
-        env: Env,
-        platform_wallet: Address,
-        admin: Address,
-        arbitrator: Address,
-        platform_fee_bps: u32,
-        onboarding_contract: Option<Address>,
-    ) {
-        if env.storage().has(&symbol_short("init")) {
-            panic_with_error(&env, Error::AlreadyInitialized);
-        }
-        env.storage().set(&symbol_short("init"), &true);
-        env.storage().set(&symbol_short("plat_wallet"), &platform_wallet);
-        env.storage().set(&symbol_short("admin"), &admin);
-        env.storage().set(&symbol_short("arbit"), &arbitrator);
-        env.storage().set(&symbol_short("fee_bps"), &platform_fee_bps);
-        env.storage().set(&symbol_short("onboard"), &onboarding_contract);
-        env.storage().set(&MIN_STAKE_KEY, &u128:0);
-        env.storage().set(&PAUSED_KEY, &false);
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    pub fn set_min_stake_required(env: Env, admin: Address, amount: u128) -> Result<(), Error> {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().get(&symbol_short("admin")).unwrap();
-        if admin != stored_admin {
-            panic_with_error(&env, Error::Unauthorized);
-        }
-        if env.storage().get(&PAUSED_KEY).unwrap_or(false) {
-            panic_with_error(&env, Error::ContractPaused);
-        }
-        if amount < 0 {
-            panic_with_error(&env, Error::InvalidAmount);
-        }
-        env.storage().set(&MIN_STAKE_KEY, &amount);
-        Ok(())
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    pub fn get_min_stake_required(env: Env) -> u128 {
-        env.storage().get(&MIN_STAKE_KEY).unwrap_or(0)
-    }
-
-    pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().get(&symbol_short("admin")).unwrap();
-        if admin != stored_admin {
-            panic_with_error(&env, Error::Unauthorized);
-        }
-        env.storage().set(&PAUSED_KEY, &true);
-    }
-
-    pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().get(&symbol_short("admin")).unwrap();
-        if admin != stored_admin {
-            panic_with_error(&env, Error::Unauthorized);
-        }
-        env.storage().set(&PAUSED_KEY, &false);
-    }
-
-    pub fn whitelist_token(env: Env, token: Address) {
-        let admin: Address = env.storage().get(&symbol_short("admin")).unwrap();
-        admin.require_auth();
-        env.storage().set(&symbol_short("whitelist"), &true);
-    }
-
-    pub fn stake_tokens(env: Env, artisan: Address, token: Address, amount: i128) {
-        artisan.require_auth();
-        if env.storage().get(&PAUSED_KEY).unwrap_or(false) {
-            panic_with_error(&env, Error::ContractPaused);
-        }
-        if amount <= 0 {
-            panic_with_error(&env, Error::InvalidAmount);
-        }
-        let min_stake = env.storage().get(&MIN_STAKE_KEY).unwrap_or(0);
-        let current: u128 = env.storage().get(&symbol_short("stake")).unwrap_or(0);
-        let new_stake = current.checked_add(amount as u128).unwrap_or_else({
-            panic_with_error(&env, Error::Overflow);
-        });
-        if new_stake < min_stake {
-            panic_with_error(&env, Error::InsufficientStake);
-        }
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(from: &artisan, to: &env.current_contract_address(), amount: &amount);
-        env.storage().set(&symbol_short("stake"), &new_stake);
-        env.storage().set(&symbol_short("stake_time"), &env.ledger.timestamp());
-    }
-
-    pub fn unstake_tokens(env: Env, artisan: Address, token: Address) {
-        artisan.require_auth();
-        if env.storage().get(&PAUSED_KEY).unwrap_or()(false) {
-            panic_with_error(&env, Error::ContractPaused);
-        }
-        let current: u128 = env.storage().get(&symbol_short("stake")).unwrap_or(0);
-        if current == 0 {
-            panic_with_error(&env, Error::NoStake);
-        }
-        let stake_time: u64 = env.storage().get(&symbol_short("stake_time")).unwrap_or(0);
-        if env.ledger().timestamp() < stake_time + STAKING_COOLDOWN_SECONDS {
-            panic_with_error(&env, Error::CooldownNotMet);
-        }
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(from: &env.current_contract_address(), to: &artisan, amount: &(current as i128));
-        env.storage().set(&symbol_short("stake"), &u128:0);
-    }
-
-    pub fn get_stake(env: Env, artisan: Address) -> u128 {
-        let _ = artisan;
-        env.storage().get(&symbol_short("stake")).unwrap_or(0)
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[no_std]
-use soroban_sdk;
+#test
+}
+mod tests {
+    use super::*;
+    use sorban_std::Env;
+
+    #[test]
+    fn get_max_dispute_duration_missing_key_returns_error() {
+        let env = Env::default();
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
+    }
+
+    #[test]
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
+        let env = Env::default();
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
+        );
+    }
+
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
+    }
+}
