@@ -1,103 +1,140 @@
-use soroban_std::{address, address::Address, contract, contracttype, env};
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-/// Error types for the Craft Nexus contract.
-#[contracterror]
-#[sorban_std::contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrder, Xdr))
-#[no_std]
-pub enum Error {
-    /// The stake health snapshot key is missing.
-    NotFound = 1,
-    /// The artisan address is not valid.
-    InvalidArtisan = 2,
-    /// The caller is not authorized.
-    Unauthorized = 3,
-    /// The stake health snapshot is not available.
-    SnapshotMissing = 4,
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
+
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
+
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
 }
 
-/// Health status of an artisan's stake.
-#[type]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrder, Xdr)]
-#[no_std]
-pub enum StakeHealth {
-    Healthy,
-    Warning,
-    Critical,
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
 }
 
-/// Persisted health snapshot for an artisan.
-#[type]
-#[derive(Clone, Debug, Eq, PartialEq, Xdr)]
-#[no_std]
-pub struct StakeHealthSnapshot {
-    pub artisan: Address,
-    pub stake: i128,
-    pub status: StakeHealth,
-    pub updated_at: u64,
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
 }
 
-/// Storage key for the persisted health snapshot of an artisan.
-#[derive(Clone)]
-#[no_std]
-pub enum DataKey {
-    StakeHealthSnapshot(Address),
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
 }
 
-/// Contract implementation.
-#[sorban_std::contract]
-#[no_std]
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+}
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
+#[contract]
 pub struct CraftNexusContract;
 
-#[sorban_std::contractimp]
-#[no_std]
-impl CraftNexusContract {
-    /// Return the persisted health snapshot for an artisan.
-    ///
-    /// Returns `None` if `evaluate_stake_health` has never been called for the
-    /// given artisan, or if the key was removed (e.g. archival or partial migration).
-    /// This getter must not trap when the storage key is absent.
-    pub fn get_stake_health_snapshot(env: Env, artisan: Address) -> Option<StakeHealthSnapshot> {
-        let key = DataKey::StakeHealthSnapshot(artisan);
-        env.storage().persistent().get(&key)
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    /// Read the persisted health snapshot and return a typed error when absent.
-    ///
-    /// Uses `extend_persistent_read` on the hot persistent key so callers do not
-    /// pay for an unbounded scan and do not trap on a missing key.
-    pub fn get_stake_health_snapshot_or_error(
-        env: Env,
-        artisan: Address,
-    ) -> Result<StakeHealthSnapshot, Error> {
-        let key = DataKey::StakeHealthSnapshot(artisan);
-        match env.storage().persistent().get(&key) {
-            Some(snapshot) => {
-                env.storage().extend_persistent_read(&key);
-                Ok(snapshot)
-            }
-            None => Err(Error::SnapshotMissing),
-        }
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    /// Persist a health snapshot for an artisan.
-    pub fn evaluate_stake_health(
-        env: Env,
-        artisan: Address,
-        stake: i128,
-        status: StakeHealth,
-    ) {
-        let key = DataKey::StakeHealthSnapshot(artisan.clone());
-        let snapshot = StakeHealthSnapshot {
-            artisan,
-            stake,
-            status,
-            updated_at: env.ledger().timestamp(),
-        };
-        env.storage().persistent().set(&key, &snapshot);
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[cfg]
-test
-mod test;
+#test
+}
+mod tests {
+    use super::*;
+    use sorban_std::Env;
+
+    #[test]
+    fn get_max_dispute_duration_missing_key_returns_error() {
+        let env = Env::default();
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
+    }
+
+    #[test]
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
+        let env = Env::default();
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
+        );
+    }
+
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
+    }
+}
