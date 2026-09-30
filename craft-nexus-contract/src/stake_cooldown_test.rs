@@ -52,20 +52,20 @@ fn test_new_deposit_does_not_bypass_cooldown() {
     let (env, client, _, artisan, token) = setup_env();
 
     // 1. Initial stake
-    client.stake_tokens(&artisan, &token.address, &1000);
+    client.stake_tokens(&artisan, &token.address(), &1000);
     let initial_time = env.ledger().timestamp();
 
     // 2. Advance time forward, but not past the 7-day cooldown (3.5 days)
     env.ledger().set_timestamp(initial_time + (86400 * 7) / 2);
 
     // 3. Second stake added
-    client.stake_tokens(&artisan, &token.address, &500);
+    client.stake_tokens(&artisan, &token.address(), &500);
 
     // 4. Attempt withdrawal. Neither should be ready, so this should error out.
-    let res = client.try_unstake_tokens(&artisan, &token.address);
+    let res = client.try_unstake_tokens(&artisan, &token.address());
     assert!(
         res.is_error(),
-        "New deposit accidentally bypassed cooldown rules"
+        "New deposit accidentally bypassed cooldown ruleq"
     );
 
     assert_eq!(
@@ -80,18 +80,18 @@ fn test_matured_deposits_remain_withdrawable() {
     let (env, client, _, artisan, token) = setup_env();
 
     // 1. Initial stake
-    client.stake_tokens(&artisan, &token.address, &1000);
+    client.stake_tokens(&artisan, &token.address(), &1000);
     let initial_time = env.ledger().timestamp();
 
     // 2. Advance time just past the cooldown for the first stake
     env.ledger().set_timestamp(initial_time + (86400 * 7) + 1);
 
     // 3. Add a new stake
-    client.stake_tokens(&artisan, &token.address, &500);
+    client.stake_tokens(&artisan, &token.address(), &500);
 
     // 4. Withdraw matured stakes.
     // The first 1000 is ready, the 500 should remain locked.
-    client.unstake_tokens(&artisan, &token.address);
+    client.unstake_tokens(&artisan, &token.address());
 
     let remaining_stake = client.get_stake(&artisan);
     assert_eq!(

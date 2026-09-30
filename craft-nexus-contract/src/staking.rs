@@ -29,6 +29,12 @@ pub struct StakeEntry {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeNotFound = 1,
+}
+
+#[contracttype]
 pub enum DataKey {
     UserStakes(Address),
 }
