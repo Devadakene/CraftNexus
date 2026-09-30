@@ -20,6 +20,7 @@ pub enum Error {
 // ============================================================================
 
 const COOLDOWN_PERIOD: u64 = 86400 * 7; // 7 days in seconds
+const MIN_STAKE_REQUIRED: i128 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +38,7 @@ pub enum Error {
 #[contracttype]
 pub enum DataKey {
     UserStakes(Address),
+    MinStakeRequired,
 }
 
 // ============================================================================
@@ -48,6 +50,29 @@ pub struct StakeContract;
 
 #[contractimpl]
 impl StakeContract {
+    /// Sets the minimum stake required. Only the admin can call this.
+    pub fn set_min_stake_required(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+
+        if amount < 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinStakeRequired)
+            .unwrap_or(MIN_STAKE_REQUIRED);
+
+        let new_amount = current
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinStakeRequired, &new_amount);
+    }
+
     /// Adds a new stake, appending it as an independent entry with its own maturity.
     pub fn stake(env: Env, user: Address, amount: i128) {
         user.require_auth();

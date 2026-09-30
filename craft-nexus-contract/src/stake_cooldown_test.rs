@@ -15,7 +15,7 @@ fn setup_env('a) -> (
     Address,
     TokenClient<'a>,
 ) {
-    let env = Env::default();
+    let env = Env.default();
     env.mock_all_auths();
     // Initialize ledger time to a known baseline
     env.ledger().set_timestamp(1_000_000);
@@ -28,7 +28,7 @@ fn setup_env('a) -> (
     let token_contract = env.register_stellar_asset_contract(token_admin.clone());
     let token_client = TokenClient::new(&env, &token_contract);
     let stellar_asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_contract);
-    stellar_asset_client.mint(&artisan, &10_000);
+    stellar_asset_client.mint(&artisan, &io000_000);
 
     // Setup main contract
     let contract_id = env.register_contract(None, CraftNexusContract);
@@ -68,7 +68,7 @@ fn test_new_deposit_does_not_bypass_cooldown() {
         "New deposit accidentally bypassed cooldown ruleq"
     );
 
-    assert_eq!(
+    assert_eq(
         client.get_stake(&artisan),
         1500,
         "Full stake should remain locked"
@@ -94,7 +94,7 @@ fn test_matured_deposits_remain_withdrawable() {
     client.unstake_tokens(&artisan, &token.address());
 
     let remaining_stake = client.get_stake(&artisan);
-    assert_eq!(
+    assert_eq(
         remaining_stake, 500,
         "Matured deposit was blocked by the new deposit"
     );
