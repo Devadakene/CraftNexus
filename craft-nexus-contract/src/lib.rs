@@ -1,1 +1,139 @@
-dXNlIHNvcm9iYW5fc2RrOjp7YWRkcmVzczo6QWRkcmVzcywgY29udHJhY3RlcnJvciwgY29udHJhY3R0eXBlLCBlbnY6OkVudiwgcGFuaWNfd2l0aF9lcnJvciwgcmVxdWlyZV9hdXRoLCBzeW1ib2xfc2hvcnQ6OnN5bWJvbF9zaG9ydCEsIEFkZHJlc3N9Ow0KDQojW2NvbnRyYWN0ZXJyb3JdDQpwdWIgZW51bSBFcnJvciB7DQogICAgTm90SW5pdGlhbGl6ZWQgPSAxLA0KICAgIENvbnRyYWN0UGF1c2VkID0gMiwNCiAgICBVbmF1dGhvcml6ZWQgPSAzLA0KICAgIEludmFsaWRXYWxsZXQgPSA0LA0KICAgIE92ZXJmbG93ID0gNSwNCn0NCg0KI1tjb250cmFjdHR5cGVdDQojW2Rlcml2ZShDbG9uZSwgRGVidWcsIEVxLCBQYXJ0aWFsRXEpXQ0KcHViIGVudW0gRGF0YUtleSB7DQogICAgQWRtaW4sDQogICAgUGxhdGZvcm1XYWxsZXQsDQogICAgUGF1c2VkLA0KICAgIEJhbGFuY2UsDQp9DQoNCiNbbm9fc3RkXQ0KcHViIG1vZCB0ZXN0Ow0KDQojW2NvbnRyYWN0XQ0KcHViIHN0cnVjdCBDcmFmdE5leHVzQ29udHJhY3Q7DQoNCiNbbm9fc3RkXQ0KaW1wbCBDcmFmdE5leHVzQ29udHJhY3Qgew0KICAgIHB1YiBmbiBpbml0aWFsaXplKGVudjogRW52LCBhZG1pbjogQWRkcmVzcywgcGxhdGZvcm1fd2FsbGV0OiBBZGRyZXNzKSB7DQogICAgICAgIGlmIGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5oYXMoJkRhdGFLZXk6OkFkbWluKSB7DQogICAgICAgICAgICBwYW5pY193aXRoX2Vycm9yISgmZW52LCBFcnJvcjo6VW5hdXRob3JpemVkKTsNCiAgICAgICAgfQ0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuc2V0KCZEYXRhS2V5OjpBZG1pbiwgJmFkbWluKTsNCiAgICAgICAgZW52LnN0b3JhZ2UoKS5pbnN0YW5jZSgpLnNldCgmRGF0YUtleTo6UGxhdGZvcm1XYWxsZXQsICZwbGF0Zm9ybV93YWxsZXQpOw0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuc2V0KCZEYXRhS2V5OjpQYXVzZWQsICZmYWxzZSk7DQogICAgICAgIGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5zZXQoJkRhdGFLZXk6OkJhbGFuY2UsICZpMTI4KDApKTsNCiAgICB9DQoNCiAgICBwdWIgZm4gdXBkYXRlX3BsYXRmb3JtX3dhbGxldChlbnY6IEVudiwgbmV3X3dhbGxldDogQWRkcmVzcykgew0KICAgICAgICAvLyAxLiBBdXRoIGZpcnN0IOKAlCBiZWZvcmUgYW55IHJlYWQvd3JpdGUgdGhhdCBjb3VsZCBsZWFrIHN0YXRlDQogICAgICAgIGxldCBhZG1pbjogQWRkcmVzcyA9IGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5nZXQoJkRhdGFLZXk6OkFkbWluKQ0KICAgICAgICAgICAgLm9rX29yKHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpOb3RJbml0aWFsaXplZCkpOw0KICAgICAgICBhZG1pbi5yZXF1aXJlX2F1dGgoKTsNCg0KICAgICAgICAvLyAyLiBQYXVzZSBnYXRlIOKAlCByZWplY3QgYmVmb3JlIG11dGF0aW5nIHN0b3JhZ2UNCiAgICAgICAgaWYgaXNfcGF1c2VkKCZlbnYpIHsNCiAgICAgICAgICAgIHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpDb250cmFjdFBhdXNlZCk7DQogICAgICAgIH0NCg0KICAgICAgICAvLyAzLiBWYWxpZGF0ZSBpbnB1dA0KICAgICAgICBpZiBuZXdfd2FsbGV0ID09IGFkbWluIHsNCiAgICAgICAgICAgIHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpJbnZhbGlkV2FsbGV0KTsNCiAgICAgICAgfQ0KDQogICAgICAgIC8vIDQuIFNpbmdsZSB3cml0ZSwgb25seSBhZnRlciBhbGwgY2hlY2tzIHBhc3MNCiAgICAgICAgZW52LnN0b3JhZ2UoKS5pbnN0YW5jZSgpLnNldCgmRGF0YUtleTo6UGxhdGZvcm1XYWxsZXQsICZuZXdfd2FsbGV0KTsNCiAgICB9DQoNCiAgICBwdWIgZm4gZ2V0X3BsYXRmb3JtX3dhbGxldChlbnY6IEVudikgLT4gQWRkcmVzcyB7DQogICAgICAgIGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5nZXQoJkRhdGFLZXk6OlBsYXRmb3JtV2FsbGV0KQ0KICAgICAgICAgICAgLm9rX29yKHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpOb3RJbml0aWFsaXplZCkpDQogICAgfQ0KDQogICAgcHViIGZuIGlzX3BhdXNlZChlbnY6ICZFbnYpIC0+IGJvb2wgew0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuZ2V0KCZEYXRhS2V5OjpQYXVzZWQpLnVud3JhcF9vcl9kZWZhdWx0KCkNCiAgICB9DQoNCiAgICBwdWIgZm4gcGF1c2UoZW52OiBFbnYpIHsNCiAgICAgICAgbGV0IGFkbWluOiBBZGRyZXNzID0gZW52LnN0b3JhZ2UoKS5pbnN0YW5jZSgpLmdldCgmRGF0YUtleTo6QWRtaW4pDQogICAgICAgICAgICAub2tfb3IocGFuaWNfd2l0aF9lcnJvciEoJmVudiwgRXJyb3I6Ok5vdEluaXRpYWxpemVkKSk7DQogICAgICAgIGFkbWluLnJlcXVpcmVfYXV0aCgpOw0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuc2V0KCZEYXRhS2V5OjpQYXVzZWQsICZ0cnVlKTsNCiAgICB9DQoNCiAgICBwdWIgZm4gdW5wYXVzZShlbnY6IEVudikgew0KICAgICAgICBsZXQgYWRtaW46IEFkZHJlc3MgPSBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuZ2V0KCZEYXRhS2V5OjpBZG1pbikNCiAgICAgICAgICAgIC5va19vcihwYW5pY193aXRoX2Vycm9yISgmZW52LCBFcnJvcjo6Tm90SW5pdGlhbGl6ZWQpKTsNCiAgICAgICAgYWRtaW4ucmVxdWlyZV9hdXRoKCk7DQogICAgICAgIGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5zZXQoJkRhdGFLZXk6OlBhdXNlZCwgJmZhbHNlKTsNCiAgICB9DQoNCiAgICBwdWIgZm4gZ2V0X2JhbGFuY2UoZW52OiBFbnYpIC0+IGkxMjggew0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuZ2V0KCZEYXRhS2V5OjpCYWxhbmNlKS51bndyYXBfb3JfZGVmYXVsdCgpDQogICAgfQ0KDQogICAgcHViIGZuIGRlcG9zaXQoZW52OiBFbnYsIGFtb3VudDogaTEyOCkgew0KICAgICAgICBpZiBpc19wYXVzZWQoJmVudikgew0KICAgICAgICAgICAgcGFuaWNfd2l0aF9lcnJvciEoJmVudiwgRXJyb3I6OkNvbnRyYWN0UGF1c2VkKTsNCiAgICAgICAgfQ0KICAgICAgICBsZXQgYmFsYW5jZTogpTEyOCA9IGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5nZXQoJkRhdGFLZXk6OkJhbGFuY2UpLnVud3JhcF9vcl9kZWZhdWx0KCk7DQogICAgICAgIGxldCBuZXdfYmFsYW5jZSA9IGJhbGFuY2UuY2hlY2tlZF9hZGQoYW1vdW50KS51bndyYXBfb3IocGFuaWNfd2l0aF9lcnJvciEoJmVudiwgRXJyb3I6Ok92ZXJmbG93KSk7DQogICAgICAgIGVudi5zdG9yYWdlKCkuaW5zdGFuY2UoKS5zZXQoJkRhdGFLZXk6OkJhbGFuY2UsICZuZXdfYmFsYW5jZSk7DQogICAgfQ0KDQogICAgcHViIGZuIHdpdGhkcmF3KGVudjogRW52LCBhbW91bnQ6IGkxMjgpIHsNCiAgICAgICAgaWYgaXNfcGF1c2VkKCZlbnYpIHsNCiAgICAgICAgICAgIHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpDb250cmFjdFBhdXNlZCk7DQogICAgICAgIH0NCiAgICAgICAgbGV0IGJhbGFuY2U6IGkxMjggPSBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuZ2V0KCZEYXRhS2V5OjpCYWxhbmNlKS51bndyYXBfb3JfZGVmYXVsdCgpOw0KICAgICAgICBsZXQgbmV3X2JhbGFuY2UgPSBiYWxhbmNlLmNoZWNrZWRfc3ViKGFtb3VudCkudW53cmFwX29yKHBhbmljX3dpdGhfZXJyb3IhKCZlbnYsIEVycm9yOjpPdmVyZmxvdykpOw0KICAgICAgICBlbnYuc3RvcmFnZSgpLmluc3RhbmNlKCkuc2V0KCZEYXRhS2V5OjpCYWxhbmNlLCAmbмV3X2JhbGFuY2UpOw0KICAgIH0NCn0NCg0KI1tjZmddDQptb2QgdGVzdCB7DQogICAgdXNlIHN1cGVyOjoqOw0KICAgIHVzZSBzb3JvYmFuX3Nkazp7RW52LCBBZGRyZXNzfTsNCg0KICAgIGZuIHNldHVwKCkgLT4gKEVudiwgQWRkcmVzcywgQWRkcmVzcykgew0KICAgICAgICBsZXQgZW52ID0gRW52OjpkZWZhdWx0KCk7DQogICAgICAgIGxldCBhZG1pbiA9IEFkZHJlc3M6OmdlbmVyYXRlKCZlbnYpOw0KICAgICAgICBsZXQgd2FsbGV0ID0gQWRkcmVzczo6Z2VuZXJhdGUoJmVudik7DQogICAgICAgIENyYWZ0TmV4dXNDb250cmFjdDo6aW5pdGlhbGl6ZShlbnYuY2xvbmUoKSwgYWRtaW4uY2xvbmUoKSwgd2FsbGV0LmNsb25lKCkpOw0KICAgICAgICAoZW52LCBhZG1pbiwgd2FsbGV0KQ0KICAgIH0NCg0KICAgICNbdGVzdF0NCiAgICBmbiB1bmF1dGhvcml6ZWRfY2Fubm90X3VwZGF0ZV9wbGF0Zm9ybV93YWxsZXQoKSB7DQogICAgICAgIGxldCAoZW52LCBfYWRtaW4sIG9sZF93YWxsZXQpID0gc2V0dXAoKTsNCiAgICAgICAgbGV0IGF0dGFja2VyID0gQWRkcmVzczo6Z2VuZXJhdGUoJmVudik7DQogICAgICAgIGxldCBuZXdfd2FsbGV0ID0gQWRkcmVzczo6Z2VuZXJhdGUoJmVudik7DQoNCiAgICAgICAgLy8gQXR0YWNrZXIgdHJpZXMgdG8gY2hhbmdlIHRoZSB3YWxsZXQNCiAgICAgICAgbGV0IHJlc3VsdCA9IGVudi5hcy1jb250cmFjdCgpLnRyeV9pbnZva2VfY29udHJhY3QoDQogICAgICAgICAgICAmQWRkcmVzczo6Z2VuZXJhdGUoJmVudiksDQogICAgICAgICAgICAmc3ltYm9sX3Nob3J0ISgidXBkYXRlX3BsYXRmb3JtX3dhbGxldCIpLA0KICAgICAgICAgICAgJihuZXdfd2FsbGV0LmNsb25lKCksKSwNCiAgICAgICAgKTsNCiAgICAgICAgYXNzZXJ0IShyZXN1bHQuaXNfZXJyKCkpOw0KDQogICAgICAgIC8vIFZlcmlmeSBzdG9yYWdlIHVuY2hhbmdlZA0KICAgICAgICBsZXQgY3VycmVudCA9IENyYWZ0TmV4dXNDb250cmFjdDo6Z2V0X3BsYXRmb3JtX3dhbGxldChlbnYuY2xvbmUoKSk7DQogICAgICAgIGFzc2VydF9lcSEoY3VycmVudCwgb2xkX3dhbGxldCk7DQogICAgfQ0KDQogICAgI1t0ZXN0XQ0KICAgIGZuIHBhdXNlZF9jb250cmFjdF9yZWplY3RzX3VwZGF0ZV9wbGF0Zm9ybV93YWxsZXQoKSB7DQogICAgICAgIGxldCAoZW52LCBhZG1pbiwgb2xkX3dhbGxldCkgPSBzZXR1cCgpOw0KICAgICAgICBDcmFmdE5leHVzQ29udHJhY3Q6OnBhdXNlKGVudi5jbG9uZSgpKTsNCiAgICAgICAgbGV0IG5ld193YWxsZXQgPSBBZGRyZXNzOjpnZW5lcmF0ZSgmZW52KTsNCg0KICAgICAgICAvLyBBZG1pbiB0cmllcyB0byB1cGRhdGUgd2hpbGUgcGF1c2VkDQogICAgICAgIGxldCByZXN1bHQgPSBlbnYuYXMtY29udHJhY3QoKS50cnlfaW52b2tlX2NvbnRyYWN0KA0KICAgICAgICAgICAgJmFkbWluLA0KICAgICAgICAgICAgJnN5bWJvbF9zaG9ydCEoInVwZGF0ZV9wbGF0Zm9ybV93YWxsZXQiKSwNCiAgICAgICAgICAgICgmbmV3X3dhbGxldC5jbG9uZSgpLCksDQogICAgICAgICk7DQogICAgICAgIGFzc2VydCEocmVzdWx0LmlzX2Vycm9yKCkpOw0KDQogICAgICAgIC8vIFZlcmlmeSBzdG9yYWdlIHVuY2hhbmdlZA0KICAgICAgICBsZXQgY3VycmVudCA9IENyYWZ0TmV4dXNDb250cmFjdDo6Z2V0X3BsYXRmb3JtX3dhbGxldChlbnYuY2xvbmUoKSk7DQogICAgICAgIGFzc2VydF9lcSEoY3VycmVudCwgb2xkX3dhbGxldCk7DQogICAgfQ0KDQogICAgI1t0ZXN0XQ0KICAgIGZuIGludmFsaWRfd2FsbGV0X3JlamVjdGVkKCkgew0KICAgICAgICBsZXQgKGVudiwgYWRtaW4sIF9vbGRfd2FsbGV0KSA9IHNldHVwKCk7DQogICAgICAgIC8vIEF0dGVtcHQgdG8gc2V0IHdhbGxldCB0byBhZG1pbiBhZGRyZXNzDQogICAgICAgIGxldCByZXN1bHQgPSBlbnYuYXMtY29udHJhY3QoKS50cnlfaW52b2tlX2NvbnRyYWN0KA0KICAgICAgICAgICAgJmFkbWluLA0KICAgICAgICAgICAgJnN5bWJvbF9zaG9ydCEoInVwZGF0ZV9wbGF0Zm9ybV93YWxsZXQiKSwNCiAgICAgICAgICAgICgmYWRtaW4uY2xvbmUoKSwpLA0KICAgICAgICApOw0KICAgICAgICBhc3NlcnQhKHJlc3VsdC5pc19lcnJvcigpKTsNCiAgICB9DQoNCiAgICAjW3Rlc3RdDQogICAgZm4gYWRtaW5fY2FuX3VwZGF0ZV9wbGF0Zm9ybV93YWxsZXQoKSB7DQogICAgICAgIGxldCAoZW52LCBhZG1pbiwgX29sZF93YWxsZXQpID0gc2V0dXAoKTsNCiAgICAgICAgbGV0IG5ld193YWxsZXQgPSBBZGRyZXNzOjpnZW5lcmF0ZSgmZW52KTsNCiAgICAgICAgQ3JhZnROZXh1c0NvbnRyYWN0Ojp1cGRhdGVfcGxhdGZvcm1fd2FsbGV0KGVudi5jbG9uZSgpLCBuZXdfd2FsbGV0LmNsb25lKCkpOw0KICAgICAgICBsZXQgY3VycmVudCA9IENyYWZ0TmV4dXNDb250cmFjdDo6Z2V0X3BsYXRmb3JtX3dhbGxldChlbnYuY2xvbmUoKSk7DQogICAgICAgIGFzc2VydF9lcSEoY3VycmVudCwgbmV3X3dhbGxldCk7DQogICAgfQ0KDQogICAgI1t0ZXN0XQ0KICAgIGZuIGJhbGFuY2VzX3VuY2hhbmdlZF9hZnRlcl9yZWplY3Rpb24oKSB7DQogICAgICAgIGxldCAoZW52LCBhZG1pbiwgX29sZF93YWxsZXQpID0gc2V0dXAoKTsNCiAgICAgICAgQ3JhZnROZXh1c0NvbnRyYWN0OjpkZXBvc2l0KGVudi5jbG9uZSgpLCAxMDAwKTsNCiAgICAgICAgbGV0IGJhbGFuY2VfYmVmb3JlID0gQ3JhZnROZXh1c0NvbnRyYWN0OjpnZXRfYmFsYW5jZShlbnYuY2xvbmUoKSk7DQoNCiAgICAgICAgLy8gQXR0ZW1wdCB1bmF1dGhvcml6ZWQgdXBkYXRlDQogICAgICAgIGxldCBhdHRhY2tlciA9IEFkZHJlc3M6OmdlbmVyYXRlKCZlbnYpOw0KICAgICAgICBsZXQgbmV3X3dhbGxldCA9IEFkZHJlc3M6OmdlbmVyYXRlKCZlbnYpOw0KICAgICAgICBsZXQgXyA9IGVudi5hcy1jb250cmFjdCgpLnRyeV9pbnZva2VfY29udHJhY3QoDQogICAgICAgICAgICAmYXR0YWNrZXIsDQogICAgICAgICAgICAmc3ltYm9sX3Nob3J0ISgidXBkYXRlX3BsYXRmb3JtX3dhbGxldCIpLA0KICAgICAgICAgICAgKCZuZXdfd2FsbGV0LmNsb25lKCksKSwNCiAgICAgICAgKTsNCg0KICAgICAgICBsZXQgYmFsYW5jZV9hZnRlciA9IENyYWZ0TmV4dXNDb250cmFjdDo6Z2V0X2JhbGFuY2UoZW52LmNsb25lKCkpOw0KICAgICAgICBhc3NlcnRfZXEhKGJhbGFuY2VfYmVmb3JlLCBiYWxhbmNlX2FmdGVyKTsNCiAgICB9DQp9DQo=
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
+
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
+
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
+
+/// Error types for the craft-nexus contract.
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
+}
+
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
+}
+
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
+#[contract]
+pub struct CraftNexusContract;
+
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
+    }
+
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
+    }
+
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
+    }
+}
+
+#test
+}
+mod tests {
+    use super::*;
+    use sorban_std::Env;
+
+    #[test]
+    fn get_max_dispute_duration_missing_key_returns_error() {
+        let env = Env::default();
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
+    }
+
+    #[test]
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
+        let env = Env::default();
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
+        );
+    }
+
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
+        );
+    }
+}
