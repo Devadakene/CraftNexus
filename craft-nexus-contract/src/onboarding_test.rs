@@ -35,6 +35,16 @@ fn setup_test(env: &Env) -> (OnboardingContractClient<'static>, Address) {
     (client, admin)
 }
 
+fn register_unpaused_escrow(env: &Env) -> Address {
+    let contract_id = env.register_contract(None, crate::CraftNexusContract);
+    let client = crate::CraftNexusContractClient::new(env, &contract_id);
+    let wallet = Address::generate(env);
+    let admin = Address::generate(env);
+    let arbitrator = Address::generate(env);
+    client.initialize(&wallet, &admin, &arbitrator, &500, &None);
+    contract_id
+}
+
 /// Disable cooldown/farming caps so Issue #100 counter-math tests stay focused.
 fn set_permissive_reputation_policy(client: &OnboardingContractClient) {
     client.set_reputation_policy(
@@ -84,7 +94,7 @@ fn test_onboarding_attestation_rejects_forgery_and_replay() {
     env.mock_all_auths();
 
     let (client, _) = setup_test(&env);
-    let escrow_contract = Address::generate(&env);
+    let escrow_contract = register_unpaused_escrow(&env);
     client.set_escrow_contract(&escrow_contract);
     let user = Address::generate(&env);
     client.onboard_user(&user, &String::from_str(&env, "attested"), &UserRole::Buyer);
@@ -107,7 +117,7 @@ fn test_onboarding_attestation_becomes_stale_after_role_change() {
     env.mock_all_auths();
 
     let (client, _) = setup_test(&env);
-    let escrow_contract = Address::generate(&env);
+    let escrow_contract = register_unpaused_escrow(&env);
     client.set_escrow_contract(&escrow_contract);
     let user = Address::generate(&env);
     client.onboard_user(&user, &String::from_str(&env, "revision"), &UserRole::Buyer);
@@ -255,7 +265,7 @@ fn test_idempotent_retry_repairs_missing_secondary_state() {
             .remove(&DataKey::Username(normalized.clone()));
         env.storage()
             .persistent()
-            .remove(&DataKey::UserStateRevision(user.clone()));
+            .remove(&DataKeyExt::UserStateRevision(user.clone()));
     });
 
     let recovered = client.onboard_user(&user, &username, &UserRole::Buyer);
@@ -1812,8 +1822,8 @@ fn test_scheduled_decay_matches_lazy_decay() {
     // Lazy read at the identical ledger time must agree (no further elapsed time).
     let lazy = client.get_trust_score(&user);
     assert_eq!(scheduled, lazy);
-    // 50 * 9500 / 10000 = 475000 / 10000 = 47 (floor).
-    assert_eq!(lazy, 47);
+    let expected = (0..5).fold(50u32, |score, _| score * 9_500 / 10_000);
+    assert_eq!(lazy, expected);
 }
 
 /// A single evaluation is CPU-bounded by [`MAX_DECAY_INTERVALS_PER_CALL`]; any

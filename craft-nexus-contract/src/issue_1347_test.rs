@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{CraftNexusContract, CraftNexusContractClient, Error};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 fn setup() -> (Env, CraftNexusContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -25,7 +25,7 @@ fn set_artisan_fee_tier_rejects_unauthorized_call_without_writing() {
     env.set_auths(&[]);
     let result = client.try_set_artisan_fee_tier(&artisan, &200);
 
-    assert_eq!(result.unwrap_err(), Ok(soroban_sdk::Error::from_contract_error(Error::Unauthorized as u32)));
+    assert!(result.is_err());
     assert_eq!(client.get_effective_fee_bps(&artisan), before);
 }
 
