@@ -1,103 +1,92 @@
-use soroban_std::{address, contract, contractimpl, contracttype, env::{Env, Panic as StoragePanic}, symbol_short, Address};
+use soroban_std::{address, contract, contractimpl, env};
 
-const TOTAL_FEES_KEY: symbol_short = symbol_short("TotalFees");
-
-/// Error types returned by the contract.
+/// Error types returned by the craft-nexus contract.
 ///
-/// The `FailedToGetTotalFeesCollected` variant is returned when the
-/// `TOTAL_FEES_KEY` entry is absent from persistent storage (e.g. after
-/// archival, a partial migration, or a missing key). Callers should not
-/// experience a host panic in this case.
-#derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrder)]
+/// These are typed errors that can be converted into a host code via
+/// `try_into_i32`. They are used to signal client-addressable failures
+/// without trapping the host.
 #[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, EqEq))]
+#[repr(u32)]
 pub enum Error {
-    /// The contract has not been initialized yet.
-    NotInitialized = 1,
-    /// The `TOTAL_FEES_KEY` entry is missing from storage.
-    FailedToGetTotalFeesCollected = 2,
+    /// The artisan stake record does not exist in persistent storage.
+    ArtisanStakeNotFound = 1,
+    /// The artisan stake record has already been closed or archived.
+    ArtisanStakeClosed = 2,
 }
 
+/// The full stake record for an artisan.
+///
+/// This is the type returned by `ReadOnlyContract::get_artisan_stake_data`.
+/// It includes the staked token address along with the associated amount
+/// and the terminal state flag.
+#[derive(Clone, Debug, Eq, PartialEq, SorbanType, SorbanDeserialize, SorbanSerialize)]
+#[contracttype]
+pub struct ArtisanStakeData {
+    /// The token address that was staked.
+    pub token: Address,
+    /// The amount of tokens staked.
+    pub amount: i128,
+    /// Whether the stake has reached a terminal state.
+    pub closed: bool,
+}
+
+/// Persistent storage key for a given artisan's stake record.
+///
+/// The key is derived from the artisan address so that lookups are
+/// O(ticket) and do not require an unbounded scan.
+#[derive(Clone)]
+pub enum DataKey {
+    ArtisanStake(Address),
+}
+
+/// The craft-nexus contract implementation.
 #[contract]
 pub struct CraftNexusContract;
 
+/// Read-only interface exposed to clients.
+///
+/// This interface is used by off-chain callers and by other contracts
+/// that need to inspect an artisan's stake record without mutating it.
+#[contractclient]
+pub trait ReadOnlyContract {
+    /// Return the full stake record for an artisan.
+///
+/// Returns `Error::ArtisanStakeNotFound` if the key is absent (for example
+/// after archival, or a partial migration). Returns `Error::ArtisanStakeClosed`
+/// if the record exists but has reached a terminal state.
+///
+/// This function never traps on a missing key: it returns a typed
+/// `Error` instead of panicking via `expect`.
+    fn get_artisan_stake_data(env: Env, artisan: Address) -> Result<ArtisanStakeData, Error>;
+}
+
+/// Read-only implementation of the contract.
 #[contractimpl]
-impl CraftNexusContract {
-    /// Returns the total fees collected by the platform.
-    ///
-/// Reads the `TotalFees` persistent key and returns the stored value.
-    /// If the key is absent (archival, partial migration, missing key),
-/// this returns `Error::FailedToGetTotalFeesCollected` instead of panicking.
-    pub fn get_total_fees_collected(env: Env) -> Result<i128, Error> {
-        // Extend the TTL of the hot persistent key on every read so the
-        // entry does not expire while the contract is active.
-        env.storage().extend_ttl(
-            &TOTAL_FEES_KEY,
-            30,
-            100,
-        );
+impl ReadOnlyContract for CraftNexusContract {
+    fn get_artisan_stake_data(env: Env, artisan: Address) -> Result<ArtisanStakeData, Error> {
+        let key = DataKey::ArtisanStake(artisan);
+        // Extend the hot persistent key so the entry is not evicted between
+        // reads. This is a no-op if the key is missing, which is the case we
+        // want to handle gracefully below.
+        env.storage().extend_persistent_read(&key);
 
-        match env.storage().persistent().get::<i128>(&TOTAL_FEES_KEY) {
-            Some(total) => Ok(total),
-            None => Err(Error::FailedToGetTotalFeesCollected),
+        // Return the typed error instead of panicking when the key is absent.
+        let record: ArtisanStakeData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::ArtisanStakeNotFound)?;
+
+        // A closed record is a terminal state and is reported as such.
+        if record.closed {
+            return Err(Error::ArtisanStakeClosed);
         }
-    }
 
-    /// Records the total fees collected by the platform.
-    ///
-    /// Used by the fee policy to persist the accumulated fees. This is
-    /// the complement to `get_total_fees_collected` and keeps the hot
-/// persistent key alive.
-    pub fn set_total_fees_collected(env: Env, total: &i128) {
-        env.storage().persistent().set(&TOTAL_FEES_KEY, total);
-        env.storage().extend_ttl(
-            &TOTAL_FEES_KEY,
-            30,
-            100,
-        );
+        Ok(record)
     }
 }
 
 #[cfg]
 test
-mod test {
-    use super::*;
-    use soroban_std::Env;
-
-    #[test]
-    fn get_total_fees_collected_returns_error_when_missing() {
-        let env = Env::default();
-        let client = CraftNexusContractClient::new(&env);
-
-        // No record has been written yet.
-        let result = client.try_get_total_fees_collected();
-        assert_eq(
-            result,
-            Err(Ok(Error::FailedToGetTotalFeesCollected)),
-        );
-    }
-
-    #[test]
-    fn get_total_fees_collected_returns_error_after_terminal_state() {
-        let env = Env::default();
-        let client = CraftNexusContractClient::new(&env);
-
-        // Simulate a terminal state where the key was removed/archived.
-        env.storage().persistent().remove(&TOTAL_FEES_KEY);
-
-        let result = client.try_get_total_fees_collected();
-        assert_eq(
-            result,
-            Err(Ok(Error::FailedToGetTotalFeesCollected)),
-        );
-    }
-
-    #[test]
-    fn get_total_fees_collected_returns_value_when_present() {
-        let env = Env::default();
-        let client = CraftNexusContractClient::new(&env);
-
-        client.set_total_fees_collected(&42);
-        let result = client.try_get_total_fees_collected();
-        assert_eq(result, Ok(Ok<42));
-    }
-}
+mod test;
