@@ -8896,7 +8896,7 @@ fn test_differential_upgrade_compatibility_representative_fixture() {
     let migrated = client.migrate_storage_layout();
     assert_eq!(migrated, CURRENT_STORAGE_LAYOUT_VERSION);
 
-    let after = capture_differential_snapshot(
+      let after = capture_differential_snapshot(
         &env,
         &client,
         &token_client,
