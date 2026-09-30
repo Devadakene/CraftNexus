@@ -3,7 +3,7 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger},
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryIntoVal,
 };
 
@@ -82,6 +82,47 @@ fn make_escrow_create_params(
         metadata_hash: None,
         service_agreement_hash: None,
     }
+}
+
+#[test]
+fn get_platform_config_refreshes_instance_ttl() {
+    let env = Env::default();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = super::ttl::TTL_EXTENSION - 5_000;
+    });
+    assert_eq!(client.get_platform_config().admin, admin);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = super::ttl::TTL_EXTENSION + 1;
+    });
+    assert_eq!(client.get_platform_config().admin, admin);
+}
+
+#[test]
+fn get_stake_refreshes_active_persistent_record_ttl() {
+    let env = Env::default();
+    let (client, _, artisan, token_id, _, _, _) = setup_test(&env, true);
+    let stake_key = DataKey::ArtisanStake(artisan.clone());
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &stake_key,
+            &ArtisanStakeData {
+                amount: 500,
+                token: token_id,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set_ttl(&stake_key, super::ttl::PERSISTENT_TTL_THRESHOLD - 1);
+    });
+
+    assert_eq!(client.get_stake(&artisan), 500);
+    env.as_contract(&client.address, || {
+        assert!(env.storage().persistent().get_ttl(&stake_key) >= super::ttl::TTL_EXTENSION);
+    });
 }
 
 #[test]
@@ -6617,6 +6658,33 @@ fn test_platform_config_ttl_extension_on_read() {
     // Read again - should still succeed because the TTL was extended on read
     let config_after = client.get_platform_config();
     assert_eq!(config.admin, config_after.admin);
+}
+
+#[test]
+fn test_shared_ttl_refresh_helper_refreshes_active_persistent_entry() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let key = DataKey::Escrow(1);
+
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(&key, &true);
+        super::ttl::refresh_persistent(&env, &key);
+        assert!(
+            env.storage().persistent().get_ttl(&key) >= super::ttl::TTL_EXTENSION
+        );
+    });
+}
+
+#[test]
+fn test_shared_ttl_refresh_helper_does_not_refresh_missing_entry() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let key = DataKey::Escrow(1);
+
+    env.as_contract(&contract_id, || {
+        assert!(!super::ttl::refresh_persistent_if_present(&env, &key));
+        assert!(!env.storage().persistent().has(&key));
+    });
 }
 
 // ===== Issue #656: funding_deadline / cancel_unfunded_escrow / auto_cancel_unfunded =====
