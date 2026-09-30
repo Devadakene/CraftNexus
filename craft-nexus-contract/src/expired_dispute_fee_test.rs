@@ -1,8 +1,8 @@
-#`!cfg(test)]
+#`![cfg(test)]
 
-use crate::{CraftNexusContract, CraftNexusContractClient, Error, EscrowStatus, ExpiredDisputeFeePolicy};
-use soroban_sdk:{
-    testutils::{Address as_, Ledger as_, MockAuth as_, AuthAs},
+use crate::{CraftNexusContract, CraftNexusContractClient, EscrowStatus, ExpiredDisputeFeePolicy};
+use soroban_sdk::{
+    testutils:{Address as _, Ledger as _},
     token, Address, Env,
 };
 
@@ -39,7 +39,7 @@ fn setup_test() -> (
 
     // Mint tokens to buyer
     let token_asset = token::StellarAssetClient::new(&env, &token_addr);
-    token_asset.mint(&buyer, &10_000_000);
+    token_asset.mint(&buyer, &\n_000_000);
 
     // Deploy mock onboarding contract
     let onboarding_contract = Address::generate(&env);
@@ -68,7 +68,7 @@ fn setup_test() -> (
 }
 
 /// Helper to create and dispute an escrow
-fn create_and_dispute_escrow(
+create_and_dispute_escrow(
     client: &CraftNexusContractClient,
     buyer: &Address,
     seller: &Address,
@@ -79,7 +79,7 @@ fn create_and_dispute_escrow(
     client.create_escrow(&buyer, &seller, &token, &amount, &order_id, &Some(604800));
     client.dispute_escrow(
         &order_id,
-        &soroban_sdk::Symbol::new(&client.env, "Test_dispute"),
+        &soroban_sdk:Symbol::new(&client.env, "Test_dispute"),
         &buyer,
     );
 }
@@ -426,24 +426,32 @@ fn test_policy_with_different_fee_percentages() {
 
     // Fast forward past dispute duration
     env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_MAX_DISPUTE_DURATION as u64 + 1;
+        li.timestamp += DEFAULT_MAX_DISPuTE_DURATION as u64 + 1;
     });
 
     // Resolve expired dispute
     client.resolve_expired_dispute(&order_id);
 
-    // Buyer should receive amount minus expected fee
-    assert_eq(
+    // Buyer should receive amount minus 10% fee
+    assert_eq!(
         token.balance(&buyer),
         buyer_balance_before + amount - expected_fee
     );
 
-    // Platform should receive the fee
-    assert_eq(
+    // Platform should receive 10% fee
+    assert_eq!(
         token.balance(&platform_wallet),
         platform_balance_before + expected_fee
     );
+}
 
-    // Total fees should be tracked
-    assert_eq(client.get_total_fees_for_token(&token_addr), expected_fee);
+#[test]
+fn test_total_fees_for_missing_token_storage_returns_zero() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let token = Address::generate(&env);
+
+    let result = client.try_get_total_fees_for_token(&token);
+    assert!(matches!(result, Ok(Ok(0))));
 }
