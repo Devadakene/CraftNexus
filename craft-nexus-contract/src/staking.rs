@@ -1,9 +1,19 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Ledger},
+
     vec, Address, Env, Vec,
 };
+
+// ============================================================================
+// 0. ERROR TYPES
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeNotFound = 1,
+}
 
 // ============================================================================
 // 1. DATA STRUCTURES & KEYS
@@ -16,6 +26,12 @@ const COOLDOWN_PERIOD: u64 = 86400 * 7; // 7 days in seconds
 pub struct StakeEntry {
     pub amount: i128,
     pub unlock_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    StakeHealthSnapshotNotFound = 1,
 }
 
 #[contracttype]
@@ -95,6 +111,14 @@ impl StakeContract {
             .get(&DataKey::UserStakes(user))
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    /// Read-only function to inspect a user's persisted stake health snapshot.
+    /// Returns `None` if `evaluate_stake_health` has never been called for the user.
+    pub fn get_stake_health_snapshot(env: Env, user: Address) -> Option<StakeEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserStakes(user))
+    }
 }
 
 // ============================================================================
@@ -104,8 +128,9 @@ impl StakeContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup() -> (Env, Address, StakeContractClient) {
+    fn setup() -> (Env, Address, StakeContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -214,5 +239,23 @@ mod tests {
             0,
             "Queue should be empty after all stakes mature"
         );
+    }
+
+    #[test]
+    fn test_get_stake_health_snapshot_missing_key_returns_none() {
+        let (env, user, client) = setup();
+
+        // No record exists yet: must not trap, must return None.
+        let snapshot = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot, None, "Missing snapshot should return None");
+
+        // After a terminal state (all stakes withdrawn), still safe.
+        client.stake(&user, &1000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
+        client.withdraw_matured(&user);
+
+        let snapshot_after = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot_after, None, "Snapshot should remain None");
     }
 }
