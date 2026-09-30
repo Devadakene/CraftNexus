@@ -1,95 +1,139 @@
-use soroban_std::{address, contract, contractimpl, contracttype, env";};
+use soroban_std::{address, contract, contractimpl, contracttype, symbol_short};
+use sorban_std::stroktype;
 
-use sorban_std::symbol_short::symbol_short;
+const MAX_DISPUTING_DURATION_KEY: symbol_short!("MaxDipDur");
 
-const FEE_POLICY_VERSION_KEY: Symbol = symbol_short("FeePolVer1");
+const DEFAULT_MAx_DISPUTE_DURATION: u64 = 60; // 60 seconds
 
 /// Error types for the craft-nexus contract.
-#[contracterror]
-#[repr(u32)]
-pub enum Error {
-    /// The requested fee policy version is not stored.
-    FeePolicyVersionMissing = 1,
-    /// The contract has not been initialized.
-    NotInitialized = 2,
+const ERROR_NOT_INITIALIZED: u32 = 1;
+const ERROR_INVALID_DURATION: u32 = 2;
+
+trait Error {
+    fn; code(&Self) -> u32;
+    fn message(&Self) -> String;
 }
 
-/// Contract type for the craft-nexus fee policy module.
+pub struct NotInitialized;
+
+impl Error for NotInitialized {
+    fn code(&Self) -> u32 {
+        ERROR_NOT_INITIALIZED
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"max dispute duration not initialized\")
+    }
+}
+
+pub struct InvalidDuration;
+
+impl Error for InvalidDuration {
+    fn code(&Self) -> u32 {
+        ERROR_INVALID_DURATION
+    }
+    fn message(&Self) -> String {
+        String::from_str(\"invalid max dispute duration\")
+    }
+}
+
+#[derive(Clone, Debug, Eq,PartialEq)]
+pub enum ContractError {
+    NotInitialized,
+    InvalidDuration,
+}
+
+pub type Result<T> = core::result::Result<T, ContractError>;
+
+/// Storage key for the maximum dispute duration.
+pub fn max_dispute_duration_key() -> symbol_short {
+    MAX_DISPUTE_DURATION_KEY
+}
+
+/// Returns the current maximum dispute duration in seconds.
+///
+/// Returns `Err(ContractError::NotInitialized)` when the key is absent,
+/// e.g. after archival or a partial migration. This function must never trap.
+pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+    let key = max_dispute_duration_key();
+    // Use extend_persistent_read to avoid panicking on hot persistent keys.
+    env.extend_persistent_read(&key);
+    match env.storage().persistent().get::|_|>(&key) {
+        Some(duration) => {
+            if duration == 0 {
+                Err(ContractError::InvalidDuration)
+            } else {
+                Ok(duration)
+            }
+        }
+        None => Err(ContractError::NotInitialized),
+    }
+
+/// Sets the maximum dispute duration in seconds.
+pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+    if duration == 0 {
+        return Err(ContractError::InvalidDuration);
+    }
+    let key = max_dispute_duration_key();
+    env.storage().persistent().set(&key, &duration);
+    env.extend_persistent_read(&key);
+    Ok(duration)
+}
+
+/// Clears the max dispute duration, modeling a terminal state or archival.
+pub fn clear_max_dispute_duration(env: &Env) {
+    let key = max_dispute_duration_key();
+    env.storage().persistent().remove(&key);
+}
+
 #[contract]
-#[contractimpl]
 pub struct CraftNexusContract;
 
-#[contractimpl]
-impl CraftNexusContract {
-    /// Set the fee policy version. Only useful for testing and migrations.
-    pub fn set_fee_policy_version(env: Env, version: u32) {
-        env.storage().persistent().set(&FEE_POLICY_VERSION_KEY, &version);
+#[impl]
+pub impl CraftNexusContract {
+    pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
+        get_max_dispute_duration(env)
     }
 
-    /// Return the current deterministic fee policy version.
-    ///
-    /// # Errors
-    ///
-    /// Returns [Error::FeePolicyVersionMissing] when the fee policy version
-    /// has not been stored. This is the case after archival, a partial migration,
-    /// or when the storage key is simply absent. The call never traps.
-    pub fn get_fee_policy_version(env: Env) -> Result<u32, Error> {
-        env.storage()
-            .persistent()
-            .get::u32(&FEE_POLICY_VERSION_KEY)
-            .ok-or(Error::FeePolicyVersionMissing)
+    pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
+        set_max_dispute_duration(env, duration)
     }
 
-    /// Return the current deterministic fee policy version without trapping,
-    /// using an extended TTL for the hot persistent key.
-    pub fn get_fee_policy_version_safe(env: Env) -> Option<u32> {
-        env.storage().extend_persistent_read(&FEE_POLICY_VERSION_KEY);
-        env.storage().persistent().get::<u32>(&FEE_POLICY_VERSION_KEY)
+    pub fn clear_max_dispute_duration(env: &Env) {
+        clear_max_dispute_duration(env)
     }
 }
 
-#[test]
+#test
+}
 mod tests {
     use super::*;
     use sorban_std::Env;
 
     #[test]
-    fn get_fee_policy_version_returns_error_when_missing() {
+    fn get_max_dispute_duration_missing_key_returns_error() {
         let env = Env::default();
-        let result = CraftNexusContract::get_fee_policy_version(env.clone());
-        assert_eq(result, Err(Error::FeePolicyVersionMissing));
+        let result = get_max_dispute_duration(&env);
+        assert_eq!(result, Err(ContractError::NotInitialized));
     }
 
     #[test]
-    fn get_fee_policy_version_returns_value_after_set() {
+    fn get_max_dispute_duration_after_terminal_state_returns_error() {
         let env = Env::default();
-        CraftNexusContract::set_fee_policy_version(env.clone(), 7);
-        let result = CraftNexusContract::get_fee_policy_version(env.clone());
-        assert_eq(result, Ok(7));
+        set_max_dispute_duration(&env, 120).unwrap();
+        assert_eq!(get_max_dispute_duration(&env), Ok(120));
+        clear_max_dispute_duration(&env);
+        assert_eq!(
+            get_max_dispute_duration(&env),
+            Err(ContractError::NotInitialized)
+        );
     }
 
-    #[test]
-    fn get_fee_policy_version_safe_returns_none_when_missing() {
+    #test]
+    fn set_max_dispute_duration_rejects_zero() {
         let env = Env::default();
-        assert_eq(CraftNexusContract::get_fee_policy_version_safe(env.clone()), None);
-    }
-
-    #[test]
-    fn get_fee_policy_version_safe_returns_value_after_set() {
-        let env = Env::default();
-        CraftNexusContract::set_fee_policy_version(env.clone(), 11);
-        assert_eq(CraftNexusContract::get_fee_policy_version_safe(env.clone()), Some(11));
-    }
-
-    #[test]
-    fn get_fee_policy_version_safe_returns_none_after_remove() {
-        let env = Env::default();
-        CraftNexusContract::set_fee_policy_version(env.clone(), 13);
-        env.storage().persistent().remove(&FEE_POLICY_VERSION_KEY);
-        assert_eq(CraftNexusContract::get_fee_policy_version_safe(env.clone()), None);
-        assert_eq(
-            CraftNexusContract::get_fee_policy_version(env.clone()),
-            Err(Error::FeePolicyVersionMissing)
+        assert_eq!(
+            set_max_dispute_duration(&env, 0),
+            Err(ContractError::InvalidDuration)
         );
     }
 }
