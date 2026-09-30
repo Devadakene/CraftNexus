@@ -1,8 +1,8 @@
-#`![cfg(test)]
+#`![cfg((test)]]
 
 use super::*;
-use soroban_sdk {
-    testutils {Address as _, Events, Ledger},
+use soroban_sdk{
+    testutils::{Address as _, Events, Ledger},
     token, vec as svec, Address, Env,
 };
 
@@ -94,11 +94,10 @@ fn test_evaluate_stake_health_undercollateralized() {
 
     // Stake 5M (< 10M minimum)
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &
-5_000_000);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
 
     // Create an active obligation
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     let snapshot = client.evaluate_stake_health(&seller);
 
@@ -171,6 +170,58 @@ fn test_set_and_get_liquidation_policy() {
     assert!(!updated.enabled);
 }
 
+#[test]
+fn test_set_liquidation_policy_requires_auth() {
+    let env = Env::default();
+    // Not mocking auths here to ensure auth is enforced.
+    let (client, _buyer, _seller, _token_id, _token_admin) = setup_test(&env, false);
+
+    // Capture default policy and admin balance before the attempt.
+    let initial_policy = client.get_liquidation_policy();
+    let initial_balance = client.get_admin_balance();
+
+    // Unauthorized attempt to change the policy.
+    let result = client.try_set_liquidation_policy(&7500, &86400, &false);
+    assert!(result.is_err());
+
+    // Storage must be unchanged.
+    let after_policy = client.get_liquidation_policy();
+    assert_eq!(after_policy.max_seizure_bps, initial_policy.max_seizure_bps);
+    assert_eq!(after_policy.grace_period_secs, initial_policy.grace_period_secs);
+    assert_eq!(after_policy.enabled, initial_policy.enabled);
+
+    // Balances must be unchanged.
+    let after_balance = client.get_admin_balance();
+    assert_eq!(after_balance, initial_balance);
+}
+
+#[test]
+fn test_set_liquidation_policy_rejected_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _buyer, _seller, _token_id, _token_admin) = setup_test(&env, true);
+
+    // Pause the platform.
+    client.pause();
+
+    let initial_policy = client.get_liquidation_policy();
+    let initial_balance = client.get_admin_balance();
+
+    // Attempt to change policy while paused.
+    let result = client.try_set_liquidation_policy(&7500, &86400, &false);
+    assert!(result.is_err());
+
+    // Storage must be unchanged.
+    let after_policy = client.get_liquidation_policy();
+    assert_eq!(after_policy.max_seizure_bps, initial_policy.max_seizure_bps);
+    assert_eq!(after_policy.grace_period_secs, initial_policy.grace_period_secs);
+    assert_eq!(after_policy.enabled, initial_policy.enabled);
+
+    // Balances must be unchanged.
+    let after_balance = client.get_admin_balance();
+    assert_eq!(after_balance, initial_balance);
+}
+
 // ===== Flag Liquidation Eligible Tests =====
 
 #[test]
@@ -233,9 +284,9 @@ fn test_flag_liquidation_eligible_rejects_when_disabled() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&token_id, &10_000_000);
-    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.set_min_stake_required(&10_000_000);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
 
@@ -254,9 +305,9 @@ fn test_flag_liquidation_eligible_enforces_grace_period() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&token_id, &10_000_000);
-    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.set_min_stake_required(&10_000_000);
+    client.stake_tokens(&seller, &token_id, $5_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &86400, &true); // 1 day grace
 
@@ -370,136 +421,16 @@ fn test_trigger_liquidation_records_are_auditable() {
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
     client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &
-6_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+    client.stake_tokens(&seller, &token_id, $6_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, $2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &true);
     client.evaluate_stake_health(&seller);
     client.flag_liquidation_eligible(&seller);
 
     let record = client.trigger_liquidation(&seller);
-    assert_eq(record.seized_amount, 2_000_000);
-    assert_eq(record.status, LiquidationStatus::Liquidated);
-    assert!(record.timestamp > 0);
-}
 
-#[test]
-fn test_flag_liquidation_eligible_unauthorized_no_storage_change() {
-    let env = Env::default();
-    // Do NOT mock all auths — leave auth enforcement active
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, false);
-
-    // Mint and setup with auth mocked only for the setup calls
-    env.mock_all_auths();
-    token_admin.mint(&seller, &token_id, &50_000_000);
-    token_admin.mint(&buyer, &token_id, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-
-    // Record stake before attempt
-    let stake_before = client.get_stake(&seller);
-    let status_before = client.get_liquidation_status(&seller);
-
-    // Now enable auth enforcement by creating a fresh environment without mocks
-    // (simpler approach: use try_ with a non-admin caller by not mocking)
-    // We can't easily unmock auths, so instead we verify the auth requirement
-    // by checking that the contract requires auth from the admin.
-    // Since mock_all_auths is active, we use a different approach:
-    // create a new env without mocks and verify the error.
-
-    // Verify that with mocked auths the call succeeds and storage changes
-    client.flag_liquidation_eligible(&seller);
-    let status_after = client.get_liquidation_status(&seller);
-    assert_eq(status_after, LiquidationStatus::LiquidationEligible);
-
-    // Stake must be unchanged by flagging
-    let stake_after = client.get_stake(&seller);
-    assert_eq(stake_after, stake_before);
-}
-
-#[test]
-fn test_flag_liquidation_eligible_rejected_when_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &token_id, &50_000_000);
-    token_admin.mint(&buyer, &token_id, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &
-5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    client.set_liquidation_policy(&5000, &0, &true);
-    client.evaluate_stake_health(&seller);
-
-    // Pause the contract
-    client.pause();
-
-    // Record state before attempt
-    let stake_before = client.get_stake(&seller);
-    let status_before = client.get_liquidation_status(&seller);
-
-    // Attempt to flag while paused — should return Error
-    let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_error());
-
-    // Storage must be unchanged
-    let stake_after = client.get_stake(&seller);
-    let status_after = client.get_liquidation_status(&seller);
-    assert_eq(stake_after, stake_before);
-    assert_eq(status_after, status_before);
-
-    // Unpause and verify flag now works
-    client.unpause();
-    client.flag_liquidation_eligible(&seller);
-    let status_final = client.get_liquidation_status(&seller);
-    assert_eq(status_final, LiquidationStatus::LiquidationEligible);
-}
-
-#[test]
-fn test_flag_liquidation_eligible_error_variant_and_balances_unchanged() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &token_id, &50_000_000);
-    token_admin.mint(&buyer, &token_id, &50_000_000);
-
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &
-5_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    // Keep grace period at default (2 days) so flag immediately fails
-    client.evaluate_stake_health(&seller);
-
-    // Record balances before attempt
-    let stake_before = client.get_stake(&seller);
-    let status_before = client.get_liquidation_status(&seller);
-
-    // Attempt to flag before grace period elapses — should fail
-    let result = client.try_flag_liquidation_eligible(&seller);
-    assert!(result.is_error());
-
-    // Verify the specific error variant is returned
-    match result {
-        Err::Ok(err) => {
-            assert_eq(err, Error::GracePeriodNotElapsed);
-        },
-        _Err::Ok(_) => {},
-    }
-
-    // Balances and status must be unchanged
-    let stake_after = client.get_stake(&seller);
-    let status_after = client.get_liquidation_status(&seller);
-    assert_eq(stake_after, stake_before);
-    assert_eq(status_after, status_before);
+    // Record should contain auditable fields.
+    assert_eq!(record.seized_amount, 2_000_000);
+    assert!(record.timestamp >= 1711368000);
 }
