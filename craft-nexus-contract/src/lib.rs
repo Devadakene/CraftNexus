@@ -67,7 +67,6 @@ pub fn get_max_dispute_duration(env: &Env) -> Result<u64> {
         }
         None => Err(ContractError::NotInitialized),
     }
-}
 
 /// Sets the maximum dispute duration in seconds.
 pub fn set_max_dispute_duration(env: &Env, duration: u64) -> Result<u64> {
