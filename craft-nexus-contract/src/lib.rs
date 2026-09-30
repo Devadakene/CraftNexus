@@ -252,6 +252,9 @@ pub enum Error {
 /// validation, permanent config) will **never** succeed on retry without
 /// a different input or caller.
 #[must_use]
+/// Returns `true` if `error` represents a transient/contention condition
+/// (e.g. reentry, pause, cooldowns) that a caller may reasonably retry,
+/// as opposed to a permanent validation or authorization failure.
 pub fn is_retryable(error: Error) -> bool {
     matches!(
         error,
