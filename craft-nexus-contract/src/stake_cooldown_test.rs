@@ -101,19 +101,31 @@ fn test_matured_deposits_remain_withdrawable() {
 }
 
 #[test]
-fn test_get_stake_missing_key_returns_zero_or_error() {
-    let (_env, client, _, artisan, _) = setup_env();
+fn test_get_artisan_stake_data_missing_key() {
+    let (_env, client, _, artisan, _token) = setup_env();
 
-    // No stake has been recorded for this artisan yet.
-    // get_stake must not trap; it should return 0 or a typed error.
-    let result = client.try_get_stake(&artisan);
-    match result {
-        Ok(value) => assert_eq!(value, 0, "Missing stake key should return zero"),
-        Err(_) => {},
-    }
+    // Before any stake record exists, the call must not trap.
+    let result = client.try_get_artisan_stake_data(&artisan);
+    assert!(
+        result.is_error(),
+        "get_artisan_stake_data should return an error when the key is absent"
+    );
+}
 
-    // After a terminal state (full unstake), get_stake must still be safe.
-    // Stake and then fully withdraw after cooldown.
-    // Note: this section only exercises the missing-key path after a record
-    // exists; the initial assertion above covers the pure missing-key case.
+#[test]
+fn test_get_artisan_stake_data_after_terminal_state() {
+    let (env, client, _, artisan, token) = setup_env();
+
+    client.stake_tokens(&artisan, &token.address, &1000);
+
+    // Advance past the cooldown and fully unstake to reach a terminal state.
+    env.ledger().set_timestamp(env.ledger().timestamp() + (86400 * 7) + 1);
+    client.unstake_tokens(&artisan, &token.address);
+
+    // After the terminal state, the call must not trap and should return an error.
+    let result = client.try_get_artisan_stake_data(&artisan);
+    assert!(
+        result.is_error(),
+        "get_artisan_stake_data should return an error after the terminal state"
+    );
 }
