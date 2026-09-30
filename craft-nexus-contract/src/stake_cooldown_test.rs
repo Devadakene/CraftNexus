@@ -1,1 +1,131 @@
-IWNmZyh0ZXN0KV0KZXh0ZXJuIGNyYXRlIHN0ZDsKCnVzZSBjcmF0ZTo6e0NyYWZ0TmV4dXNDb250cmFjdCwgQ3JhZnROZXh1c0NvbnRyYWN0Q2xpZW50LCBFcnJvcn07CnVzZSBzb3JvYmFuX3Nkazp7CiAgICB0ZXN0dXRpbHM6e0FkZHJlc3MgYXMgXywgTGVkZ2VyfSwKICAgIHRva2VuOjpDbGllbnQgYXMgVG9rZW5DbGllbnQsCiAgICBBZGRyZXNzLCBFbnYsCn07CgpmbiBzZXR1cF9lbnY8J2E+KCkgLT4gKAogICAgRW52LAogICAgQ3JhZnROZXh1c0NvbnRyYWN0Q2xpZW50PCdhPiwKICAgIEFkZHJlc3MsCiAgICBBZGRyZXNzLAogICAgVG9rZW5DbGllbnQ8J2E+LAopIHsKICAgIGxldCBlbnYgPSBFbnY6OmRlZmF1bHQoKTsKICAgIGVudi5tb2NrX2FsbF9hdXRocygpOwogICAgLy8gSW5pdGlhbGl6ZSBsZWRnZXIgdGltZSB0byBhIGtub3duIGJhc2VsaW5lCiAgICBlbnYubGVkZ2VyKCkuc2V0X3RpbWVzdGFtcCgxXzAwMF8wMDApOwoKICAgIGxldCBhZG1pbiA9IEFkZHJlc3M6OmdlbmVyYXRlKCZlbnYpOwogICAgbGV0IGFydGlzYW4gPSBBZGRyZXNzOjpnZW5lcmF0ZSgmZW52KTsKCiAgICAvLyBTZXR1cCBuYXRpdmUgdG9rZW4gZm9yIHN0YWtpbmcKICAgIGxldCB0b2tlbl9hZG1pbiA9IEFkZHJlc3M6OmdlbmVyYXRlKCZlbnYpOwogICAgbGV0IHRva2VuX2NvbnRyYWN0ID0gZW52LnJlZ2lzdGVyX3N0ZWxsYXJfYXNzZXRfY29udHJhY3QodG9rZW5fYWRtaW4uY2xvbmUoKSk7CiAgICBsZXQgdG9rZW5fY2xpZW50ID0gVG9rZW5DbGllbnQ6Om5ldygmZW52LCAmdG9rZW5fY29udHJhY3QpOwogICAgbGV0IHN0ZWxsYXJfYXNzZXRfY2xpZW50ID0gc29yb2Jhbl9zZGt0b2tlbjo6U3RlbGxhckFzc2V0Q2xpZW50OjpuZXcoJmVudiwgJnRva2VuX2NvbnRyYWN0KTsKICAgIHN0ZWxsYXJfYXNzZXRfY2xpZW50Lm1pbnQoJmFydGlzYW4sICZxMTBfMDAwKTsKCiAgICAvLyBTZXR1cCBtYWluIGNvbnRyYWN0CiAgICBsZXQgY29udHJhY3RfaWQgPSBlbnYucmVnaXN0ZXJfY29udHJhY3QoTm9uZSwgQ3JhZnROZXh1c0NvbnRyYWN0KTsKICAgIGxldCBjbGllbnQgPSBDcmFmdE5leHVzQ29udHJhY3RDbGllbnQ6Om5ldygmZW52LCAmY29udHJhY3RfaWQpOwoKICAgIGNsaWVudC5pbml0aWFsaXplKAogICAgICAgICZhZG1pbiwgLy8gcGxhdGZvcm1fd2FsbGV0CiAgICAgICAgJmFkbWluLCAvLyBhZG1pbgogICAgICAgICZhZG1pbiwgLy8gYXJiaXRyYXRvcgogICAgICAgICZ1NTAwLCAgIC8vIHBsYXRmb3JtX2ZlZV9icHMKICAgICAgICAmTm9uZSwgIC8vIG9uYm9hcmRpbmdfY29udHJhY3QKICAgICk7CgogICAgY2xpZW50LndoaXRlbGlzdF90b2tlbigmdG9rZW5fY29udHJhY3QpOwoKICAgIChlbnYsIGNsaWVudCwgYWRtaW4sIGFydGlzYW4sIHRva2VuX2NsaWVudCkKfQoKI1t0ZXN0XQpmbiB0ZXN0X25ld19kZXBvc2l0X2RvZXNfbm90X2J5cGFzc19jb29sZG93bigpIHsKICAgIGxldCAoZW52LCBjbGllbnQsIF8sIGFydGlzYW4sIHRva2VuKSA9IHNldHVwX2VudigpOwoKICAgIC8vIDEuIEluaXRpYWwgc3Rha2UKICAgIGNsaWVudC5zdGFrZV90b2tlbnMoJmFydGlzYW4sICZ0b2tlbi5hZGRyZXNzKCksICZxMTAwMCk7CiAgICBsZXQgaW5pdGlhbF90aW1lID0gZW52LmxlZGdlci gpLnRpbWVzdGFtcCgpOwoKICAgIC8vIDIuIEFkdmFuY2UgdGltZSBmb3J3YXJkLCBidXQgbm90IHBhc3QgdGhlIDctZGF5IGNvb2xkb3duICgzLjUgZGF5cykKICAgIGVudi5sZWRnZXIoKS5zZXRfdGltZXN0YW1wKGluaXRpYWxfdGltZSArICg4NjQwMCAqIDcpIC8gMik7CgogICAgLy8gMy4gU2Vjb25kIHN0YWtlIGFkZGVkCiAgICBjbGllbnQuc3Rha2VfdG9rZW5zKCZhcnRpc2FuLCAmdG9rZW4uYWRkcmVzcygpLCAmcTUwMCk7CgogICAgLy8gNC4gQXR0ZW1wdCB3aXRoZHJhd2FsLiBOZWl0aGVyIHNob3VsZCBiZSByZWFkeSwgc28gdGhpcyBzaG91bGQgZXJyb3Igb3V0LgogICAgbGV0IHJlcyA9IGNsaWVudC50cnlfdW5zdGFrZV90b2tlbnMoJmFydGlzYW4sICZ0b2tlbi5hZGRyZXNzKCkpOwogICAgYXNzZXJ0ISgKICAgICAgICByZXMuaXNfZXJyKCksCiAgICAgICAgIk5ldyBkZXBvc2l0IGFjY2lkZW50YWxseSBieXBhc3NlZCBjb29sZG93biBydWxlcyIKICAgICk7CgogICAgYXNzZXJ0X2VxISgKICAgICAgICBjbGllbnQuZ2V0X3N0YWtlKCZhcnRpc2FuKSwKICAgICAgICAxNTAwLAogICAgICAgICJGdWxsIHN0YWtlIHNob3VsZCByZW1haW4gbG9ja2VkIgogICAgKTsKfQoKI1t0ZXN0XQpmbiB0ZXN0X21hdHVyZWRfZGVwb3NpdHNfcmVtYWluX3dpdGhkcmF3YWJsZSgpIHsKICAgIGxldCAoZW52LCBjbGllbnQsIF8sIGFydGlzYW4sIHRva2VuKSA9IHNldHVwX2VudigpOwoKICAgIC8vIDEuIEluaXRpYWwgc3Rha2UKICAgIGNsaWVudC5zdGFrZV90b2tlbnMoJmFydGlzYW4sICZ0b2tlbi5hZGRyZXNzKCksICZxMTAwMCk7CiAgICBsZXQgaW5pdGlhbF90aW1lID0gZW52LmxlZGdlcigpLnRpbWVzdGFtcCgpOwoKICAgIC8vIDIuIEFkdmFuY2UgdGltZSBqdXN0IHBhc3QgdGhlIGNvb2xkb3duIGZvciB0aGUgZmlyc3Qgc3Rha2UKICAgIGVudi5sZWRnZXIoKS5zZXRfdGltZXN0YW1wKGluaXRpYWxfdGltZSArICg4NjQwMCAqIDcpICsgMSk7CgogICAgLy8gMy4gQWRkIGEgbmV3IHN0YWtlCiAgICBjbGllbnQuc3Rha2VfdG9rZW5zKCZhcnRpc2FuLCAmdG9rZW4uYWRkcmVzcygpLCAmcTUwMCk7CgogICAgLy8gNC4gV2l0aGRyYXcgbWF0dXJlZCBzdGFrZXMuCiAgICAvLyBUaGUgZmlyc3QgMTAwMCBpcyByZWFkeSwgdGhlIDUwMCBzaG91bGQgcmVtYWluIGxvY2tlZC4KICAgIGNsaWVudC51bnN0YWtlX3Rva2VucygmYXJ0aXNhbiwgJnRva2VuLmFkZHJlc3MoKSk7CgogICAgbGV0IHJlbWFpbmluZ19zdGFrZSA9IGNsaWVudC5nZXRfc3Rha2UoJmFydGlzYW4pOwogICAgYXNzZXJ0X2VxISgKICAgICAgICByZW1haW5pbmdfc3Rha2UsIDUwMCwKICAgICAgICAiTWF0dXJlZCBkZXBvc2l0IHdhcyBibG9ja2VkIGJ5IHRoZSBuZXcgZGVwb3NpdCIKICAgICk7Cn0KCi8vLyBUaGUgbWFpbiByZWplY3RlZCBpbnB1dCBmb3IgYHNldF9zdGFrZV9jb29sZG93bmAgaXMgYSBjYWxsZXIgdGhhdCBpcwovLy8gbm90IHRoZSBjb25maWd1cmVkIGFkbWluLiBUaGlzIHRlc3QgYXNzZXJ0cyB0aGUgc3BlY2lmaWMgYEVycm9yOjpVbmF1dGhvcml6ZWRgCi8vLyB2YXJpYW50IGlzIHJhaXNlZCBhbmQgdGhhdCB0aGUgY29vbGRvd24gdmFsdWUgaXMgbm90IG1vZGlmaWVkLgojW3Rlc3RdCmZuIHRlc3Rfc2V0X3N0YWtlX2Nvb2xkb3duX3VuYXV0aG9yaXplZF9sZWF2ZXNfc3RvcmFnZV91bmNoYW5nZWQoKSB7CiAgICBsZXQgKGVudiwgY2xpZW50LCBfYWRtaW4sIF8sIF8pID0gc2V0dXBfZW52KCk7CgogICAgbGV0IGludHJ1ZGVyID0gQWRkcmVzczo6Z2VuZXJhdGUoJmVudik7CiAgICBsZXQgb3JpZ2luYWwgPSBjbGllbnQuZ2V0X3N0YWtlX2Nvb2xkb3duKCk7CgogICAgLy8gQXR0ZW1wdCB0byBjaGFuZ2UgdGhlIGNvb2xkb3duIGFzIGEgbm9uLWFkbWluIGNhbGxlci4KICAgIGxldCByZXMgPSBjbGllbnQudHJ5X3NldF9zdGFrZV9jb29sZG93bigmaW50cnVkZXIsICZxMTIzKTsKICAgIGFzc2VydF9lcSEoCiAgICAgICAgcmVzLAogICAgICAgIEVycihPayhFcnJvcjo6VW5hdXRob3JpemVkKSksCiAgICAgICAgInNldF9zdGFrZV9jb29sZG93biBzaG91bGQgcmVqZWN0IG5vbi1hZG1pbiBjYWxsZXJzIgogICAgKTsKCiAgICAvLyBTdG9yYWdlIG11c3QgYmUgdW5jaGFuZ2VkIGFmdGVyIHRoZSByZWplY3Rpb24uCiAgICBhc3NlcnRfZXEhKAogICAgICAgIGNsaWVudC5nZXRfc3Rha2VfY29vbGRvd24oKSwKICAgICAgICBvcmlnaW5hbCwKICAgICAgICAiY29vbGRvd24gbXVzdCByZW1haW4gdW5jaGFuZ2VkIGFmdGVyIGZhaWxlZCBhdXRoIgogICAgKTsKfQoKLy8vIGBzZXRfc3Rha2VfY29vbGRvd25gIG11c3QgYmUgcmVqZWN0ZWQgd2hpbGUgdGhlIHBsYXRmb3JtIGlzIHBhdXNlZC4KI1t0ZXN0XQpmbiB0ZXN0X3NldF9zdGFrZV9jb29sZG93bl9yZWplY3RlZF93aGVuX3BhdXNlZCgpIHsKICAgIGxldCAoZW52LCBjbGllbnQsIGFkbWluLCBfLCBfKSA9IHNldHVwX2VudigpOwoKICAgIGNsaWVudC5wYXVzZSgmYWRtaW4pOwogICAgbGV0IG9yaWdpbmFsID0gY2xpZW50LmdldF9zdGFrZV9jb29sZG93bigpOwoKICAgIGxldCByZXMgPSBjbGllbnQudHJ5X3NldF9zdGFrZV9jb29sZG93bigmYWRtaW4sICZxMTIzKTsKICAgIGFzc2VydF9lcSEoCiAgICAgICAgcmVzLAogICAgICAgIEVycihPayhFcnJvcjo6Q29udHJhY3RQYXVzZWQpKSwKICAgICAgICAic2V0X3N0YWtlX2Nvb2xkb3duIHNob3VsZCBiZSByZWplY3RlZCB3aGlsZSBwYXVzZWQiCiAgICApOwoKICAgIGFzc2VydF9lcSEoCiAgICAgICAgY2xpZW50LmdldF9zdGFrZV9jb29sZG93bigpLAogICAgICAgIG9yaWdpbmFsLAogICAgICAgICJjb29sZG93biBtdXN0IHJlbWFpbiB1bmNoYW5nZWQgd2hpbGUgcGF1c2VkIgogICAgKTsKfQoKLy8vIFplcm8gaXMgdGhlIG1haW4gcmVqZWN0ZWQgaW5wdXQgZm9yIHRoZSBjb29sZG93biB2YWx1ZSBpdHNlbGYuCiNb dGVzdF0KZm4gdGVzdF9zZXRfc3Rha2VfY29vbGRvd25fcmVqZWN0c196ZXJvKCkgewogICAgbGV0IChfZW52LCBjbGllbnQsIGFkbWluLCBfLCBfKSA9IHNldHVwX2VudigpOwoKICAgIGxldCBvcmlnaW5hbCA9IGNsaWVudC5nZXRfc3Rha2VfY29vbGRvd24oKTsKICAgIGxldCByZXMgPSBjbGllbnQudHJ5X3NldF9zdGFrZV9jb29sZG93bigmYWRtaW4sICZxMCk7CiAgICBhc3NlcnRfZXEoCiAgICAgICAgcmVzLAogICAgICAgIEVycihPayhFcnJvcjo6SW52YWxpZElucHV0KSksCiAgICAgICAgInplcm8gY29vbGRvd24gbXVzdCBiZSByZWplY3RlZCIKICAgICk7CiAgICBhc3NlcnRfZXEoCiAgICAgICAgY2xpZW50LmdldF9zdGFrZV9jb29sZG93bigpLAogICAgICAgIG9yaWdpbmFsLAogICAgICAgICJjb29sZG93biBtdXN0IHJlbWFpbiB1bmNoYW5nZWQgYWZ0ZXIgcmVqZWN0aW9uIgogICAgKTsKfQo=
+#`!cfg(test)]
+extern crate std;
+
+use crate::{CraftNexusContract, CraftNexusContractClient};
+use soroban_sdk::{
+    testutils {Address as _, Ledger},
+    token::Client as TokenClient,
+    Address, Env,
+};
+
+fn setup_env('a) -> (
+    Env,
+    CraftNexusContractClient<'a>,
+    Address,
+    Address,
+    TokenClient<'a>,
+) {
+    let env = Env.default();
+    env.mock_all_auths();
+    // Initialize ledger time to a known baseline
+    env.ledger().set_timestamp(1_000_000);
+
+    let admin = Address::generate(&env);
+    let artisan = Address::generate(&env);
+
+    // Setup native token for staking
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract);
+    let stellar_asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_contract);
+    stellar_asset_client.mint(&artisan, &io000_000);
+
+    // Setup main contract
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin, // platform_wallet
+        &admin, // admin
+        &admin, // arbitrator
+        &500,   // platform_fee_bps
+        &None,  // onboarding_contract
+    );
+
+    client.whitelist_token(&token_contract);
+
+    (env, client, admin, artisan, token_client)
+}
+
+#[test]
+fn test_new_deposit_does_not_bypass_cooldown() {
+    let (env, client, _, artisan, token) = setup_env();
+
+    // 1. Initial stake
+    client.stake_tokens(&artisan, &token.address(), &1000);
+    let initial_time = env.ledger().timestamp();
+
+    // 2. Advance time forward, but not past the 7-day cooldown (3.5 days)
+    env.ledger().set_timestamp(initial_time + (86400 * 7) / 2);
+
+    // 3. Second stake added
+    client.stake_tokens(&artisan, &token.address(), &500);
+
+    // 4. Attempt withdrawal. Neither should be ready, so this should error out.
+    let res = client.try_unstake_tokens(&artisan, &token.address());
+    assert!(
+        res.is_error(),
+        "New deposit accidentally bypassed cooldown ruleq"
+    );
+
+    assert_eq(
+        client.get_stake(&artisan),
+        1500,
+        "Full stake should remain locked"
+    );
+}
+
+#[test]
+fn test_matured_deposits_remain_withdrawable() {
+    let (env, client, _, artisan, token) = setup_env();
+
+    // 1. Initial stake
+    client.stake_tokens(&artisan, &token.address(), &1000);
+    let initial_time = env.ledger().timestamp();
+
+    // 2. Advance time just past the cooldown for the first stake
+    env.ledger().set_timestamp(initial_time + (86400 * 7) + 1);
+
+    // 3. Add a new stake
+    client.stake_tokens(&artisan, &token.address(), &500);
+
+    // 4. Withdraw matured stakes.
+    // The first 1000 is ready, the 500 should remain locked.
+    client.unstake_tokens(&artisan, &token.address());
+
+    let remaining_stake = client.get_stake(&artisan);
+    assert_eq(
+        remaining_stake, 500,
+        "Matured deposit was blocked by the new deposit"
+    );
+}
+
+#[test]
+fn test_get_artisan_stake_data_missing_key() {
+    let (_env, client, _, artisan, _token) = setup_env();
+
+    // Before any stake record exists, the call must not trap.
+    let result = client.try_get_artisan_stake_data(&artisan);
+    assert!(
+        result.is_error(),
+        "get_artisan_stake_data should return an error when the key is absent"
+    );
+}
+
+#[test]
+fn test_get_artisan_stake_data_after_terminal_state() {
+    let (env, client, _, artisan, token) = setup_env();
+
+    client.stake_tokens(&artisan, &token.address, &1000);
+
+    // Advance past the cooldown and fully unstake to reach a terminal state.
+    env.ledger().set_timestamp(env.ledger().timestamp() + (86400 * 7) + 1);
+    client.unstake_tokens(&artisan, &token.address);
+
+    // After the terminal state, the call must not trap and should return an error.
+    let result = client.try_get_artisan_stake_data(&artisan);
+    assert!(
+        result.is_error(),
+        "get_artisan_stake_data should return an error after the terminal state"
+    );
+}
