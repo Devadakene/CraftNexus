@@ -211,7 +211,7 @@ impl OnboardingContract {
         let mut counter: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::SettlementSnapshotCounter)
+            .get(&DataKey::SettlementSnapCounter)
             .unwrap_or(0);
         counter += 1;
         let revision = counter;
@@ -233,7 +233,7 @@ impl OnboardingContract {
             .set(&DataKey::SettlementSnapshot(revision), &snapshot);
         env.storage()
             .persistent()
-            .set(&DataKey::SettlementSnapshotCounter, &revision);
+            .set(&DataKey::SettlementSnapCounter, &revision);
         revision
     }
 
@@ -308,6 +308,19 @@ pub struct ObservabilityMetrics {
     pub last_reset_ledger: u32,
 }
 
+
+
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKeyExt {
+    PohReqForAutoVerify,
+    PohVerifier,
+    UserStateRevision(Address),
+    UsedAttestation(Address, Bytes),
+    MaxOnboardAttempts,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -329,7 +342,7 @@ pub enum DataKey {
     /// Total successful onboarding operations.
     GlobalOnboardCount,
     /// Total username changes.
-    GlobalUsernameChangeCount,
+    GlobalUserChangeCount,
     /// Total admin profile-management actions.
     GlobalAdminActionCount,
     /// Pending manual verification request marker keyed by user (#138).
@@ -350,15 +363,15 @@ pub enum DataKey {
     /// Migrated lazily to indexed compact entries (#519).
     VerificationHistory(Address),
     /// Count of compact verification history entries per user (#519)
-    VerificationHistoryCount(Address),
+    VerifyHistoryCount(Address),
     /// Indexed compact verification history entry (#519)
-    VerificationHistoryIndexed(Address, u32),
+    VerifyHistoryIndexed(Address, u32),
     /// Username change fee (in stroops) - Issue #114
     UsernameChangeFee,
     /// Token used to collect username change fees (#134)
     UsernameChangeFeeToken,
     /// Destination wallet for username change fees (#134)
-    UsernameChangeFeeWallet,
+    UserChangeFeeWallet,
     /// Timestamp of last username change per user - Issue #114
     LastUsernameChange(Address),
     /// Per-user decaying trust score + anti-farming window state (#939)
@@ -366,15 +379,15 @@ pub enum DataKey {
     /// Global reputation decay / cooldown / anti-farming policy (#939)
     ReputationPolicy,
     /// Minimum normalized completed-settlement value eligible for reputation.
-    MinimumReputationSettlement,
+    MinRepSettlement,
     /// Count of compact reputation history entries per user (#939)
     ReputationHistoryCount(Address),
     /// Indexed compact reputation history entry (#939)
-    ReputationHistoryIndexed(Address, u32),
+    RepHistoryIndexed(Address, u32),
     /// Immutable settlement snapshot keyed by revision.
     SettlementSnapshot(u64),
     /// Monotonic counter for settlement snapshot revisions.
-    SettlementSnapshotCounter,
+    SettlementSnapCounter,
     /// Proof-of-Humanity credential record keyed by user address (#940)
     UserPohCredential(Address),
     /// Global archival policy for immutable summaries (retention & migration rules).
@@ -382,7 +395,7 @@ pub enum DataKey {
     /// Immutable archival summary keyed by user address and sequence number.
     ArchivalRecord(Address, u64),
     /// Per-user resumable compaction offset for archival records.
-    ArchivalCompactionOffset(Address),
+    ArchivalCompactOffset(Address),
     /// Secondary index mapping proof-of-humanity credential hash to owner address (#940)
     PohCredentialHash(Bytes),
     /// Secondary index mapping correlated identity hash to owner address (#940)
@@ -390,11 +403,11 @@ pub enum DataKey {
     /// Rate limit tracker for onboarding attempts per address (#940)
     RateLimitTracker(Address),
     /// Per-account verification attempt window (#1084)
-    VerificationRateLimitTracker(Address),
+    VerifyRateLimitTracker(Address),
     /// Global onboarding attempt window (#1084)
     GlobalOnboardingRateLimit,
     /// Global verification attempt window (#1084)
-    GlobalVerificationRateLimit,
+    GlobalVerifyRateLimit,
     /// Versioned onboarding and verification rate policy (#1084)
     AttemptRatePolicy,
     /// Suspicious activity flag record per user (#940)
@@ -410,21 +423,21 @@ pub enum DataKey {
     /// Review queue index -> address mapping (#940)
     ReviewQueueIndex(u64),
     /// Timestamp of last manual verification request attempt per user (#940)
-    VerificationLastAttempt(Address),
+    VerifyLastAttempt(Address),
     /// Anti-Sybil onboarding rate limit window in seconds (#940)
-    OnboardingRateLimitWindow,
+    OnboardRateLimitWindow,
     /// Maximum onboarding attempts allowed per window (#940)
-    MaxOnboardAttempts,
+    // MaxOnboardAttempts,
     /// Verification request cooldown in seconds (#940)
     VerificationCooldown,
-    /// Whether Proof-of-Humanity is required for auto/manual verification (#940)
-    PohRequiredForAutoVerify,
-    /// Optional Proof-of-Humanity verifier address (#940)
-    PohVerifier,
-    /// Monotonic canonical onboarding state revision per user.
-    UserStateRevision(Address),
-    /// An operation binding already consumed by an escrow contract.
-    UsedAttestation(Address, Bytes),
+
+    // PohReqForAutoVerify,
+
+    // PohVerifier,
+
+    // UserStateRevision(Address),
+
+    // UsedAttestation(Address, Bytes),
 }
 
 /// User roles in the CraftNexus platform.
@@ -703,8 +716,8 @@ pub struct AutoVerifiedEvent {
 ///
 /// ## Storage side-effects
 /// Entries are stored under two key patterns:
-/// - `DataKey::VerificationHistoryCount(Address)` — count of entries (u32)
-/// - `DataKey::VerificationHistoryIndexed(Address, u32)` — per-entry compact
+/// - `DataKey::VerifyHistoryCount(Address)` — count of entries (u32)
+/// - `DataKey::VerifyHistoryIndexed(Address, u32)` — per-entry compact
 ///   record ([`CompactVerificationEntry`]); the `action` field is stored as
 ///   [`VerificationActionCode`] to minimise on-chain size.
 ///
@@ -759,7 +772,7 @@ pub struct VerificationEntry {
 ///
 /// ## Storage side-effects
 /// - Stored as the `action` field inside
-///   [`DataKey::VerificationHistoryIndexed`]`(Address, u32)` entries.
+///   [`DataKey::VerifyHistoryIndexed`]`(Address, u32)` entries.
 /// - Discriminant values are **stable** — adding new variants is safe;
 ///   reordering or removing variants is a breaking schema change.
 ///
@@ -787,17 +800,17 @@ enum VerificationActionCode {
 ///
 /// ## Purpose
 /// `CompactVerificationEntry` is the actual bytes persisted under
-/// [`DataKey::VerificationHistoryIndexed`]`(Address, u32)`. It mirrors
+/// [`DataKey::VerifyHistoryIndexed`]`(Address, u32)`. It mirrors
 /// [`VerificationEntry`] but stores `action` as a [`VerificationActionCode`]
 /// discriminant rather than a heap-allocated [`Symbol`], keeping each
 /// storage entry small and rent-efficient.
 ///
 /// ## Storage side-effects
-/// - Key: `DataKey::VerificationHistoryIndexed(user_address, index_u32)`
+/// - Key: `DataKey::VerifyHistoryIndexed(user_address, index_u32)`
 /// - TTL is extended immediately after every write and on reads within
 ///   `get_verification_history`.
 /// - The corresponding count is maintained under
-///   `DataKey::VerificationHistoryCount(user_address)`.
+///   `DataKey::VerifyHistoryCount(user_address)`.
 ///
 /// ## Off-chain consumers
 /// Indexers receive the decoded [`VerificationEntry`] form (with
@@ -1740,12 +1753,12 @@ impl OnboardingContract {
                 revision: 1,
                 onboarding_window_secs: Self::read_persistent(
                     env,
-                    &DataKey::OnboardingRateLimitWindow,
+                    &DataKey::OnboardRateLimitWindow,
                 )
                 .unwrap_or(3_600),
                 max_onboarding_per_account: Self::read_persistent(
                     env,
-                    &DataKey::MaxOnboardAttempts,
+                    &DataKeyExt::MaxOnboardAttempts,
                 )
                 .unwrap_or(3),
                 max_onboarding_global: 100,
@@ -1772,8 +1785,8 @@ impl OnboardingContract {
         let (account_key, global_key, window, account_max, global_max, operation) = if verification
         {
             (
-                DataKey::VerificationRateLimitTracker(user.clone()),
-                DataKey::GlobalVerificationRateLimit,
+                DataKey::VerifyRateLimitTracker(user.clone()),
+                DataKey::GlobalVerifyRateLimit,
                 policy.verification_window_secs,
                 policy.max_verification_per_account,
                 policy.max_verification_global,
@@ -1884,10 +1897,10 @@ impl OnboardingContract {
 
     /// Resolve the wallet that receives username-change fees.
     ///
-    /// Reads `DataKey::UsernameChangeFeeWallet`; when unset, falls back to
+    /// Reads `DataKey::UserChangeFeeWallet`; when unset, falls back to
     /// `config.platform_admin`. Extends TTL when the key exists.
     fn read_username_fee_wallet(env: &Env, config: &OnboardingConfig) -> Address {
-        Self::read_persistent(env, &DataKey::UsernameChangeFeeWallet)
+        Self::read_persistent(env, &DataKey::UserChangeFeeWallet)
             .unwrap_or_else(|| config.platform_admin.clone())
     }
 
@@ -1959,7 +1972,7 @@ impl OnboardingContract {
     /// ### Role Transitions (Endpoint #85)
     /// - **Valid Roles**: Buyer, Artisan, Moderator (None and Admin excluded)
     /// - **Authorization**: Platform admin only; enforced via `require_auth()`
-    /// - **Audit Trail**: All transitions logged to `VerificationHistoryIndexed`
+    /// - **Audit Trail**: All transitions logged to `VerifyHistoryIndexed`
     /// - **Event Emission**: `RoleUpdated` carries (user, old_role, new_role)
     ///
     /// ### Verification Workflow
@@ -2008,7 +2021,7 @@ impl OnboardingContract {
             .get(&legacy_key)
             .unwrap_or(Vec::new(env));
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
         let mut count: u32 = 0;
         for i in 0..history.len() {
             if let Some(entry) = history.get(i) {
@@ -2017,7 +2030,7 @@ impl OnboardingContract {
                     action: Self::parse_verification_action(env, &entry.action),
                     by: entry.by.clone(),
                 };
-                let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), i);
                 env.storage().persistent().set(&entry_key, &compact);
                 Self::extend_persistent(env, &entry_key);
                 count = i + 1;
@@ -2039,8 +2052,8 @@ impl OnboardingContract {
     /// to enforce bounded storage while preserving temporal ordering of recent events.
     ///
     /// Developer note: the historical record is stored in indexed slots under
-    /// `DataKey::VerificationHistoryIndexed(user, slot)` and the logical order is defined by
-    /// `DataKey::VerificationHistoryCount(user)`. Readers must iterate from slot `0` through
+    /// `DataKey::VerifyHistoryIndexed(user, slot)` and the logical order is defined by
+    /// `DataKey::VerifyHistoryCount(user)`. Readers must iterate from slot `0` through
     /// `count - 1`; writers must not write to an arbitrary slot based on timestamps or the
     /// current append count once the buffer is full. When the buffer reaches capacity, older
     /// entries are shifted down and the new entry is written to the tail slot. This preserves
@@ -2056,8 +2069,8 @@ impl OnboardingContract {
     /// * `by` - Optional moderator/admin address that triggered the action
     ///
     /// # Storage Side-Effects
-    /// - Reads/writes `DataKey::VerificationHistoryCount(user)` (4 bytes)
-    /// - Reads/writes up to 10 entries of `DataKey::VerificationHistoryIndexed(user, slot)`
+    /// - Reads/writes `DataKey::VerifyHistoryCount(user)` (4 bytes)
+    /// - Reads/writes up to 10 entries of `DataKey::VerifyHistoryIndexed(user, slot)`
     /// - Each entry is ~24 bytes (timestamp u64 + action u32 + optional address 32 bytes)
     /// - Extends TTL on count and all affected entries to prevent archival
     ///
@@ -2078,7 +2091,7 @@ impl OnboardingContract {
     ) {
         Self::migrate_legacy_verification_history(env, user);
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
         // [PERFORMANCE #94] Extend TTL on read so the count key does not expire while
         // the buffer is still in active use. Without this bump a count entry close to
         // its TTL deadline could be archived on the same ledger as the write that follows,
@@ -2096,13 +2109,13 @@ impl OnboardingContract {
         let slot = if count >= MAX_VERIFICATION_HISTORY {
             // Shift entries: move index i down to i-1 for all i in [1, MAX-1]
             for i in 1..MAX_VERIFICATION_HISTORY {
-                let src_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                let src_key = DataKey::VerifyHistoryIndexed(user.clone(), i);
                 if let Some(entry) = env
                     .storage()
                     .persistent()
                     .get::<DataKey, CompactVerificationEntry>(&src_key)
                 {
-                    let dst_key = DataKey::VerificationHistoryIndexed(user.clone(), i - 1);
+                    let dst_key = DataKey::VerifyHistoryIndexed(user.clone(), i - 1);
                     env.storage().persistent().set(&dst_key, &entry);
                     Self::extend_persistent(env, &dst_key);
                     env.storage().persistent().remove(&src_key);
@@ -2118,7 +2131,7 @@ impl OnboardingContract {
             action,
             by,
         };
-        let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), slot);
+        let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), slot);
         env.storage().persistent().set(&entry_key, &entry);
         Self::extend_persistent(env, &entry_key);
 
@@ -2149,7 +2162,7 @@ impl OnboardingContract {
     }
 
     fn get_minimum_reputation_settlement_internal(env: &Env) -> i128 {
-        Self::read_persistent(env, &DataKey::MinimumReputationSettlement)
+        Self::read_persistent(env, &DataKey::MinRepSettlement)
             .unwrap_or(DEFAULT_MIN_REPUTATION_SETTLEMENT)
     }
 
@@ -2364,13 +2377,13 @@ impl OnboardingContract {
 
         let slot = if count >= MAX_REPUTATION_HISTORY {
             for i in 1..MAX_REPUTATION_HISTORY {
-                let src_key = DataKey::ReputationHistoryIndexed(user.clone(), i);
+                let src_key = DataKey::RepHistoryIndexed(user.clone(), i);
                 if let Some(entry) = env
                     .storage()
                     .persistent()
                     .get::<DataKey, CompactReputationHistoryEntry>(&src_key)
                 {
-                    let dst_key = DataKey::ReputationHistoryIndexed(user.clone(), i - 1);
+                    let dst_key = DataKey::RepHistoryIndexed(user.clone(), i - 1);
                     env.storage().persistent().set(&dst_key, &entry);
                     Self::extend_persistent(env, &dst_key);
                     env.storage().persistent().remove(&src_key);
@@ -2390,7 +2403,7 @@ impl OnboardingContract {
             trust_score_after,
             reason,
         };
-        let entry_key = DataKey::ReputationHistoryIndexed(user.clone(), slot);
+        let entry_key = DataKey::RepHistoryIndexed(user.clone(), slot);
         env.storage().persistent().set(&entry_key, &entry);
         Self::extend_persistent(env, &entry_key);
 
@@ -2455,7 +2468,7 @@ impl OnboardingContract {
         portfolio_cid: Option<Bytes>,
     ) -> UserProfile {
         let state_version =
-            Self::read_persistent(env, &DataKey::UserStateRevision(stored.address.clone()))
+            Self::read_persistent(env, &DataKeyExt::UserStateRevision(stored.address.clone()))
                 .unwrap_or(1);
         UserProfile {
             version: stored.version,
@@ -2515,7 +2528,7 @@ impl OnboardingContract {
     }
 
     fn ensure_state_revision(env: &Env, user: &Address) {
-        let key = DataKey::UserStateRevision(user.clone());
+        let key = DataKeyExt::UserStateRevision(user.clone());
         if !env.storage().persistent().has(&key) {
             env.storage().persistent().set(&key, &1u32);
             Self::extend_persistent(env, &key);
@@ -2523,7 +2536,7 @@ impl OnboardingContract {
     }
 
     fn bump_state_revision(env: &Env, user: &Address) {
-        let key = DataKey::UserStateRevision(user.clone());
+        let key = DataKeyExt::UserStateRevision(user.clone());
         let revision = env.storage().persistent().get::<_, u32>(&key).unwrap_or(0);
         let next = revision
             .checked_add(1)
@@ -2533,7 +2546,7 @@ impl OnboardingContract {
     }
 
     fn state_revision(env: &Env, user: &Address) -> u64 {
-        let key = DataKey::UserStateRevision(user.clone());
+        let key = DataKeyExt::UserStateRevision(user.clone());
         let revision = env
             .storage()
             .persistent()
@@ -2633,7 +2646,7 @@ impl OnboardingContract {
     /// Repair secondary state for an existing account-keyed canonical profile.
     fn repair_onboarding_state(env: &Env, normalized: &String, user: &Address) {
         Self::ensure_username_claim(env, normalized, user);
-        let version_key = DataKey::UserStateRevision(user.clone());
+        let version_key = DataKeyExt::UserStateRevision(user.clone());
         if !env.storage().persistent().has(&version_key) {
             env.storage().persistent().set(&version_key, &1u32);
         }
@@ -2663,8 +2676,8 @@ impl OnboardingContract {
         Self::persist_stored_user_profile(env, user, &stored);
         env.storage()
             .persistent()
-            .set(&DataKey::UserStateRevision(user.clone()), &1u32);
-        Self::extend_persistent(env, &DataKey::UserStateRevision(user.clone()));
+            .set(&DataKeyExt::UserStateRevision(user.clone()), &1u32);
+        Self::extend_persistent(env, &DataKeyExt::UserStateRevision(user.clone()));
         (stored, true)
     }
 
@@ -2766,7 +2779,7 @@ impl OnboardingContract {
     }
 
     fn bump_state_version(env: &Env, user: &Address) -> u32 {
-        let key = DataKey::UserStateRevision(user.clone());
+        let key = DataKeyExt::UserStateRevision(user.clone());
         let current: u32 = Self::read_persistent(env, &key).unwrap_or(1u32);
         let next: u32 = current.saturating_add(1);
         env.storage().persistent().set(&key, &next);
@@ -2881,7 +2894,7 @@ impl OnboardingContract {
     /// # Storage Optimization Strategy
     /// - Compact representation: Only stores minimal required state per entry
     /// - Lazy TTL refresh: Only bump when entry is actively accessed (read pattern)
-    /// - Indexed access: O(1) lookups via `DataKey::VerificationHistoryIndexed(user, slot)`
+    /// - Indexed access: O(1) lookups via `DataKey::VerifyHistoryIndexed(user, slot)`
     /// - No Vec allocations: Eliminates runtime allocation overhead (Issue #82)
     ///
     /// # Arguments
@@ -3027,13 +3040,13 @@ impl OnboardingContract {
         // Seed default anti-Sybil configuration (#940)
         env.storage()
             .persistent()
-            .set(&DataKey::OnboardingRateLimitWindow, &3600u64);
-        Self::extend_persistent(&env, &DataKey::OnboardingRateLimitWindow);
+            .set(&DataKey::OnboardRateLimitWindow, &3600u64);
+        Self::extend_persistent(&env, &DataKey::OnboardRateLimitWindow);
 
         env.storage()
             .persistent()
-            .set(&DataKey::MaxOnboardAttempts, &3u32);
-        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
+            .set(&DataKeyExt::MaxOnboardAttempts, &3u32);
+        Self::extend_persistent(&env, &DataKeyExt::MaxOnboardAttempts);
 
         env.storage()
             .persistent()
@@ -3042,8 +3055,8 @@ impl OnboardingContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::PohRequiredForAutoVerify, &false);
-        Self::extend_persistent(&env, &DataKey::PohRequiredForAutoVerify);
+            .set(&DataKeyExt::PohReqForAutoVerify, &false);
+        Self::extend_persistent(&env, &DataKeyExt::PohReqForAutoVerify);
 
         // Issue #939 — seed default reputation decay / anti-farming policy.
         let reputation_policy = Self::default_reputation_policy();
@@ -3527,7 +3540,7 @@ impl OnboardingContract {
             env.panic_with_error(Error::InvalidAttestation);
         }
         Self::require_ttl_bump_auth(&config);
-        let used_key = DataKey::UsedAttestation(
+        let used_key = DataKeyExt::UsedAttestation(
             attestation.account.clone(),
             attestation.operation_id.clone(),
         );
@@ -4648,7 +4661,7 @@ impl OnboardingContract {
         }
 
         let poh_required =
-            Self::read_persistent(env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+            Self::read_persistent(env, &DataKeyExt::PohReqForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
             return;
         }
@@ -4722,7 +4735,7 @@ impl OnboardingContract {
         }
 
         let poh_required =
-            Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+            Self::read_persistent(&env, &DataKeyExt::PohReqForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
             return false;
         }
@@ -4774,7 +4787,7 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
 
         let poh_required =
-            Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+            Self::read_persistent(&env, &DataKeyExt::PohReqForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), user.clone()) {
             env.panic_with_error(Error::InvalidPohCredential);
         }
@@ -4788,7 +4801,7 @@ impl OnboardingContract {
         Self::consume_attempt_capacity(&env, &user, true);
 
         let now = env.ledger().timestamp();
-        let last_attempt_key = DataKey::VerificationLastAttempt(user.clone());
+        let last_attempt_key = DataKey::VerifyLastAttempt(user.clone());
         let cooldown =
             Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400u64);
         if let Some(last_attempt) = Self::read_persistent::<_, u64>(&env, &last_attempt_key) {
@@ -4982,12 +4995,12 @@ impl OnboardingContract {
 
         Self::migrate_legacy_verification_history(&env, &user);
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifyHistoryCount(user.clone());
         let count: u32 = Self::read_persistent(&env, &count_key).unwrap_or(0);
 
         let mut result = Vec::new(&env);
         for index in 0..count {
-            let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), index);
+            let entry_key = DataKey::VerifyHistoryIndexed(user.clone(), index);
             if let Some(compact) =
                 Self::read_persistent::<_, CompactVerificationEntry>(&env, &entry_key)
             {
@@ -5320,7 +5333,7 @@ impl OnboardingContract {
 
         let mut result = Vec::new(&env);
         for index in 0..count {
-            let entry_key = DataKey::ReputationHistoryIndexed(address.clone(), index);
+            let entry_key = DataKey::RepHistoryIndexed(address.clone(), index);
             if let Some(compact) =
                 Self::read_persistent::<_, CompactReputationHistoryEntry>(&env, &entry_key)
             {
@@ -5363,8 +5376,8 @@ impl OnboardingContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MinimumReputationSettlement, &minimum_amount);
-        Self::extend_persistent(&env, &DataKey::MinimumReputationSettlement);
+            .set(&DataKey::MinRepSettlement, &minimum_amount);
+        Self::extend_persistent(&env, &DataKey::MinRepSettlement);
     }
 
     /// Set the reputation decay / anti-farming policy (admin only, #939).
@@ -5603,7 +5616,7 @@ impl OnboardingContract {
 
         // Interaction (CEI pattern: external transfer is the last step)
         Self::collect_username_change_fee(&env, &user, &config, snapshotted_fee_token);
-        Self::increment_persistent_u32(&env, &DataKey::GlobalUsernameChangeCount);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalUserChangeCount);
 
         profile
     }
@@ -5714,7 +5727,7 @@ impl OnboardingContract {
     ///
     /// ## Storage side-effects
     /// - Reads and extends TTL on `DataKey::Config`.
-    /// - Writes and extends TTL on `DataKey::UsernameChangeFeeWallet`.
+    /// - Writes and extends TTL on `DataKey::UserChangeFeeWallet`.
     /// - Does not modify profile shapes or `CURRENT_USER_PROFILE_VERSION`.
     ///
     /// ## Emitted events
@@ -5748,8 +5761,8 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
         env.storage()
             .persistent()
-            .set(&DataKey::UsernameChangeFeeWallet, &wallet);
-        Self::extend_persistent(&env, &DataKey::UsernameChangeFeeWallet);
+            .set(&DataKey::UserChangeFeeWallet, &wallet);
+        Self::extend_persistent(&env, &DataKey::UserChangeFeeWallet);
     }
 
     /// Get the current username change fee — Issue #114.
@@ -5793,7 +5806,7 @@ impl OnboardingContract {
     /// - No auth required; safe for simulation and read-only client previews.
     ///
     /// ## Storage side-effects
-    /// - Reads `DataKey::UsernameChangeFeeWallet` via `read_username_fee_wallet`.
+    /// - Reads `DataKey::UserChangeFeeWallet` via `read_username_fee_wallet`.
     /// - When the key exists, extends its persistent TTL by `TTL_EXTENSION`
     ///   ledgers (~30 days).
     /// - When unset, returns `OnboardingConfig::platform_admin` without writing
@@ -5916,12 +5929,12 @@ impl OnboardingContract {
 
     /// Read onboarding rate limit window length in seconds (#940).
     pub fn get_rate_limit_window(env: Env) -> u64 {
-        Self::read_persistent(&env, &DataKey::OnboardingRateLimitWindow).unwrap_or(3600)
+        Self::read_persistent(&env, &DataKey::OnboardRateLimitWindow).unwrap_or(3600)
     }
 
     /// Read maximum onboarding attempts per window (#940).
     pub fn get_max_onboard_attempts(env: Env) -> u32 {
-        Self::read_persistent(&env, &DataKey::MaxOnboardAttempts).unwrap_or(3)
+        Self::read_persistent(&env, &DataKeyExt::MaxOnboardAttempts).unwrap_or(3)
     }
 
     /// Read verification cooldown period in seconds (#940).
@@ -5980,12 +5993,12 @@ impl OnboardingContract {
 
     /// Read whether Proof-of-Humanity is required for auto/manual verification (#940).
     pub fn is_poh_required_for_auto_verify(env: Env) -> bool {
-        Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false)
+        Self::read_persistent(&env, &DataKeyExt::PohReqForAutoVerify).unwrap_or(false)
     }
 
     /// Read optional Proof-of-Humanity verifier address (#940).
     pub fn get_poh_verifier(env: Env) -> Option<Address> {
-        Self::read_persistent(&env, &DataKey::PohVerifier)
+        Self::read_persistent(&env, &DataKeyExt::PohVerifier)
     }
 
     /// Update anti-Sybil, rate-limiting, and Proof-of-Humanity configuration (admin only) (#940).
@@ -6007,14 +6020,14 @@ impl OnboardingContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::OnboardingRateLimitWindow, &rate_limit_window);
-        Self::extend_persistent(&env, &DataKey::OnboardingRateLimitWindow);
+            .set(&DataKey::OnboardRateLimitWindow, &rate_limit_window);
+        Self::extend_persistent(&env, &DataKey::OnboardRateLimitWindow);
 
         env.storage()
             .persistent()
-            .set(&DataKey::MaxOnboardAttempts, &max_onboard_attempts);
-        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
-        Self::extend_persistent(&env, &DataKey::MaxOnboardAttempts);
+            .set(&DataKeyExt::MaxOnboardAttempts, &max_onboard_attempts);
+        Self::extend_persistent(&env, &DataKeyExt::MaxOnboardAttempts);
+        Self::extend_persistent(&env, &DataKeyExt::MaxOnboardAttempts);
 
         env.storage()
             .persistent()
@@ -6022,18 +6035,18 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::VerificationCooldown);
 
         env.storage().persistent().set(
-            &DataKey::PohRequiredForAutoVerify,
+            &DataKeyExt::PohReqForAutoVerify,
             &poh_required_for_auto_verify,
         );
-        Self::extend_persistent(&env, &DataKey::PohRequiredForAutoVerify);
+        Self::extend_persistent(&env, &DataKeyExt::PohReqForAutoVerify);
 
         if let Some(ref verifier) = poh_verifier {
             env.storage()
                 .persistent()
-                .set(&DataKey::PohVerifier, verifier);
-            Self::extend_persistent(&env, &DataKey::PohVerifier);
+                .set(&DataKeyExt::PohVerifier, verifier);
+            Self::extend_persistent(&env, &DataKeyExt::PohVerifier);
         } else {
-            env.storage().persistent().remove(&DataKey::PohVerifier);
+            env.storage().persistent().remove(&DataKeyExt::PohVerifier);
         }
 
         env.events().publish(
@@ -6064,7 +6077,7 @@ impl OnboardingContract {
             .get(&DataKey::Config)
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
 
-        let verifier: Option<Address> = Self::read_persistent(&env, &DataKey::PohVerifier);
+        let verifier: Option<Address> = Self::read_persistent(&env, &DataKeyExt::PohVerifier);
         if let Some(ref v) = verifier {
             v.require_auth();
         }
