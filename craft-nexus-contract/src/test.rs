@@ -9063,3 +9063,128 @@ fn test_differential_upgrade_compatibility_representative_fixture() {
         total_supply
     );
 }
+
+// ─── accept_partial_refund hardening (Issue: Harden accept_partial_refund) ───
+//
+// `accept_partial_refund` moves value out of a disputed escrow, so every
+// rejection path must leave storage and token balances untouched. The tests
+// below pin the specific `Error` variant raised for the main rejected inputs
+// and assert that no state mutation occurred.
+
+#[test]
+fn test_accept_partial_refund_unauthorized_caller_leaves_state_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &10_000_000);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Fund an escrow and open a dispute, then propose a partial refund.
+    client.create_escrow(&buyer, &seller, &token_id, &1_000_000, &1, &Some(3600));
+    client.dispute_escrow(&1, &Symbol::new(&env, "PartialRefund"), &buyer);
+    client.propose_partial_refund(&1, &250_000, &buyer);
+
+    let escrow_before = client.get_escrow(&1);
+    let buyer_balance_before = token_client.balance(&buyer);
+    let seller_balance_before = token_client.balance(&seller);
+    let contract_balance_before = token_client.balance(&client.address);
+
+    // Drop all authorizations so the caller is unauthenticated.
+    env.set_auths(&[]);
+
+    let result = client.try_accept_partial_refund(&1);
+    assert_panic_contract_error(result, Error::Unauthorized);
+
+    // Storage and balances must be byte-for-byte identical after rejection.
+    assert_eq!(client.get_escrow(&1), escrow_before);
+    assert_eq!(token_client.balance(&buyer), buyer_balance_before);
+    assert_eq!(token_client.balance(&seller), seller_balance_before);
+    assert_eq!(token_client.balance(&client.address), contract_balance_before);
+}
+
+#[test]
+fn test_accept_partial_refund_rejected_while_paused_leaves_state_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &10_000_000);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.create_escrow(&buyer, &seller, &token_id, &1_000_000, &1, &Some(3600));
+    client.dispute_escrow(&1, &Symbol::new(&env, "PartialRefund"), &buyer);
+    client.propose_partial_refund(&1, &250_000, &buyer);
+
+    let escrow_before = client.get_escrow(&1);
+    let buyer_balance_before = token_client.balance(&buyer);
+    let seller_balance_before = token_client.balance(&seller);
+    let contract_balance_before = token_client.balance(&client.address);
+
+    // Pause the platform through the admin path.
+    client.set_paused(&true);
+    assert!(client.is_paused());
+
+    let result = client.try_accept_partial_refund(&1);
+    assert_panic_contract_error(result, Error::ContractPaused);
+
+    // Pause state itself is unchanged and no value moved.
+    assert!(client.is_paused());
+    assert_eq!(client.get_escrow(&1), escrow_before);
+    assert_eq!(token_client.balance(&buyer), buyer_balance_before);
+    assert_eq!(token_client.balance(&seller), seller_balance_before);
+    assert_eq!(token_client.balance(&client.address), contract_balance_before);
+}
+
+#[test]
+fn test_accept_partial_refund_missing_proposal_returns_proposal_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &10_000_000);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.create_escrow(&buyer, &seller, &token_id, &1_000_000, &1, &Some(3600));
+    client.dispute_escrow(&1, &Symbol::new(&env, "PartialRefund"), &buyer);
+    // Deliberately do NOT propose a partial refund.
+
+    let escrow_before = client.get_escrow(&1);
+    let buyer_balance_before = token_client.balance(&buyer);
+    let seller_balance_before = token_client.balance(&seller);
+    let contract_balance_before = token_client.balance(&client.address);
+
+    let result = client.try_accept_partial_refund(&1);
+    assert_panic_contract_error(result, Error::ProposalNotFound);
+
+    assert_eq!(client.get_escrow(&1), escrow_before);
+    assert_eq!(token_client.balance(&buyer), buyer_balance_before);
+    assert_eq!(token_client.balance(&seller), seller_balance_before);
+    assert_eq!(token_client.balance(&client.address), contract_balance_before);
+}
+
+#[test]
+fn test_accept_partial_refund_rejected_when_not_in_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &10_000_000);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Escrow is Active, not Disputed.
+    client.create_escrow(&buyer, &seller, &token_id, &1_000_000, &1, &Some(3600));
+
+    let escrow_before = client.get_escrow(&1);
+    let buyer_balance_before = token_client.balance(&buyer);
+    let seller_balance_before = token_client.balance(&seller);
+    let contract_balance_before = token_client.balance(&client.address);
+
+    let result = client.try_accept_partial_refund(&1);
+    assert_panic_contract_error(result, Error::NotInDispute);
+
+    assert_eq!(client.get_escrow(&1), escrow_before);
+    assert_eq!(token_client.balance(&buyer), buyer_balance_before);
+    assert_eq!(token_client.balance(&seller), seller_balance_before);
+    assert_eq!(token_client.balance(&client.address), contract_balance_before);
+}
