@@ -71,8 +71,8 @@ fn test_evaluate_stake_health_healthy_no_obligations() {
     token_admin.mint(&seller, &token_id, &50_000_000);
 
     // Stake above minimum
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &20_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &20_000_000);
 
     let snapshot = client.evaluate_stake_health(&seller);
 
@@ -124,7 +124,7 @@ fn test_evaluate_stake_health_returns_persisted_snapshot() {
     client.evaluate_stake_health(&seller);
 
     let persisted = client.get_stake_health_snapshot(&seller);
-    assert!(persisted.is_some());
+    assert(persisted.is_some());
     let snap = persisted.unwrap();
     assert_eq(snap.status, LiquidationStatus::Healthy);
     assert_eq(snap.current_stake, 20_000_000);
@@ -233,8 +233,8 @@ fn test_flag_liquidation_eligible_rejects_when_disabled() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
@@ -254,8 +254,8 @@ fn test_flag_liquidation_eligible_enforces_grace_period() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &86400, &true); // 1 day grace
@@ -293,8 +293,8 @@ fn test_trigger_liquidation_capped_at_deficit() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &6_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &6_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     // Set grace period to 0 so we can flag immediately
@@ -345,8 +345,8 @@ fn test_trigger_liquidation_rejects_when_disabled() {
     token_admin.mint(&seller, &token_id, &50_000_000);
     token_admin.mint(&buyer, &token_id, &50_000_000);
 
-    client.set_min_stake_required(&10_000_000);
-    client.stake_tokens(&seller, &token_id, &5_000_000);
+    client.set_min_stake_required(&token_id, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &token_id, &5_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
 
     client.set_liquidation_policy(&5000, &0, &false); // disable
