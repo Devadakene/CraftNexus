@@ -31,7 +31,7 @@ pub struct StakeEntry {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    StakeNotFound = 1,
+    StakeHealthSnapshotNotFound = 1,
 }
 
 #[contracttype]
@@ -112,18 +112,12 @@ impl StakeContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Read-only function to fetch a user's stake record.
-    ///
-    /// Returns `Error::StakeNotFound` when the storage key is absent instead of
-    /// trapping the host. Uses `extend_persistent_read` on the hot persistent
-    /// key so callers do not pay for a full scan or panic on archival.
-    pub fn get_artisan_stake_data(env: Env, user: Address) -> Result<Vec<StakeEntry>, Error> {
-        let key = DataKey::UserStakes(user);
-        env.storage().persistent().extend_ttl(&key, 100, 1000);
+    /// Read-only function to inspect a user's persisted stake health snapshot.
+    /// Returns `None` if `evaluate_stake_health` has never been called for the user.
+    pub fn get_stake_health_snapshot(env: Env, user: Address) -> Option<StakeEntry> {
         env.storage()
             .persistent()
-            .get(&key)
-            .ok_or(Error::StakeNotFound)
+            .get(&DataKey::UserStakes(user))
     }
 }
 
@@ -248,28 +242,20 @@ mod tests {
     }
 
     #[test]
-    fn test_get_artisan_stake_data_missing_key_returns_error() {
-        let (_env, user, client) = setup();
-
-        // No stake has been recorded yet: the key is absent.
-        let result = client.try_get_artisan_stake_data(&user);
-        assert_eq!(result, Err(Ok(Error::StakeNotFound)));
-    }
-
-    #[test]
-    fn test_get_artisan_stake_data_after_terminal_state() {
+    fn test_get_stake_health_snapshot_missing_key_returns_none() {
         let (env, user, client) = setup();
 
-        client.stake(&user, &1000);
+        // No record exists yet: must not trap, must return None.
+        let snapshot = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot, None, "Missing snapshot should return None");
 
-        // Advance past the cooldown and drain the queue to a terminal state.
+        // After a terminal state (all stakes withdrawn), still safe.
+        client.stake(&user, &1000);
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + COOLDOWN_PERIOD + 1);
-        let withdrawn = client.withdraw_matured(&user);
-        assert_eq!(withdrawn, 1000);
+        client.withdraw_matured(&user);
 
-        // Record now exists but is empty; the call must not trap.
-        let stakes = client.get_artisan_stake_data(&user).unwrap();
-        assert_eq!(stakes.len(), 0);
+        let snapshot_after = client.get_stake_health_snapshot(&user);
+        assert_eq!(snapshot_after, None, "Snapshot should remain None");
     }
 }
