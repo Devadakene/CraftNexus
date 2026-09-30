@@ -3103,6 +3103,66 @@ fn test_set_moderator_unknown_user_panics() {
     client.set_moderator(&ghost);
 }
 
+/// Issue #470 — set_moderator must be rejected while the platform is paused,
+/// and the target profile's role must remain unchanged after rejection.
+#[test]
+fn test_set_moderator_rejected_when_paused_and_storage_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &soroban_sdk::String::from_str(&env, "paused_mod"),
+        &UserRole::Artisan,
+    );
+
+    let before = client.get_user(&user);
+    assert_eq!(before.role, UserRole::Artisan);
+
+    client.set_paused(&true);
+    let result = client.try_set_moderator(&user);
+    assert!(result.is_err(), "set_moderator must be rejected while paused");
+
+    let after = client.get_user(&user);
+    assert_eq!(
+        after.role,
+        UserRole::Artisan,
+        "role must be unchanged after paused rejection"
+    );
+    assert!(!client.has_role(&user, &UserRole::Moderator));
+}
+
+/// Issue #470 — an unauthorized caller must not mutate storage through
+/// set_moderator. Without the admin's signature, require_auth() aborts the
+/// invocation and the target profile's role stays untouched.
+#[test]
+fn test_set_moderator_unauthorized_leaves_storage_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &soroban_sdk::String::from_str(&env, "unauth_mod"),
+        &UserRole::Buyer,
+    );
+
+    let before = client.get_user(&user);
+    assert_eq!(before.role, UserRole::Buyer);
+
+    env.set_auths(&[]);
+    let result = client.try_set_moderator(&user);
+    assert!(result.is_err(), "unauthorized set_moderator must be rejected");
+
+    env.mock_all_auths();
+    let after = client.get_user(&user);
+    assert_eq!(after.role, UserRole::Buyer);
+    assert!(!client.has_role(&user, &UserRole::Moderator));
+}
+
 // ── Issue #474: [SECURITY] Endpoint #73 – get_verification_queue ─────────────
 
 /// Issue #474 — non-admin caller must not read the verification queue.
